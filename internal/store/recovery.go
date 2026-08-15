@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
 )
@@ -109,7 +110,8 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_state
-			SET active_owner = ?, fence_epoch = ?,
+			SET write_seq = write_seq + 1,
+			    active_owner = ?, fence_epoch = ?,
 			    lease_until  = TIMESTAMPADD(SECOND, ?, NOW()),
 			    heartbeat_at = NOW(), updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?
@@ -124,7 +126,8 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET owner_instance = ?, fence_epoch = ?,
+			SET write_seq = write_seq + 1,
+			    owner_instance = ?, fence_epoch = ?,
 			    lease_until  = TIMESTAMPADD(SECOND, ?, NOW()),
 			    heartbeat_at = NOW(), updated_at = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
@@ -152,7 +155,12 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 //
 // cancel_requested resolves to `cancelled`, never `ready`. Someone asked this run to stop; its
 // executor dying is not a reason to start it again.
-func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob.Status, error) {
+//
+// nextPollAt is honoured only when this recovery ENDS the pass — recovery to `dead`. Recovery
+// back to `ready` leaves the poll clock NULL, because the recovered pass is still the
+// outstanding one and restoring the clock would let the due scanner materialize a second to
+// race it (doc/scheduling.md §2).
+func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int, nextPollAt *time.Time) (gojob.Status, error) {
 	var landed gojob.Status
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		st, err := lockState(ctx, tx, v.JobName)
@@ -162,6 +170,25 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 		if !st.Held() || st.ActiveRunToken.String != v.RunToken || st.FenceEpoch != v.FenceEpoch {
 			return fmt.Errorf("%w: job %q was recovered by another instance", gojob.ErrContended, v.JobName)
 		}
+
+		// Re-read the execution UNDER THE LOCK. Phase 1's snapshot was taken before the
+		// reconciliation RPC, which is bounded but not instant, and the row can legitimately
+		// change during it: an operator can commit `cancel_requested`, or timeout_at can
+		// elapse. Deciding from the stale snapshot would send work an operator explicitly
+		// cancelled straight back to `ready`.
+		//
+		// The state row is already locked, so this takes the two rows in the canonical order.
+		cur, err := lockExecution(ctx, tx, v.ID)
+		if err != nil {
+			return err
+		}
+		if cur.RunToken != v.RunToken || cur.FenceEpoch != v.FenceEpoch {
+			return fmt.Errorf("%w: execution %d was recovered by another instance", gojob.ErrContended, v.ID)
+		}
+		if cur.Status.Terminal() {
+			return fmt.Errorf("%w: execution %d reached %s before recovery ran",
+				gojob.ErrContended, v.ID, cur.Status)
+		}
 		now := s.clock.Now()
 
 		// Release the state row under the OLD ownership. This is the step a claim must never
@@ -170,7 +197,8 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 		// statement would affect zero rows forever.
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_state
-			SET active_kind = NULL, active_execution = NULL, active_owner = NULL,
+			SET write_seq = write_seq + 1,
+			    active_kind = NULL, active_execution = NULL, active_owner = NULL,
 			    active_run_token = NULL, dispatched_to = NULL, lease_until = NULL,
 			    last_failure_at = ?, updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?
@@ -183,11 +211,11 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 			return err
 		}
 
-		landed = resolvedStatus(v)
+		landed = resolvedStatus(cur)
 		reason := gojob.ReasonFenced
 		switch landed {
 		case gojob.StatusDead:
-			if v.TimeoutExpired {
+			if cur.TimeoutExpired {
 				reason = gojob.ReasonTimeout
 			} else {
 				reason = gojob.ReasonBudgetExhausted
@@ -200,7 +228,8 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 		// the old epoch cannot write to it. recovery_count is the budget this path consumes.
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET status         = ?,
+			SET write_seq = write_seq + 1,
+			    status         = ?,
 			    terminal_reason = ?,
 			    finished_at    = IF(? = 'ready', NULL, ?),
 			    available_at   = IF(? = 'ready', TIMESTAMPADD(SECOND, ?, ?), available_at),
@@ -225,24 +254,58 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 		// The attempt is recorded as `unknown` rather than `failed`, and under the token it
 		// actually ran with — which is why attempt history is keyed by run_token and not by
 		// the ordinal this path deliberately did not consume.
-		return recordAttempt(ctx, tx, Holder{
+		h := Holder{
 			JobName:      v.JobName,
 			ExecutionID:  v.ID,
 			ExecutionKey: v.ExecutionKey,
 			RunToken:     v.RunToken,
 			FenceEpoch:   v.FenceEpoch,
-		}, Outcome{
+		}
+		if err := recordAttempt(ctx, tx, h, Outcome{
 			AttemptOutcome: gojob.AttemptUnknown,
 			ExecutorID:     v.DispatchedTo,
 			FinishedAt:     now,
 			FailureKind:    "lease_expired",
 			ResultSummary:  "scheduler lost ownership; executor could not confirm the outcome",
-		})
+		}); err != nil {
+			return err
+		}
+
+		// Recovery restores a fixed-delay job's poll clock only when it ENDS the pass.
+		if nextPollAt != nil && landed != gojob.StatusReady {
+			return restorePollClockIfDead(ctx, tx, h, *nextPollAt, now)
+		}
+		return nil
 	})
 	if err != nil {
 		return "", err
 	}
 	return landed, nil
+}
+
+// lockExecution takes an execution row under the state row already held, which is the
+// canonical order. A blocking FOR UPDATE rather than SKIP LOCKED: holding the state row means
+// nobody else can legitimately be inside this execution's transition, so a wait here is
+// either momentary or a genuine violation worth surfacing rather than skipping.
+func lockExecution(ctx context.Context, tx *sql.Tx, id int64) (Stale, error) {
+	const q = `
+		SELECT id, execution_key, job_name, status,
+		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
+		       attempt_no, max_attempts, recovery_count, max_recoveries,
+		       (timeout_at IS NOT NULL AND timeout_at < NOW())
+		FROM job_execution WHERE id = ? FOR UPDATE`
+
+	var v Stale
+	err := tx.QueryRowContext(ctx, q, id).Scan(&v.ID, &v.ExecutionKey, &v.JobName, &v.Status,
+		&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
+		&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries, &v.TimeoutExpired)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Stale{}, fmt.Errorf("%w: execution %d", ErrNoSuchExecution, id)
+	}
+	if err != nil {
+		return Stale{}, fmt.Errorf("lock execution %d: %w", id, err)
+	}
+	return v, nil
 }
 
 // resolvedStatus decides where an unrecoverable attempt lands.
@@ -308,7 +371,9 @@ func (s *Store) TimedOut(ctx context.Context, limit int) ([]Stale, error) {
 // lapse, because the owning scheduler is alive and would otherwise keep renewing forever. The
 // executor is asked to stop separately; whether it complies is not something this can prove,
 // which is why the terminal reason distinguishes the two ways `dead` is reached.
-func (s *Store) FenceTimedOut(ctx context.Context, v Stale) error {
+// nextPollAt restores a fixed-delay job's poll clock: the cap always ENDS the pass, so unlike
+// Resolve there is no branch on where the execution landed.
+func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Time) error {
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		st, err := lockState(ctx, tx, v.JobName)
@@ -325,7 +390,7 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale) error {
 			RunToken:     v.RunToken,
 			FenceEpoch:   v.FenceEpoch,
 		}
-		if err := releaseJobLock(ctx, tx, h, false, now); err != nil {
+		if err := releaseJobLock(ctx, tx, h, false, nextPollAt, now); err != nil {
 			return err
 		}
 
@@ -333,7 +398,8 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale) error {
 		// is the one writer whose whole purpose is to act after the cap has passed.
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET status = 'dead', terminal_reason = ?, finished_at = ?,
+			SET write_seq = write_seq + 1,
+			    status = 'dead', terminal_reason = ?, finished_at = ?,
 			    failure_kind = 'timeout',
 			    error_message = 'runtime cap elapsed; execution fenced by the scheduler',
 			    fence_epoch = fence_epoch + 1,

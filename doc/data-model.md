@@ -446,6 +446,7 @@ CREATE TABLE job_state (
     last_success_at   DATETIME     NULL,
     last_failure_at   DATETIME     NULL,
     config_version    BIGINT       NOT NULL DEFAULT 0,
+    write_seq         BIGINT       NOT NULL DEFAULT 0,   -- see "the witness column" below
     updated_at        DATETIME     NOT NULL,
     PRIMARY KEY (job_name),
     KEY idx_job_state_due (next_fire_at),
@@ -453,6 +454,23 @@ CREATE TABLE job_state (
     KEY idx_job_state_lease (lease_until)
 );
 ```
+
+### The witness column
+
+`write_seq` exists on both `job_state` and `job_execution`, is incremented by every guarded
+write, and is touched by nothing else. It is not a version for optimistic concurrency —
+`fence_epoch` and `config_version` already do that work — and nothing ever reads it in a
+predicate.
+
+It exists so that "zero rows affected" has exactly one meaning. MySQL reports rows *changed*,
+not rows matched, and every other column a guarded write touches can be assigned the value it
+already holds: `DATETIME` is whole-second, so a heartbeat or progress report redelivered
+inside the same database second rewrites `lease_until`, `deadline_at` and `updated_at`
+identically and MySQL reports zero. The protocol reads zero rows as fencing, so without a
+column that always moves, a lost response packet would abandon a healthy long-running handler.
+
+`protocol.md` §2 carries the full argument, including why setting `CLIENT_FOUND_ROWS` on the
+connection is not an acceptable substitute.
 
 ### Two "who" fields, because there are two layers
 
@@ -533,6 +551,7 @@ CREATE TABLE job_execution (
     terminal_reason VARCHAR(24) NULL,       -- how a terminal state was reached
     result_summary VARCHAR(512) NULL,
     error_message  VARCHAR(512) NULL,
+    write_seq      BIGINT       NOT NULL DEFAULT 0,   -- see §3, "the witness column"
     created_at     DATETIME     NOT NULL,
     updated_at     DATETIME     NOT NULL,
     PRIMARY KEY (id),
@@ -540,6 +559,7 @@ CREATE TABLE job_execution (
     UNIQUE KEY uk_job_execution_request (request_id),
     KEY idx_job_execution_claim (status, manual_first, available_at, id),
     KEY idx_job_execution_recovery (status, lease_until, id),
+    KEY idx_job_execution_timeout (status, timeout_at),
     KEY idx_job_execution_history (job_name, scheduled_at, id)
 );
 ```

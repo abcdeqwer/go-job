@@ -124,6 +124,9 @@ CREATE TABLE job_state (
     -- scan recomputes — this is how an edit to a weekly job takes effect in seconds instead
     -- of when its stale instant eventually arrives.
     config_version   BIGINT       NOT NULL DEFAULT 0,
+
+    -- Incremented by every guarded write. See job_execution.write_seq.
+    write_seq        BIGINT       NOT NULL DEFAULT 0,
     updated_at       DATETIME     NOT NULL,
     PRIMARY KEY (job_name),
     KEY idx_job_state_due   (next_fire_at),
@@ -185,6 +188,20 @@ CREATE TABLE job_execution (
     terminal_reason VARCHAR(24)  NULL,      -- how a terminal state was reached
     result_summary  VARCHAR(512) NULL,
     error_message   VARCHAR(512) NULL,
+
+    -- Incremented by every guarded write, and by nothing else.
+    --
+    -- It exists because MySQL reports rows CHANGED, not rows matched, and every other column
+    -- a guarded write touches can legitimately be assigned the value it already holds:
+    -- DATETIME columns are whole-second, so a heartbeat or a progress report redelivered
+    -- inside the same database second writes lease_until, deadline_at and updated_at back
+    -- unchanged. Without a column that always moves, zero changed rows would be ambiguous
+    -- between "the ownership guard failed" and "this write was an exact repeat" — and the
+    -- protocol reads the first as fencing, which would abort a healthy twenty-hour handler
+    -- because one response packet was lost.
+    --
+    -- With it, zero changed rows means the guard failed, everywhere, unconditionally.
+    write_seq       BIGINT       NOT NULL DEFAULT 0,
 
     created_at      DATETIME     NOT NULL,
     updated_at      DATETIME     NOT NULL,

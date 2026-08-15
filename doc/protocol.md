@@ -154,6 +154,32 @@ WHERE id = ?
 Every statement's affected-row count is asserted; any mismatch rolls the transaction back.
 **Dispatch happens only after commit.**
 
+### Zero rows must mean the guard failed
+
+That assertion is only sound if a guarded statement cannot affect zero rows for any *other*
+reason — and by default it can. MySQL reports rows **changed**, not rows matched, unless the
+connection sets `CLIENT_FOUND_ROWS`, which go-job cannot require because DSNs come from the
+tenant registry and a flag silently missing from one of them would break exactly one tenant,
+invisibly.
+
+Every other column a guarded write touches can legitimately be assigned the value it already
+holds. `DATETIME` is whole-second, so a heartbeat or a progress report redelivered inside the
+same database second writes `lease_until`, `deadline_at` and `updated_at` back unchanged and
+MySQL reports zero. Read as fencing — which is what this protocol does with zero rows — that
+would abandon a healthy twenty-hour handler because one response packet was lost.
+
+So `job_state` and `job_execution` each carry a `write_seq BIGINT`, **incremented by every
+guarded write and touched by nothing else**. It cannot be assigned its current value, so a
+matched row always counts as changed. That single column is what makes "zero rows means the
+guard failed" true unconditionally, and a guarded statement that omits it is a defect.
+
+A rejection, though, is a **committed decision, not a failed statement**. A claim that finds
+the job held, paused or unrunnable writes a bounded backoff — or, under `FORBID`, a terminal
+`skipped` row — and *commits* it, reporting the outcome to its caller separately. Returning
+an error there would roll back the very write that makes the rejection safe, leaving the
+candidate at the front of the next ordered, bounded discovery page to spin against a busy job
+at full rate.
+
 ### Claiming is not attempting
 
 The claim commits `dispatching`, **not** `running`, and does not touch `attempt_no`. An
@@ -213,9 +239,24 @@ A `dispatching` row whose lease expires is recovered exactly like a `running` on
 the same reason: the scheduler that was mid-dispatch may have died after the executor
 accepted.
 
-`attempt_no` is incremented **on acceptance** and nowhere else — not at claim, not by
-recovery. It counts handler starts, and a dispatch that was refused, or never answered, did
-not start one.
+`attempt_no` is incremented **on acceptance**, and on exactly one other path — never at claim,
+never by recovery. It counts handler starts, and a dispatch that was refused, or never
+answered, did not start one.
+
+The other path is a **result arriving while the row is still `dispatching`**. Results are
+instance-agnostic: an executor reports to whichever scheduler the load balancer picks, and
+that report can reach the database before the dispatching scheduler has recorded the
+acceptance. A result is proof a handler started, so that transition charges the attempt in the
+same transaction, before terminality is evaluated.
+
+Without it `max_attempts` is not a bound at all. A handler that fails fast enough to keep
+winning that race would be retried forever with `attempt_no` stuck at zero: every retry finds
+`0 < max_attempts`, returns the row to `ready`, and the acceptance that would have charged the
+budget is refused because the status already moved. The charge is a separate guarded
+statement rather than a conditional inside the terminal CAS, because MySQL evaluates a `SET`
+list left to right using already-updated values — so an expression reading `status` while the
+same statement assigns it would depend on column order, which is not a correctness argument
+any reader should have to reconstruct.
 
 One consequence is worth stating rather than discovering: if an executor accepts and the
 acceptance reply is lost, `attempt_no` has not yet been incremented. The re-send resolves it

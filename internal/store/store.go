@@ -73,12 +73,21 @@ func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 
 // affected returns a statement's affected-row count.
 //
-// MySQL's affected-row count is the number of rows CHANGED, not matched, unless the
-// connection sets CLIENT_FOUND_ROWS. Every guarded update in this package writes at least
-// one column to a value it cannot already hold — updated_at, or a rotated token — so
-// "changed" and "matched" coincide and a zero means the guard genuinely failed. A future
-// statement that could be a no-op must not rely on this and must carry its own witness
-// column.
+// MySQL reports rows CHANGED, not rows matched, unless the connection sets CLIENT_FOUND_ROWS
+// — and go-job cannot require that, because DSNs come from the tenant registry and a flag
+// silently missing from one of them would break exactly one tenant, invisibly.
+//
+// So "zero rows means the guard failed" is not free. Every other column a guarded write
+// touches can legitimately be assigned the value it already holds: DATETIME columns are
+// whole-second, so a heartbeat or progress report redelivered inside the same database
+// second writes lease_until, deadline_at and updated_at back unchanged, and MySQL reports
+// zero. Read as fencing, that would abort a healthy twenty-hour handler because one response
+// packet was lost.
+//
+// **Every guarded UPDATE in this package therefore increments write_seq**, which no other
+// writer touches and which cannot be assigned its current value. That single column is what
+// makes zero-rows-means-guard-failed true unconditionally. A new guarded statement without
+// it is a defect, and TestEveryUpdateIsGuarded fails the build for one.
 func affected(res sql.Result, stmt string) (int64, error) {
 	n, err := res.RowsAffected()
 	if err != nil {

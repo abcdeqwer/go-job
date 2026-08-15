@@ -40,7 +40,8 @@ func (s *Store) Renew(ctx context.Context, h Holder, leaseSeconds int) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_state
-			SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+			SET write_seq = write_seq + 1,
+			    lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?`,
 			leaseSeconds, now, h.JobName, h.RunToken, h.FenceEpoch)
 		if err != nil {
@@ -64,7 +65,8 @@ func (s *Store) Renew(ctx context.Context, h Holder, leaseSeconds int) error {
 		// in would give ownership transfer two implementations that can disagree.
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+			SET write_seq = write_seq + 1,
+			    lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
 			WHERE id = ?
 			  AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND owner_instance = ? AND run_token = ? AND fence_epoch = ?
@@ -94,7 +96,8 @@ func (s *Store) Renew(ctx context.Context, h Holder, leaseSeconds int) error {
 func (s *Store) ExtendDeadline(ctx context.Context, h Holder, silenceSeconds int) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE job_execution
-		SET deadline_at = TIMESTAMPADD(SECOND, ?, NOW()), updated_at = ?
+		SET write_seq = write_seq + 1,
+			    deadline_at = TIMESTAMPADD(SECOND, ?, NOW()), updated_at = ?
 		WHERE id = ?
 		  AND status IN ('dispatching', 'running', 'cancel_requested')
 		  AND run_token = ? AND fence_epoch = ?

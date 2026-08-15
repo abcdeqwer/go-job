@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -62,40 +63,96 @@ func TestResolvedStatus(t *testing.T) {
 	}
 }
 
-// Every UPDATE in this package must carry a guard beyond its primary key.
+// Every ownership-bearing UPDATE must carry the fence: a token predicate AND fence_epoch.
 //
-// This is the invariant the whole protocol rests on: "no handler updates status with a bare
-// WHERE id = ?". It is asserted by reading the package's own source rather than by exercising
-// a database, because the failure it guards against is a future edit dropping a token or
-// epoch predicate — which no functional test notices until two executors overlap in
-// production.
-func TestEveryUpdateIsGuarded(t *testing.T) {
-	stmts := sqlStatementsInPackage(t)
-	if len(stmts) < 10 {
-		t.Fatalf("found only %d SQL literals; the extractor is probably broken", len(stmts))
+// This is the invariant the whole protocol rests on — a revived zombie is harmless only
+// because its epoch no longer matches, so every statement it attempts affects zero rows. It
+// is asserted by reading the package's own source rather than by exercising a database,
+// because the failure it guards against is a future edit dropping one of the two predicates,
+// which no functional test notices until two executors overlap in production.
+//
+// Counting predicates is not enough: an UPDATE stripped of both run_token and fence_epoch
+// still has a status predicate, and would pass. The check therefore names them.
+//
+// The exceptions are listed explicitly, each with the reason it has no owner to fence
+// against. A new statement is fenced or it is on this list with an argument.
+func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
+	// An UPDATE is exempt only when there is provably no owner to fence against, and the
+	// exemption is derived from the statement's own guard rather than from its text — so a
+	// statement that stops being an acquisition also stops being exempt.
+	exemptions := []struct {
+		predicate string
+		why       string
+	}{
+		{"active_kind IS NULL", "acquisition: the job is unheld, and that IS the guard"},
+		{"status = 'ready'", "the row has never been dispatched, so it carries no token"},
+		{"status IN ('dispatching', 'running')", "operator cancel: acts against whoever holds the job, by design"},
+		{"js.active_kind IS NULL", "poll clock restore: the lock is already released, and the guard is the execution's terminal status"},
 	}
 
-	var updates int
-	for _, s := range stmts {
+	var owned, exempt int
+	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
 		if !strings.HasPrefix(strings.ToUpper(norm), "UPDATE ") {
 			continue
 		}
-		updates++
-
 		where := whereClause(norm)
 		if where == "" {
 			t.Errorf("UPDATE with no WHERE clause:\n  %s", norm)
 			continue
 		}
-		// A primary-key predicate alone is never sufficient.
-		guards := strings.Count(where, "AND")
-		if guards == 0 {
-			t.Errorf("UPDATE guarded only by its key, with no status/token/epoch predicate:\n  %s", norm)
+
+		var excused bool
+		for _, e := range exemptions {
+			if strings.Contains(where, e.predicate) {
+				excused = true
+				break
+			}
+		}
+		if excused {
+			exempt++
+			continue
+		}
+
+		hasToken := strings.Contains(where, "run_token = ?") || strings.Contains(where, "active_run_token = ?")
+		hasEpoch := strings.Contains(where, "fence_epoch = ?")
+		if !hasToken || !hasEpoch {
+			t.Errorf("ownership UPDATE missing its fence (token=%v epoch=%v); "+
+				"a zombie holding a stale epoch would be able to write:\n  %s", hasToken, hasEpoch, norm)
+			continue
+		}
+		owned++
+	}
+	if owned < 6 {
+		t.Fatalf("found only %d fenced UPDATEs; the extractor is probably broken", owned)
+	}
+	if exempt < 3 {
+		t.Fatalf("only %d statements matched an exemption; the predicates have drifted from the SQL", exempt)
+	}
+}
+
+// Every guarded UPDATE must increment write_seq.
+//
+// Without it, "zero rows affected" is ambiguous: MySQL reports rows CHANGED, and a heartbeat
+// or progress report redelivered inside the same whole second writes its DATETIME columns
+// back unchanged. The protocol reads zero rows as fencing, so the ambiguity would abort a
+// healthy long-running handler because one response packet was lost.
+func TestEveryUpdateBumpsWriteSeq(t *testing.T) {
+	var checked int
+	for _, s := range sqlStatementsInPackage(t) {
+		norm := strings.Join(strings.Fields(s), " ")
+		if !strings.HasPrefix(strings.ToUpper(norm), "UPDATE ") {
+			continue
+		}
+		checked++
+		if !strings.Contains(norm, "write_seq = write_seq + 1") &&
+			!strings.Contains(norm, "js.write_seq = js.write_seq + 1") {
+			t.Errorf("UPDATE does not increment write_seq, so a no-op repeat would be "+
+				"indistinguishable from a failed guard:\n  %s", norm)
 		}
 	}
-	if updates < 8 {
-		t.Fatalf("found only %d UPDATE statements; the extractor is probably broken", updates)
+	if checked < 8 {
+		t.Fatalf("found only %d UPDATE statements; the extractor is probably broken", checked)
 	}
 }
 
@@ -220,19 +277,186 @@ func setAssignments(norm string) []assignment {
 }
 
 // The canonical lock order is job_state then job_execution. A transaction that took them the
-// other way round would deadlock against every completion. Asserted by checking that no
-// function in this package locks an execution row before a state row.
-func TestNoStatementLocksExecutionBeforeState(t *testing.T) {
-	for _, s := range sqlStatementsInPackage(t) {
-		norm := strings.ToUpper(strings.Join(strings.Fields(s), " "))
-		if !strings.Contains(norm, "FOR UPDATE") {
+// other way round would deadlock against every completion, and the deadlock needs two
+// transactions racing on one job to appear — so it shows up under production load and almost
+// never in a test.
+//
+// Checking individual statements cannot catch it: most locking in this package happens across
+// several statements, and the state row is taken by a helper the entry point merely calls. So
+// this walks each exported method, expands calls into other functions in the package in
+// source order, flattens the result into the sequence of tables that method touches, and
+// requires job_state to appear before job_execution in every method that touches both.
+func TestCanonicalLockOrder(t *testing.T) {
+	fns := packageFunctions(t)
+
+	var checked int
+	for name, fn := range fns {
+		if !fn.exported {
 			continue
 		}
-		if strings.Contains(norm, "JOB_EXECUTION") && !strings.Contains(norm, "JOB_STATE") {
-			t.Errorf("locking read on job_execution outside the state-row lock; "+
-				"the canonical order is job_state then job_execution:\n  %s", norm)
+		seq := flattenTouches(fns, name, map[string]bool{})
+		firstState, firstExec := -1, -1
+		for i, table := range seq {
+			if table == "job_state" && firstState < 0 {
+				firstState = i
+			}
+			if table == "job_execution" && firstExec < 0 {
+				firstExec = i
+			}
+		}
+		if firstState < 0 || firstExec < 0 {
+			continue // touches at most one of the two; nothing to order
+		}
+		checked++
+		if firstExec < firstState {
+			t.Errorf("%s touches job_execution before job_state; the canonical order is "+
+				"job_state then job_execution, and reversing it deadlocks against completion.\n  sequence: %v",
+				name, seq)
 		}
 	}
+	if checked < 5 {
+		t.Fatalf("only %d methods touched both tables; the extractor is probably broken", checked)
+	}
+}
+
+type packageFunc struct {
+	exported bool
+	// events is the function body in source order: either "table:<name>" for a SQL statement's
+	// table references, or "call:<name>" for a call to another function in this package.
+	events []string
+}
+
+// packageFunctions builds the call/statement graph the lock-order check walks.
+func packageFunctions(t *testing.T) map[string]packageFunc {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	// Package-level SQL constants, so a statement held in one is attributed to the function
+	// that uses it rather than being invisible.
+	consts := map[string]string{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				gd, ok := decl.(*ast.GenDecl)
+				if !ok || gd.Tok != token.CONST {
+					continue
+				}
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for i, n := range vs.Names {
+						if i < len(vs.Values) {
+							if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+								consts[n.Name] = strings.Trim(lit.Value, "`\"")
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fns := map[string]packageFunc{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Body == nil {
+					continue
+				}
+				pf := packageFunc{exported: fd.Name.IsExported()}
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					switch v := n.(type) {
+					case *ast.BasicLit:
+						if v.Kind == token.STRING {
+							pf.events = append(pf.events, tableEvents(strings.Trim(v.Value, "`\""))...)
+						}
+					case *ast.Ident:
+						if sql, ok := consts[v.Name]; ok {
+							pf.events = append(pf.events, tableEvents(sql)...)
+						}
+					case *ast.CallExpr:
+						if id, ok := v.Fun.(*ast.Ident); ok {
+							pf.events = append(pf.events, "call:"+id.Name)
+						}
+						if sel, ok := v.Fun.(*ast.SelectorExpr); ok {
+							pf.events = append(pf.events, "call:"+sel.Sel.Name)
+						}
+					}
+					return true
+				})
+				fns[fd.Name.Name] = pf
+			}
+		}
+	}
+	return fns
+}
+
+// tableEvents lists the coordination tables a statement references, in the order they appear.
+func tableEvents(sql string) []string {
+	upper := strings.ToUpper(sql)
+	if !strings.HasPrefix(strings.TrimSpace(upper), "SELECT") &&
+		!strings.HasPrefix(strings.TrimSpace(upper), "UPDATE") &&
+		!strings.HasPrefix(strings.TrimSpace(upper), "INSERT") &&
+		!strings.HasPrefix(strings.TrimSpace(upper), "DELETE") {
+		return nil
+	}
+	type hit struct {
+		at    int
+		table string
+	}
+	var hits []hit
+	for _, name := range []string{"JOB_STATE", "JOB_EXECUTION"} {
+		for i := 0; ; {
+			j := strings.Index(upper[i:], name)
+			if j < 0 {
+				break
+			}
+			at := i + j
+			i = at + len(name)
+			// JOB_EXECUTION_ATTEMPT is a different table and must not be counted as one.
+			if rest := upper[at+len(name):]; strings.HasPrefix(rest, "_") {
+				continue
+			}
+			hits = append(hits, hit{at, strings.ToLower(name)})
+		}
+	}
+	sort.Slice(hits, func(a, b int) bool { return hits[a].at < hits[b].at })
+	out := make([]string, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.table)
+	}
+	return out
+}
+
+// flattenTouches expands a function's events into the flat sequence of tables it touches,
+// following calls into other functions in this package.
+func flattenTouches(fns map[string]packageFunc, name string, seen map[string]bool) []string {
+	if seen[name] {
+		return nil // recursion; the cycle adds no new ordering information
+	}
+	seen[name] = true
+	defer delete(seen, name)
+
+	var out []string
+	for _, ev := range fns[name].events {
+		if callee, ok := strings.CutPrefix(ev, "call:"); ok {
+			if _, known := fns[callee]; known {
+				out = append(out, flattenTouches(fns, callee, seen)...)
+			}
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 func whereClause(norm string) string {

@@ -302,7 +302,8 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 		//    path, and it costs one recovery interval of latency after a crash.
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_state
-			SET active_kind      = 'EXECUTION',
+			SET write_seq = write_seq + 1,
+			    active_kind      = 'EXECUTION',
 			    active_execution = ?,
 			    active_owner     = ?,
 			    active_run_token = ?,
@@ -329,7 +330,8 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 		//    `dispatching` row whose executor never answers would have no budget at all.
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET status         = 'dispatching',
+			SET write_seq = write_seq + 1,
+			    status         = 'dispatching',
 			    owner_instance = ?,
 			    dispatched_to  = ?,
 			    run_token      = ?,
@@ -369,7 +371,8 @@ func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, out *ClaimResul
 		if !manual {
 			res, err := tx.ExecContext(ctx, `
 				UPDATE job_execution
-				SET status = 'skipped', terminal_reason = ?, finished_at = ?,
+				SET write_seq = write_seq + 1,
+			    status = 'skipped', terminal_reason = ?, finished_at = ?,
 				    result_summary = ?, lease_until = NULL, updated_at = ?
 				WHERE id = ? AND status = 'ready'`,
 				string(gojob.ReasonOperator), now,
@@ -404,7 +407,8 @@ func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, out *ClaimResul
 func deferCandidate(ctx context.Context, tx *sql.Tx, id int64, backoffSeconds int, now time.Time) error {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE job_execution
-		SET available_at = TIMESTAMPADD(SECOND, ?, ?), updated_at = ?
+		SET write_seq = write_seq + 1,
+			    available_at = TIMESTAMPADD(SECOND, ?, ?), updated_at = ?
 		WHERE id = ? AND status = 'ready'`,
 		backoffSeconds, now, now, id)
 	if err != nil {
@@ -442,7 +446,8 @@ func (s *Store) Accept(ctx context.Context, id int64, runToken string, epoch int
 	now := s.clock.Now()
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE job_execution
-		SET status      = 'running',
+		SET write_seq = write_seq + 1,
+			    status      = 'running',
 		    attempt_no  = attempt_no + 1,
 		    started_at  = COALESCE(started_at, ?),
 		    deadline_at = TIMESTAMPADD(SECOND, ?, NOW()),
@@ -476,7 +481,8 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_state
-			SET active_kind = NULL, active_execution = NULL, active_owner = NULL,
+			SET write_seq = write_seq + 1,
+			    active_kind = NULL, active_execution = NULL, active_owner = NULL,
 			    active_run_token = NULL, dispatched_to = NULL,
 			    lease_until = NULL, updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?`,
@@ -494,7 +500,8 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET status = 'ready',
+			SET write_seq = write_seq + 1,
+			    status = 'ready',
 			    available_at   = TIMESTAMPADD(SECOND, ?, ?),
 			    owner_instance = NULL, dispatched_to = NULL, run_token = NULL,
 			    lease_until = NULL, heartbeat_at = NULL, updated_at = ?
