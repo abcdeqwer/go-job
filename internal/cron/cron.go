@@ -273,9 +273,16 @@ func (e *Expression) matchesDay(year, month, day int) bool {
 }
 
 // searchLimit bounds Next so an expression that somehow matches nothing returns an error
-// instead of spinning. Five years is well past any legitimate gap; parse-time rejection
-// should mean this is never reached.
-const searchLimit = 5 * 366 * 24 * time.Hour
+// instead of spinning. Parse-time rejection should mean it is never reached.
+//
+// Twelve years, not five. The largest gap a SATISFIABLE expression can have is eight years:
+// `0 0 0 29 2 *` fires on 2096-02-29 and then not until 2104-02-29, because 2100 is a common
+// year under the Gregorian century rule. A five-year cap turns that valid schedule into an
+// error — and only in 2096, which is exactly the kind of bound nobody tests.
+//
+// The cost of the larger limit is nothing in practice: the search walks calendar fields, so a
+// year that matches no month advances twelve times, not thirty-one million.
+const searchLimit = 12 * 366 * 24 * time.Hour
 
 // Next returns the first fire instant strictly after `after`, in `after`'s location.
 //

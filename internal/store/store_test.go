@@ -137,9 +137,15 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 			continue
 		}
 
+		// A disjunction voids every exemption. The predicates below are only self-proving as
+		// top-level conjuncts: `WHERE status = 'ready' OR status = 'running'` contains the
+		// exempting substring while being able to mutate a running row without a fence, so a
+		// substring match alone would let the test pass the exact defect it exists to prevent.
+		disjunctive := strings.Contains(strings.ToUpper(where), " OR ")
+
 		var excused bool
 		for _, e := range guardExemptions {
-			if !strings.Contains(where, e.predicate) {
+			if disjunctive || !strings.Contains(where, e.predicate) {
 				continue
 			}
 			if e.alsoAssign != "" && !strings.Contains(norm, e.alsoAssign) {

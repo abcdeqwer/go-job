@@ -142,12 +142,28 @@ func (s *Store) MaterializeCron(ctx context.Context, jobName string, sched Sched
 		}
 		now := s.clock.Now()
 
-		if !def.Enabled || def.Retired {
+		if !def.Enabled || def.Retired || def.ScheduleKind != gojob.ScheduleCron {
 			// Stop the row being due forever. A later enable bumps the definition's version,
 			// and the config-drift scan recomputes next_fire_at from the current schedule —
 			// which is also what stops a re-enabled job replaying its dormant instants.
 			out.Outcome = MaterializedSkipped
 			return clearFireClock(ctx, tx, jobName, def.Version, now)
+		}
+
+		// Drift is reconciled BEFORE deciding what is due, never after.
+		//
+		// next_fire_at was computed from the definition as it stood at config_version. If the
+		// definition has moved on, that instant belongs to a schedule nobody uses any more:
+		// materializing it would run a job on Monday because Monday is what the old expression
+		// said, and then stamp the new version onto the row as though it had been honoured.
+		// Recompute and let the next pass decide.
+		if st.ConfigVersion != def.Version {
+			next, err := sched.Next(now)
+			if err != nil {
+				return fmt.Errorf("recompute next fire for %q: %w", jobName, err)
+			}
+			out.Outcome, out.NextFireAt = MaterializedSkipped, next
+			return advanceFireClock(ctx, tx, jobName, next, def.Version, now)
 		}
 
 		// While a manual execution for this job is `ready`, materialization is suspended.
@@ -171,23 +187,35 @@ func (s *Store) MaterializeCron(ctx context.Context, jobName string, sched Sched
 		}
 		due := st.NextFireAt.Time
 
-		// A fire within grace of now is on time. Anything strictly older is missed.
+		// A fire at or after now-grace is ON TIME. Only strictly older instants are missed.
+		//
+		// All instants are whole seconds, so the half-open window [due, onTimeFrom) is
+		// expressed to CountBetween — whose window is (from, to] — as (due-1s, onTimeFrom-1s].
+		// Getting that endpoint wrong puts a fire landing exactly on the grace boundary into
+		// the missed set, and under SKIP a job that is reliably one grace-period late would be
+		// skipped on every single pass.
 		onTimeFrom := now.Add(-grace)
-		out.Missed, out.MissedExact, err = sched.CountBetween(due.Add(-time.Second), onTimeFrom, missedCountLimit)
+		out.Missed, out.MissedExact, err = sched.CountBetween(
+			due.Add(-time.Second), onTimeFrom.Add(-time.Second), missedCountLimit)
 		if err != nil {
 			return fmt.Errorf("count missed fires for %q: %w", jobName, err)
 		}
 
 		fireAt := due
 		create := true
-		if out.Missed > 0 && def.Misfire == gojob.MisfireSkip {
+		switch {
+		case out.Missed == 0:
+			// On time. Nothing special.
+		case def.Misfire == gojob.MisfireSkip:
 			// SKIP runs nothing from the past. Unbounded replay is not on offer, and an hour
 			// of downtime must not become an hour of catch-up executions arriving at once.
 			create = false
-		} else if out.Missed > 0 {
-			// FIRE_ONCE creates exactly one catch-up, for the LATEST missed instant, so the
-			// job runs with the freshest inputs rather than replaying the oldest.
-			latest, ok, err := sched.Latest(now, misfireHorizon)
+		default:
+			// FIRE_ONCE creates exactly one catch-up, for the LATEST MISSED instant — the last
+			// fire strictly before the grace boundary, not the last fire before now. Using
+			// Latest(now) would jump over the instants inside the grace window, which are on
+			// time and have not been materialized yet, and silently drop them.
+			latest, ok, err := sched.Latest(onTimeFrom.Add(-time.Second), misfireHorizon)
 			if err != nil {
 				return fmt.Errorf("find latest missed fire for %q: %w", jobName, err)
 			}
@@ -198,7 +226,20 @@ func (s *Store) MaterializeCron(ctx context.Context, jobName string, sched Sched
 			}
 		}
 
-		next, err := sched.Next(now)
+		// The clock advances past the instant this pass DEALT WITH, not past now.
+		//
+		// Advancing to Next(now) would erase every instant between the one materialized and
+		// now — for a job firing faster than the scan interval, most of them, with no execution
+		// row and no missed count to show for it. Advancing to Next(fireAt) leaves the backlog
+		// on the row, so successive passes drain it one instant at a time and anything that
+		// ages past grace is then handled by the misfire policy, visibly.
+		//
+		// SKIP is the deliberate exception: its whole meaning is to abandon the past.
+		anchor := fireAt
+		if !create && def.Misfire == gojob.MisfireSkip {
+			anchor = now
+		}
+		next, err := sched.Next(anchor)
 		if err != nil {
 			return fmt.Errorf("compute next fire for %q: %w", jobName, err)
 		}
@@ -265,11 +306,18 @@ func (s *Store) MaterializePoll(ctx context.Context, jobName, executionKey strin
 		}
 		now := s.clock.Now()
 
-		// The state row is locked, so a NULL here means a pass this scan cannot see is already
-		// outstanding — the row was materialized between the non-locking due scan and now.
+		// Re-verify due-ness under the lock, not just non-NULL-ness.
+		//
+		// The due scan does not lock, so between it and this transaction another replica can
+		// materialize a pass, have it complete, and set next_poll_at to completion + delay.
+		// Accepting any non-NULL value would then start a second pass immediately: the passes
+		// would not overlap — the job lock still guarantees that — but the configured delay
+		// would simply not have been waited, which is the entire content of a fixed-delay
+		// schedule.
+		//
 		// Checked FIRST, because every branch below writes next_poll_at and the guarded write
 		// would assert against a row that legitimately has nothing left to clear.
-		if !st.NextPollAt.Valid {
+		if !st.NextPollAt.Valid || st.NextPollAt.Time.After(now) {
 			out.Outcome = MaterializedSuspended
 			return nil
 		}
@@ -324,7 +372,8 @@ func (s *Store) MaterializePoll(ctx context.Context, jobName, executionKey strin
 func (s *Store) Recompute(ctx context.Context, jobName string, sched Schedule) (time.Time, error) {
 	var next time.Time
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		if _, err := lockState(ctx, tx, jobName); err != nil {
+		st, err := lockState(ctx, tx, jobName)
+		if err != nil {
 			return err
 		}
 		def, err := readDefinition(ctx, tx, jobName)
@@ -333,9 +382,28 @@ func (s *Store) Recompute(ctx context.Context, jobName string, sched Schedule) (
 		}
 		now := s.clock.Now()
 
-		if def.ScheduleKind != gojob.ScheduleCron || !def.Enabled || def.Retired {
-			return clearFireClock(ctx, tx, jobName, def.Version, now)
+		if !def.Enabled || def.Retired {
+			return parkBothClocks(ctx, tx, jobName, def.Version, now)
 		}
+
+		if def.ScheduleKind == gojob.ScheduleFixedDelay {
+			// A poller has no fire instant, so next_fire_at is cleared — but next_poll_at must
+			// be RESTARTED, not left alone. Disabling a due poller clears it, and NULL means "a
+			// pass is outstanding", so a re-enabled job would sit excluded from the due scan
+			// forever with nothing to end the pass that never existed.
+			//
+			// The distinction between "outstanding" and "stranded" is not in job_state, so it
+			// is answered where it actually lives: whether the job has a non-terminal execution.
+			outstanding, err := passOutstanding(ctx, tx, jobName)
+			if err != nil {
+				return err
+			}
+			if st.NextPollAt.Valid || outstanding {
+				return clearFireClockKeepingPoll(ctx, tx, jobName, def.Version, now)
+			}
+			return restartPollClock(ctx, tx, jobName, def.Version, now)
+		}
+
 		next, err = sched.Next(now)
 		if err != nil {
 			return fmt.Errorf("recompute next fire for %q: %w", jobName, err)
@@ -343,6 +411,25 @@ func (s *Store) Recompute(ctx context.Context, jobName string, sched Schedule) (
 		return advanceFireClock(ctx, tx, jobName, next, def.Version, now)
 	})
 	return next, err
+}
+
+// passOutstanding reports whether the job has an execution that has not reached a terminal
+// state. It is the authority on whether a NULL next_poll_at means "a pass is running" or "the
+// clock was parked and nothing will ever restart it".
+func passOutstanding(ctx context.Context, tx *sql.Tx, jobName string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM job_execution
+		WHERE job_name = ?
+		  AND status IN ('ready', 'dispatching', 'running', 'cancel_requested')
+		LIMIT 1`, jobName).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check outstanding pass for %q: %w", jobName, err)
+	}
+	return true, nil
 }
 
 // Drifted lists jobs whose state row was computed from a definition that has since changed.
@@ -406,6 +493,58 @@ func clearFireClock(ctx context.Context, tx *sql.Tx, jobName string, version int
 		return fmt.Errorf("clear fire clock for %q: %w", jobName, err)
 	}
 	return assertOne(res, "materialize: clear fire clock")
+}
+
+// parkBothClocks stops a disabled or retired job being due on either scan.
+func parkBothClocks(ctx context.Context, tx *sql.Tx, jobName string, version int64, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE job_state
+		SET write_seq      = write_seq + 1,
+		    next_fire_at   = NULL,
+		    next_poll_at   = NULL,
+		    config_version = ?,
+		    updated_at     = ?
+		WHERE job_name = ?`, version, now, jobName)
+	if err != nil {
+		return fmt.Errorf("park clocks for %q: %w", jobName, err)
+	}
+	return assertOne(res, "materialize: park both clocks")
+}
+
+// clearFireClockKeepingPoll parks the cron clock of a fixed-delay job without disturbing an
+// outstanding pass's reservation.
+func clearFireClockKeepingPoll(ctx context.Context, tx *sql.Tx, jobName string, version int64, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE job_state
+		SET write_seq      = write_seq + 1,
+		    next_fire_at   = NULL,
+		    config_version = ?,
+		    updated_at     = ?
+		WHERE job_name = ?`, version, now, jobName)
+	if err != nil {
+		return fmt.Errorf("clear fire clock for %q: %w", jobName, err)
+	}
+	return assertOne(res, "materialize: clear fire clock keeping poll")
+}
+
+// restartPollClock makes a poller due immediately.
+//
+// A poller starts at once rather than after one delay, because the delay is defined as the gap
+// BETWEEN passes and there is no previous pass to measure from. Waiting would make a
+// newly-enabled poller look broken for exactly as long as its delay.
+func restartPollClock(ctx context.Context, tx *sql.Tx, jobName string, version int64, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE job_state
+		SET write_seq      = write_seq + 1,
+		    next_fire_at   = NULL,
+		    next_poll_at   = ?,
+		    config_version = ?,
+		    updated_at     = ?
+		WHERE job_name = ?`, now, version, now, jobName)
+	if err != nil {
+		return fmt.Errorf("restart poll clock for %q: %w", jobName, err)
+	}
+	return assertOne(res, "materialize: restart poll clock")
 }
 
 func clearPollClock(ctx context.Context, tx *sql.Tx, jobName string, now time.Time) error {

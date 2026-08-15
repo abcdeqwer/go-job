@@ -367,6 +367,17 @@ func TestLeapDay(t *testing.T) {
 	}
 }
 
+// The longest gap any satisfiable expression can have: 2100 is a common year under the
+// Gregorian century rule, so a leap-day schedule jumps eight years across it. A search cap
+// sized for "surely five years is enough" turns this valid schedule into an error, in 2096.
+func TestLeapDayAcrossTheCenturyRule(t *testing.T) {
+	utc := time.UTC
+	got := next(t, "0 0 0 29 2 *", at(t, utc, "2096-02-29 00:00:00"))
+	if want := at(t, utc, "2104-02-29 00:00:00"); !got.Equal(want) {
+		t.Fatalf("got %s, want %s — 2100 is not a leap year", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
 func TestStringRoundTrips(t *testing.T) {
 	const expr = "0 */5 * * * MON-FRI"
 	e := MustParse(expr)

@@ -552,6 +552,22 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 		if err != nil {
 			return fmt.Errorf("return execution %d to ready: %w", p.ExecutionID, err)
 		}
-		return assertOne(res, "refuse: return to ready")
+		if err := assertOne(res, "refuse: return to ready"); err != nil {
+			return err
+		}
+
+		// Making a late refusal terminal created a new terminal path, and every terminal
+		// outcome for a fixed-delay pass must restore the poll clock — otherwise this refusal
+		// ends the outstanding pass and leaves next_poll_at NULL, which nothing else revisits.
+		// The guard inside restorePollClockIfDead means the ordinary `ready` branch is a no-op.
+		def, err := readDefinition(ctx, tx, p.JobName)
+		if err != nil {
+			return err
+		}
+		if def.ScheduleKind == gojob.ScheduleFixedDelay {
+			h := Holder{JobName: p.JobName, ExecutionID: p.ExecutionID, ExecutionKey: p.ExecutionKey}
+			return restorePollClockIfDead(ctx, tx, h, now.Add(def.Delay()), now)
+		}
+		return nil
 	})
 }

@@ -106,6 +106,49 @@ executions arriving at once — that turns a recovery into a second incident. A 
 catch-up policy would need an explicit maximum, a defined ordering and a load test before
 it could exist.
 
+#### "Passed" needs a threshold, or `SKIP` never fires anything
+
+A fire instant is **missed** only if it is strictly older than `now - grace`. Anything newer
+is **on time**, however late the scan actually ran.
+
+Without that threshold the policy is unusable. A scan running one second late on a
+`* * * * * *` job sees one past instant plus the due one; both are "in the past", so `SKIP`
+advances to the future and creates nothing — on every pass, for ever, reporting no error while
+the missed counter climbs. `grace` must therefore be at least the scan interval plus expected
+jitter.
+
+The boundary is half-open — `[due, now-grace)` — so an instant landing exactly on it is on
+time. A closed boundary would put a reliably-one-grace-period-late job on the wrong side of it
+every pass, which is the same starvation in a milder form.
+
+#### The clock advances past what the pass DEALT WITH, not past `now`
+
+After materializing an instant, `next_fire_at` becomes the fire after **that instant** — not
+the fire after `now`. The two differ whenever a job fires faster than the scan interval, and
+advancing past `now` would erase every instant in between, with no execution row and no missed
+count to show for it.
+
+Leaving the backlog on the row means successive passes drain it one instant at a time, and
+anything that ages past `grace` is then handled by the misfire policy — visibly, with a
+counter, instead of vanishing.
+
+`SKIP` is the one deliberate exception: abandoning the past is its entire meaning, so it
+advances past `now`.
+
+`FIRE_ONCE` catches up to the **latest missed** instant — the last fire strictly before the
+grace boundary — not to the last fire before `now`. Reaching past the boundary would jump over
+the instants inside the grace window, which are on time and have not run yet.
+
+#### Drift is reconciled before due-ness is decided, never after
+
+`next_fire_at` was computed from the definition as it stood at `config_version`. If the
+definition has since changed, that instant belongs to a schedule nobody uses any more.
+Materializing it would run the job on Monday because Monday is what the *old* expression said,
+and then stamp the new version onto the row as though the new schedule had been honoured.
+
+A materialization pass that finds `config_version <> version` therefore recomputes and creates
+nothing; the next pass decides against the current schedule.
+
 ---
 
 ## 2. Fixed-delay pollers

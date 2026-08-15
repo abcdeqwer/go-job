@@ -100,6 +100,28 @@ func TestLatestIsCheapForADenseScheduleAfterALongOutage(t *testing.T) {
 	}
 }
 
+// A BURSTY schedule is the case the uniform test above misses: `* * 0-3 1 * *` fires every
+// second for four hours on the first of each month, so on the 15th the finest window holding
+// any fire is the 31-day one — and the walk from it crosses 14,400 legitimate fires. A cap
+// sized for uniform density rejects this valid schedule, and because misfire handling calls
+// Latest, the row stays due forever, retrying and failing.
+func TestLatestHandlesABurstySchedule(t *testing.T) {
+	e := MustParse("* * 0-3 1 * *")
+	ref := at(t, time.UTC, "2026-02-15 12:00:00")
+
+	got, ok, err := e.Latest(ref, 366*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if !ok {
+		t.Fatal("no fire found for a schedule that fires 14,400 times a month")
+	}
+	// The last fire of the burst: 03:59:59 on the 1st.
+	if want := at(t, time.UTC, "2026-02-01 03:59:59"); !got.Equal(want) {
+		t.Fatalf("Latest = %s, want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
 func TestCountBetween(t *testing.T) {
 	utc := time.UTC
 	e := MustParse("0 * * * * *") // every minute
@@ -123,6 +145,17 @@ func TestCountBetween(t *testing.T) {
 	}
 	if exact || n != 4 {
 		t.Fatalf("CountBetween with limit 4 = %d (exact=%v), want 4 truncated", n, exact)
+	}
+
+	// A limit that happens to equal the true count is NOT truncation. Reporting it as
+	// truncated would turn "ten missed instants" into "at least ten" for the most likely
+	// limit anyone would pick.
+	n, exact, err = e.CountBetween(from, to, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exact || n != 10 {
+		t.Fatalf("CountBetween with limit 10 = %d (exact=%v), want 10 exact", n, exact)
 	}
 
 	// An empty window is zero, not one.

@@ -21,10 +21,18 @@ var probeWindows = []time.Duration{
 	366 * 24 * time.Hour,
 }
 
-// walkCap bounds the forward walk inside Latest. It is far above any legitimate result for
-// the anchor that matched — the finest window that contains a fire — and exists so a
-// pathological expression fails loudly instead of spinning.
-const walkCap = 10_000
+// walkCap bounds the forward walk inside Latest, so a pathological expression fails loudly
+// instead of spinning.
+//
+// It has to clear the worst BURSTY schedule, not the worst uniform one. `* * 0-3 1 * *` fires
+// every second for four hours on the first of each month: asked for the latest fire on the
+// 15th, the finest window that contains any fire is the 31-day one, which anchors on the 1st
+// and must then cross 14,400 legitimate fires. A cap of 10,000 rejected that valid schedule —
+// and, because misfire handling calls Latest, left the row due forever, retrying and failing.
+//
+// A quarter of a million steps is a few hundred milliseconds on a path that runs only when a
+// job has actually misfired. Being slow there is much cheaper than being wrong.
+const walkCap = 250_000
 
 // Latest returns the most recent fire instant at or before `at`, searching back at most
 // `horizon`. ok is false when the expression has no fire in that window.
@@ -85,6 +93,10 @@ func (e *Expression) Latest(at time.Time, horizon time.Duration) (time.Time, boo
 // rather than a number that quietly understates an outage. The count is a metric, not a
 // control input — nothing branches on its exact value — which is why truncating it is
 // acceptable and walking a week of per-second fires to be precise is not.
+//
+// Reaching the limit is not the same as truncating. A window holding exactly `limit` fires is
+// counted exactly, so the extra probe below is what stops the common "I sized the limit to the
+// answer" case from being reported as an unknown overflow.
 func (e *Expression) CountBetween(from, to time.Time, limit int) (n int, exact bool, err error) {
 	cur := from
 	for n < limit {
@@ -98,5 +110,9 @@ func (e *Expression) CountBetween(from, to time.Time, limit int) (n int, exact b
 		n++
 		cur = nxt
 	}
-	return n, false, nil
+	nxt, err := e.Next(cur)
+	if err != nil {
+		return n, false, err
+	}
+	return n, nxt.After(to), nil
 }
