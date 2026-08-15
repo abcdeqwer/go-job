@@ -84,8 +84,8 @@ static analysis for everything else.
 25. a pass reporting `did_work=false` leaves no execution row and is visible only in
     metrics; one reporting `did_work=true` persists a row; a **failed** pass persists a row
     regardless of `did_work`;
-26. an executor that dies mid-pass leaves an expired `POLL` holder on the state row that
-    recovery clears, after which the next pass can be dispatched;
+26. an executor that dies mid-pass leaves an expired execution that recovery reconciles and
+    resolves, after which the next pass can be dispatched;
 27. pausing a job stops further passes being dispatched, and the in-flight one is allowed to
     finish rather than being abandoned.
 
@@ -130,22 +130,20 @@ static analysis for everything else.
 
 ---
 
-## 6. Registry, roles and deployment
+## 6. Jobs, executors and deployment
 
-37. a job whose handler is outside this deployment's assignment is not claimed by it and is
-    **not** an admission failure; a handler inside the assignment but absent from the build
-    registry **is**;
-38. an orphaned job — no live executor anywhere declares its handler — raises an alert and
-    is visible in the UI, but never prevents a scheduler from starting. Refusing to start
-    because another deployment is down turns one missing lane into two;
-39. registry reconciliation inserts missing jobs with declared defaults and **never**
-    overwrites an operator edit;
-40. reconciliation is idempotent under concurrency: running it twice, or from two processes,
-    inserts no duplicates and loses no edit;
-41. a control-plane deployment with an empty execution assignment reconciles and serves the
-    API while claiming no work;
-42. an executor restart produces a new `executor_id` and never inherits or has to clean up
-    its predecessor's registration row.
+40. a job can be created only through the API with a `handler_key`; the scheduler holds no
+    handler code and materializes no job from any registry of its own;
+41. an orphaned job — no live executor anywhere declares its handler — stays `ready`, raises
+    an alert, is visible in the UI, and is **never** marked failed, because nothing was
+    attempted;
+42. an orphan never prevents a scheduler from starting; refusing to start because an executor
+    is down turns one outage into two;
+43. an executor restart produces a new `executor_id` and never inherits or has to clean up
+    its predecessor's registration row;
+44. an executor declaring a handler no job uses is harmless and visible;
+45. a job whose `handler_key` matches no declared handler can still be created — an executor
+    may simply be down — but is flagged as an orphan until one appears.
 
 ---
 
@@ -232,7 +230,46 @@ correctly when one does not.
 
 ---
 
-## 11. What this list does not cover
+## 11. Contract-hardening cases from adversarial review
+
+Each of these corresponds to a defect found before implementation, and exists so the fix
+cannot regress silently.
+
+69. a callback (`Heartbeat`, `ReportProgress`, `ReportResult`) carrying a tenant the caller's
+    identity is not authorized for is refused; a `Register` naming another tenant or group is
+    refused and alerted;
+70. two tenants holding the same job name and therefore the same `execution_key` are routed
+    correctly, with callbacks arriving at an arbitrary scheduler instance;
+71. repeated `RESOURCE_EXHAUSTED` refusals never consume `attempt_no` and never drive a job
+    to `dead` without a handler having started;
+72. a `dispatching` row whose scheduler dies is recovered like a `running` one, reconciling
+    with `dispatched_to` before deciding;
+73. **entering recovery never re-dispatches a run the executor is still performing**: with an
+    executor deliberately held mid-run, kill the owning scheduler and assert the successor
+    adopts with the same `run_token` and a new fence epoch;
+74. a fixed-delay pass survives scheduler failover: the pass's execution row, parameters and
+    budgets are readable by the instance that takes over, and a `did_work=true` result
+    reported to a *different* instance is recorded correctly;
+75. a successful `ReportResult` arriving after `cancel_requested` records `success`, not
+    `cancelled`, and the cancel request remains in the audit trail;
+76. redelivering a result already recorded returns `already_recorded=true`, never `ABORTED`;
+77. a manual trigger is selected ahead of a due poll of the same job, repeatedly, under
+    sustained polling — mutual exclusion is not fairness;
+78. heartbeat renews both rows in one transaction in the canonical order, and sustained
+    heartbeat/completion contention produces no deadlock;
+79. retiring a job cancels its outstanding executions with `terminal_reason = 'retired'` and
+    leaves no non-terminal row behind;
+80. disabling a tenant or changing its DSN completes within `drain_timeout`, fencing whatever
+    is still outstanding rather than waiting indefinitely;
+81. the cron cases of `scheduling.md` §1 — day-of-month/day-of-week OR semantics, rejected
+    `L`/`W`/`#`, rejected impossible dates, spring-forward and fall-back — each produce the
+    single documented answer;
+82. every validation bound in `data-model.md` §0.4 is rejected at the API, not discovered
+    later.
+
+---
+
+## 12. What this list does not cover
 
 Verification of **handler logic** is the host's responsibility, not this library's. This
 list proves the scheduler runs a handler exactly once per accepted execution and reports

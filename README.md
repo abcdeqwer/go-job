@@ -2,7 +2,7 @@
 
 A multi-tenant, database-durable **job scheduling platform**.
 
-`go-job` decides what runs, when, for which tenant, and exactly once. Your applications
+`go-job` decides what runs, when, and for which tenant, with exactly one owner at a time. Your applications
 run the work: they register as **executors** over a gRPC contract, in any language, and
 receive dispatches with parameters. MySQL is the only infrastructure dependency, and the
 admin UI ships with the scheduler.

@@ -31,7 +31,7 @@ This document, and everything else in `go-job`, is **part 1 only**.
 
 A multi-tenant, database-durable **job scheduling platform**.
 
-- it decides what runs, when, for which tenant, and exactly once;
+- it decides what runs, when, and for which tenant, with exactly one owner at a time;
 - applications register as **executors** over a gRPC contract, in any language, and receive
   dispatches with parameters;
 - MySQL is the only infrastructure dependency;
@@ -60,8 +60,12 @@ A multi-tenant, database-durable **job scheduling platform**.
    in the scheduler so a new executor in a new language cannot get it wrong.
 5. **Operable by people who did not write it** — schedule, enablement, concurrency, retry
    budget and timeout are editable, audited data; a silently stopped job is detectable.
-6. **Honest about guarantees** — ownership is not idempotency, and a fenced cancellation is
-   not proof that an in-flight request was withdrawn.
+6. **Honest about guarantees.** The delivery guarantee is **at-least-once with exactly one
+   owner at a time**, not exactly-once. When an attempt's fate cannot be established — an
+   executor restarted and answers `NOT_FOUND` — the scheduler fences and retries, which can
+   run the logical work twice. Handler idempotency is what makes that harmless, and it is
+   required rather than recommended. Ownership is not idempotency, and a fenced cancellation
+   is not proof that an in-flight request was withdrawn.
 7. **One dependency.** MySQL. No Redis, broker, ZooKeeper or etcd.
 
 ### Explicit non-goals
@@ -117,6 +121,10 @@ Each was argued and settled; a reviewer should treat re-opening one as needing n
 | 4 | Push dispatch (scheduler calls executor) | keeps the ownership protocol in one place; executors implement four RPCs and nothing subtle |
 | 5 | Executors register with `in_flight`; the scheduler adopts or fences | more reliable than asking, and free on a message already sent |
 | 6 | `GetExecution` `NOT_FOUND` means **unknown**, never "did not run" | durable proof belongs in the handler's idempotency key, not the protocol |
+| 6a | Job definitions are created by operators through the API/UI only | the scheduler holds no handler code, so it has no registry to generate them from; executors declare `handler_key`s, operators select one |
+| 6b | Claiming commits `dispatching`, and `attempt_no` is consumed only on acceptance | a busy executor refusing work is not an attempt; otherwise saturated capacity marches a job to `dead` with no code having run |
+| 6c | A fixed-delay pass is an ordinary execution, deleted when it found nothing | a state-row-only holder cannot be reconciled with its executor after a scheduler dies |
+| 6d | Both directions authenticated; identity bound to `(tenant, group)` | an unauthenticated `Register` hands a stranger a tenant's work by ordinary routing |
 | 7 | `AUTO_INCREMENT` execution ids, not snowflake | uniqueness is only needed per tenant schema; a distributed generator would add a coordination dependency |
 | 8 | Two concurrency policies only: `QUEUE`, `FORBID` | `PARALLEL` has no defined completion protocol against a single-holder state row |
 | 9 | Fixed-delay = one dispatched pass at a time, `next_poll_at` from the **result** | delay measured from completion; also removes the manual-trigger starvation an executor-side loop lease would create |
@@ -193,3 +201,5 @@ Stated rather than hidden:
 5. Non-gRPC executors would need an HTTP transcoding gateway, and would lose the build-time
    guarantees; supported but second-class, and not yet specified.
 6. No license chosen.
+7. The conformance suite must also cover the scheduler side (that it tolerates a
+   non-conforming executor), which `verification.md` §10 specifies but nothing yet runs.

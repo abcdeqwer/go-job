@@ -71,9 +71,18 @@ SELECT id, job_name
 FROM job_execution
 WHERE status = 'ready'
   AND available_at <= ?          -- business time, supplied by the scheduler
-ORDER BY available_at, id
+ORDER BY manual_first DESC, available_at, id
 LIMIT ?;
 ```
+
+`manual_first` is a stored column set at creation — `1` for `trigger_type = 'manual'`, `0`
+otherwise — so operator-initiated work is selected ahead of scheduled work of the same job.
+
+Without it, exclusion alone does not give **fairness**: a fast poller releases the job lock
+and immediately becomes due again, and nothing stops it winning the next claim
+indefinitely while an operator's manual run waits. Mutual exclusion is not liveness, and a
+trigger button that works only when the queue happens to be quiet is not a working trigger
+button.
 
 ---
 
@@ -108,29 +117,60 @@ WHERE job_name   = ?
 
 ```sql
 UPDATE job_execution
-SET status       = 'running',
+SET status         = 'dispatching',
     owner_instance = ?,
-    dispatched_to  = ?,
-    run_token    = ?,
-    fence_epoch  = ?,
-    lease_until  = TIMESTAMPADD(SECOND, ?, NOW()),
-    heartbeat_at = NOW(),
-    attempt_no   = attempt_no + 1,
-    started_at   = COALESCE(started_at, ?),
-    updated_at   = ?
+    run_token      = ?,
+    fence_epoch    = ?,
+    lease_until    = TIMESTAMPADD(SECOND, ?, NOW()),
+    heartbeat_at   = NOW(),
+    updated_at     = ?
 WHERE id = ?
   AND status = 'ready'
   AND attempt_no < max_attempts;
 ```
 
 Every statement's affected-row count is asserted; any mismatch rolls the transaction back.
+**Dispatch happens only after commit.**
 
-**Dispatch happens only after commit**, and `dispatched_to` is written in the same
-transaction so a takeover can reconcile with the right executor (section 10). No row lock is
-held while an executor runs the work — leases, not locks, carry ownership across an
-execution's lifetime, which may be hours.
+### Claiming is not attempting
 
-`attempt_no` is incremented here and nowhere else. Recovery does not touch it (section 7).
+The claim commits `dispatching`, **not** `running`, and does not touch `attempt_no`. An
+attempt is a *handler start*, and at this point nothing has started: the chosen executor may
+answer `RESOURCE_EXHAUSTED` because it is busy, or `UNAVAILABLE` because it is shutting
+down. Consuming a retry budget for an executor's capacity is a defect — a job whose
+executors are saturated would march to `dead` without one line of business code running.
+
+So dispatch has two outcomes, each a short fenced transaction:
+
+| Executor answers | Transition | `attempt_no` | `dispatched_to` |
+| --- | --- | --- | --- |
+| OK / `ALREADY_EXISTS` | `dispatching` → `running` | **+1** | set |
+| `RESOURCE_EXHAUSTED`, `UNAVAILABLE` | `dispatching` → `ready`, release the job lock, try the next instance; when none accept, apply a bounded backoff | unchanged | unset |
+| `FAILED_PRECONDITION` (unknown handler) | `dispatching` → `ready`, alert: routing is wrong | unchanged | unset |
+| transport error, outcome unknown | stay `dispatching`; re-send to the **same** executor with the same `execution_key`, which answers `ALREADY_EXISTS` if it has it | +1 on eventual acceptance | set |
+
+```sql
+-- acceptance
+UPDATE job_execution
+SET status        = 'running',
+    dispatched_to = ?,
+    attempt_no    = attempt_no + 1,
+    started_at    = COALESCE(started_at, ?),
+    deadline_at   = TIMESTAMPADD(SECOND, ?, NOW()),
+    updated_at    = ?
+WHERE id = ? AND status = 'dispatching'
+  AND run_token = ? AND fence_epoch = ?;
+```
+
+`dispatched_to` is written on acceptance, before any result can arrive, so a takeover always
+knows which executor to reconcile with (section 10).
+
+A `dispatching` row whose lease expires is recovered exactly like a `running` one, and for
+the same reason: the scheduler that was mid-dispatch may have died after the executor
+accepted.
+
+`attempt_no` is incremented on acceptance and nowhere else. Recovery never touches it
+(section 7).
 
 ---
 
@@ -139,14 +179,18 @@ execution's lifetime, which may be hours.
 Evaluated inside the claim transaction, in this order, with every failed condition recorded
 rather than collapsed into one boolean:
 
-1. `handler_key` resolves in this binary's registry;
-2. `handler_key` is within this deployment's execution assignment;
-3. `job_definition.enabled = 1`;
-4. `job_state.ops_paused = 0`;
-5. the schema version matches what this library requires.
+1. `job_definition.enabled = 1` and the job is not retired;
+2. `job_state.ops_paused = 0`;
+3. **at least one live executor declares this job's `handler_key`** for this tenant;
+4. the schema version matches what this scheduler requires.
 
-Condition 2 is why a deployment serving only some handlers is normal rather than broken:
-work outside its assignment is simply not its work.
+Condition 3 replaces what an earlier revision called "resolves in this binary's registry" —
+a leftover from a design in which handlers were compiled into the scheduler. **The scheduler
+holds no handler code.** It knows a `handler_key` only as a string that executors declare and
+operators select, so the only meaningful question is whether anything alive can run it.
+
+A job failing condition 3 is an **orphan**: it stays `ready`, is never dispatched, and is
+alerted on. It is never marked failed, because nothing was attempted.
 
 ---
 
@@ -186,22 +230,26 @@ handler timeout         per job
 shutdown grace      <   remaining lease, where practical
 ```
 
-Both rows are renewed in the same heartbeat cycle:
+Both rows are renewed in **one transaction, in the canonical order** — `job_state` first,
+then `job_execution`. Renewing the execution first would take the two rows in the opposite
+order to completion and reproduce exactly the deadlock section 1 exists to prevent; renewing
+them in separate transactions would let a crash between the two leave one lease live and the
+other expired, with no rule saying which is authoritative.
 
 ```sql
-UPDATE job_execution
-SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
-WHERE id = ?
-  AND status IN ('running', 'cancel_requested')
-  AND owner_instance = ? AND run_token = ? AND fence_epoch = ?
-  AND lease_until >= NOW();
-```
-
-```sql
+-- 1. state row first
 UPDATE job_state
 SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
 WHERE job_name = ?
   AND active_run_token = ? AND fence_epoch = ?;
+
+-- 2. then the execution row, same transaction
+UPDATE job_execution
+SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+WHERE id = ?
+  AND status IN ('dispatching', 'running', 'cancel_requested')
+  AND owner_instance = ? AND run_token = ? AND fence_epoch = ?
+  AND lease_until >= NOW();
 ```
 
 `status IN ('running', 'cancel_requested')` is deliberate: a cancelled-but-not-yet-stopped
@@ -340,26 +388,39 @@ instead of two that can disagree.
 
 ## 7. Recovery
 
-Recovery is the only path that clears an expired holder, for every `active_kind`. It finds
-work two ways, both non-locking reads:
+Recovery is the only path that clears an expired holder. It finds work with a non-locking
+read over `job_execution` rows in `dispatching`, `running` or `cancel_requested` whose lease
+has expired. Every holder of a job's state row has an execution row — including a fixed-delay
+pass (`scheduling.md` §2) — so there is one scan and one algorithm.
 
-- expired `job_state` rows — `lease_until < NOW()` with a non-null `active_kind` — which is
-  what catches a dead polling loop, since a loop has no execution row to scan;
-- expired `job_execution` rows in `running` or `cancel_requested`.
+**Recovery must reconcile before it decides.** This is the whole of the difficulty: an
+expired lease means the *scheduler* that owned the execution stopped renewing, which says
+nothing about the *executor*, which may be running the work perfectly well. An earlier
+revision had recovery move `running` straight to `ready`, which would start a second
+executor while the first was still writing.
 
-Each is recovered in a transaction following the canonical order. **Recovery never becomes
-the executor:**
+So, in one transaction following the canonical order:
 
-1. lock `job_state`, then the execution row if there is one;
+1. lock `job_state`, then the execution row;
 2. verify the old token, fence epoch and expired lease;
-3. release the state row guarded by that old ownership, clearing `active_kind`;
-4. increment `fence_epoch` and `recovery_count`;
-5. resolve the execution by its prior status:
-   - `running` → `ready` with bounded recovery backoff, or `dead` when
+3. if `dispatched_to` is set, **call `GetExecution` on that executor** and act on the answer:
+
+   | Executor says | Action |
+   | --- | --- |
+   | `RUNNING` | **adopt**: take the lease with a new `fence_epoch` and the **same** `run_token`, and resume tracking. The work was never interrupted, and rotating the token would fence a healthy run |
+   | `FINISHED` | adopt the reported outcome and complete the execution normally |
+   | `NOT_FOUND`, or unreachable | the attempt is **unknown**; continue to step 4 |
+
+4. release the state row guarded by the old ownership, clearing `active_kind`;
+5. increment `fence_epoch` and `recovery_count`;
+6. resolve by prior status:
+   - `dispatching` or `running` → `ready` with bounded recovery backoff, or `dead` when
      `attempt_no >= max_attempts` or `recovery_count >= max_recoveries`;
    - `cancel_requested` → **`cancelled`**, never `ready`. Someone asked this run to stop;
-     its executor dying is not a reason to start it again;
-   - `active_kind = 'LOOP'` → nothing to resolve; step 3 is the whole recovery.
+     its executor dying is not a reason to start it again.
+
+`dispatched_to` unset means the dispatch never reached an executor, so there is nothing to
+reconcile with and step 3 is skipped.
 
 The normal claim path then assigns capacity and a new owner, so a recovery scan can never
 end up owning more work than a tenant's quota permits.
@@ -382,22 +443,43 @@ while the first is still writing.
 ## 8. State machine
 
 ```text
-ready --claim (attempt_no+1)--> running --success--> success
-                                   |
-                                   +--retryable, budget left--> ready (future avail_at)
-                                   +--budget exhausted / permanent--> dead
-                                   +--authorized cancel--> cancel_requested
-                                   +--stale lease--> ready (fence+1, recovery+1) | dead
+ready --claim--> dispatching --accepted (attempt_no+1)--> running --success--> success
+                     |                                      |
+                     +--refused--> ready (no attempt)        +--retryable--> ready
+                     +--stale lease--> recovery              +--exhausted--> dead
+                                                             +--cancel--> cancel_requested
+                                                             +--stale lease--> recovery
 
-cancel_requested --handler confirms exit--> cancelled
-cancel_requested --stale lease, fenced----> cancelled       (never back to ready)
+cancel_requested --result arrives: success--> success     (the work finished; see below)
+cancel_requested --result arrives: failed---> dead | ready
+cancel_requested --handler confirms stopped-> cancelled
+cancel_requested --stale lease, fenced------> cancelled   (never back to ready)
 
 ready --FORBID contention--> skipped
 dead  --authorized retry--> ready (attempt_no reset, audited)
+any non-terminal --job retired--> cancelled (audited)
 ```
+
+### A cancel that loses the race does not rewrite history
+
+An operator can commit `running -> cancel_requested` a moment after the handler already
+finished successfully, and the success result then arrives against a `cancel_requested` row.
+
+**The real outcome wins.** The execution becomes `success`, not `cancelled`: the work
+happened, and recording it as cancelled would tell an operator the opposite of the truth
+about a job that may have moved money. The audit trail keeps the cancel request, so "we
+asked, but it had already finished" remains visible.
+
+`cancelled` is therefore reached only when the handler confirms it stopped, or when the
+attempt is fenced without ever reporting.
 
 Every transition has guarded SQL carrying the expected prior status and, where an owner
 exists, the token and fence epoch. No handler updates status with a bare `WHERE id = ?`.
+
+`terminal_reason` on the execution row records *how* a terminal state was reached —
+`handler_confirmed`, `fenced`, `budget_exhausted`, `permanent_failure`, `retired`,
+`operator` — because `cancelled` alone cannot tell an operator whether side effects were
+verified (section 8, and `admin.md` §5).
 
 ### Cancellation is two steps
 
@@ -473,8 +555,7 @@ and no cluster mode to configure.
 
 ## 10. Scheduler failover while an execution is running
 
-This is the case the two-layer split creates, and it has a specific answer because the naive
-one is a duplicate run.
+The case the two-layer split creates. The naive response is a duplicate run:
 
 ```text
 scheduler A claims execution E, dispatches to executor X, holds the lease
@@ -483,33 +564,18 @@ E's lease expires
 scheduler B's recovery loop picks up E
 ```
 
-**B must not re-dispatch.** Executor X may still be running E perfectly well; A's death says
-nothing about X. Re-dispatching on the assumption that a dead scheduler means dead work is
-how a fifteen-minute settlement job gets run twice.
+**B must not re-dispatch.** Executor X may still be running E; A's death says nothing about
+X. Re-dispatching on the assumption that a dead scheduler means dead work is how a
+fifteen-minute settlement job runs twice.
 
-So recovery of an execution in `running` **reconciles before it decides**:
+There is no separate failover algorithm: this *is* recovery, and step 3 of section 7 is
+where it is handled. `dispatched_to` records which executor to ask, `GetExecution` supplies
+the answer, and adoption keeps the same `run_token` because the executor still holds it.
 
-1. read `dispatched_to` from the execution row — the executor instance A handed it to;
-2. call `GET {address}/jobs/{execution_key}` (`dispatch.md` §4.3);
-3. act on the answer:
-
-| Executor says | B does |
-| --- | --- |
-| `running` | adopt tracking: take the lease with a **new** fence epoch, keep the same `run_token`, and continue waiting. The work was never interrupted. |
-| `finished` | adopt the reported result and complete the execution normally |
-| `404`, or unreachable | the attempt is genuinely lost: fence the `run_token` and retry per policy |
-
-Keeping the same `run_token` in the adopt case matters: the executor is still holding it and
-will present it with its progress and result calls. Rotating it would fence a healthy
-running execution — the mistake of invalidating the current generation while it is still
-working.
-
-The fence epoch does advance, because scheduler-side ownership genuinely moved and any write
-attempted by a resurrected A must still be refused.
-
-`dispatched_to` therefore has to be durable, written in the same transaction as the claim.
-An execution whose dispatch target is not recorded cannot be reconciled, and would leave
-recovery guessing.
+`dispatched_to` must therefore be durable, written when the dispatch is accepted and before
+any result can arrive. An execution whose dispatch target is not recorded cannot be
+reconciled, and recovery would have to choose between re-dispatching blindly and giving up —
+both wrong.
 
 ---
 

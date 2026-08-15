@@ -69,8 +69,28 @@ with steps (`*/15`), ranges (`1-5`), lists (`1,3,5`), and named weekdays and mon
 (`MON`, `FRI`, `JAN`). Expressions are evaluated in the configured business `Location`.
 
 The dialect is fixed rather than pluggable. A scheduler with two cron dialects has two sets
-of edge cases around day-of-week numbering, `L`/`#` handling and month boundaries, and the
-cases where they differ are exactly the ones nobody tests.
+of edge cases, and the cases where they differ are exactly the ones nobody tests.
+
+Syntax alone is not a specification, so the ambiguous cases are decided here. Without these
+rules, two conforming implementations produce different fire instants and the cron
+differential test has no single correct answer:
+
+| Case | Rule |
+| --- | --- |
+| day-of-month **and** day-of-week both restricted | **OR** — fire when either matches, as Vixie cron and Quartz do. `0 0 0 1 * MON` fires on the 1st *and* every Monday |
+| day-of-month or day-of-week is `*` | the other alone decides; `*` adds nothing |
+| day-of-week numbering | `0` and `7` both mean Sunday |
+| `L`, `W`, `#` | **not supported.** Rejected at validation, not silently ignored |
+| a field that cannot match (`0 0 0 31 2 *`) | rejected at validation rather than never firing |
+| **nonexistent local time** (spring forward) | fire at the first valid instant after the gap, once |
+| **ambiguous local time** (fall back) | fire at the **first** occurrence only; the repeat is skipped |
+| zone | always the tenant's configured `Location`, never the host's |
+
+The two DST rules exist because `DATETIME` carries no offset. During a fall-back hour two
+real instants share one wall time, so an execution key derived from wall time would collide
+and the second occurrence would be silently deduplicated. Firing once, on the first, makes
+that deliberate rather than accidental. A zone without DST — the common case for a business
+calendar — never reaches either rule.
 
 ### Misfire
 
@@ -111,10 +131,12 @@ There is no long-lived loop inside an executor. The scheduler drives each pass:
 
 ```text
 next_poll_at <= now
-  -> take the job_state lock with active_kind = 'POLL'
-  -> dispatch one pass to an executor
+  -> take the job_state lock
+  -> create an ordinary execution row (trigger_type = 'poll')
+  -> dispatch it, exactly like a cron execution
   -> executor runs one pass, reports {did_work, summary}
   -> release the lock, set next_poll_at = result time + delay
+  -> if did_work = false and the pass succeeded, DELETE the execution row
 ```
 
 Because `next_poll_at` is computed from the **result**, the delay is measured from
@@ -135,24 +157,34 @@ indefinitely, which preserved mutual exclusion perfectly while making manual tri
 unreachable for every polling job. Dispatching one pass at a time removes the possibility
 rather than working around it.
 
-### Empty passes leave no trace
+### A pass is an ordinary execution, deleted if it found nothing
 
-Only a pass that reports `did_work = true` persists an execution row.
+A pass creates a real `job_execution` row **before** it is dispatched, and is claimed,
+leased, fenced, recovered and completed by exactly the same code as a cron execution. On a
+successful pass reporting `did_work = false`, the terminal transaction **deletes** the row.
 
-The scheduler holds the pass as `active_kind = 'POLL'` on the state row while it is in
-flight, without an execution row. When the result arrives:
+An earlier revision tried to avoid the write entirely by holding the in-flight pass only on
+the state row, with no execution row until the result proved it worth keeping. That is
+broken in two ways, and both are worth recording so the idea is not reinvented:
 
-| `did_work` | Result |
-| --- | --- |
-| `true` | materialize the execution row with its outcome — this is history worth keeping |
-| `false` | release the lock, advance `next_poll_at`, count it in metrics only |
+- **it breaks exclusion across a scheduler failure.** Scheduler A dispatches a pass to
+  executor X and dies. The state-row lease expires. Recovery has no execution row to
+  reconcile from, so it cannot ask X whether the pass is still running — it can only clear
+  the holder, after which B dispatches a second pass into the same queue while X is still
+  writing;
+- **it cannot reconstruct the run.** If the executor reports `did_work = true` to a
+  *different* scheduler instance, that instance must create the history row — but the
+  parameters, scheduled instant, attempt number and budgets existed only in the dead
+  instance's memory.
 
-A failure always persists, whatever `did_work` says: a pass that errored is evidence
-regardless of whether it found work.
+Creating the row first and deleting empty ones costs an insert and a delete per idle pass —
+roughly one write per three seconds for the fastest poller — in exchange for one execution
+model instead of two, and for exclusion that survives a scheduler dying. A failed pass is
+never deleted: an error is evidence regardless of whether it found work.
 
-This is what keeps a three-second poller from writing 28,800 rows a day per tenant to record
-that there was nothing to do. The cost is one boolean in the result and one intermediate
-state on the state row, which is a good trade for two orders of magnitude of rows.
+The end state is the same as the goal that motivated the original idea: **a three-second
+poller does not accumulate 28,800 rows a day.** It simply reaches that by deleting rather
+than by never writing.
 
 Liveness for an idle poller comes from metrics — last successful pass, empty-poll rate,
 source backlog — not from execution rows. `admin.md` shows these on the job page so an idle

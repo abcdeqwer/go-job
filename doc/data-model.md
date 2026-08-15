@@ -59,8 +59,16 @@ Schedulers poll `tenant_registry` on a short interval:
 | Change | Effect |
 | --- | --- |
 | a new `enabled` row appears | open a pool, verify the schema version, admit, start loops |
-| a row is disabled | stop claiming, let in-flight work finish, release the pool |
-| a DSN changes | drain and re-admit under the new DSN |
+| a row is disabled | stop claiming, drain, release the pool |
+| a DSN changes | drain, then re-admit under the new DSN |
+
+**Draining is bounded.** "Let in-flight work finish" is not a terminating condition: an
+execution can hang, and a scheduler that waits for it forever means a disable or a DSN change
+that never takes effect. So a drain waits at most `drain_timeout`, then fences everything
+still outstanding — those executions become `dead` with `terminal_reason = 'fenced'`, and the
+pool is released. Which is correct rather than merely convenient: after the DSN changes, the
+old connection no longer points at the schema those rows live in, so holding the pool open
+would not help them and closing it silently would strand them.
 
 This forces a design change worth stating explicitly. Admission was previously
 all-or-nothing across tenants: any tenant failing prevented readiness. **With hot add that
@@ -122,6 +130,23 @@ CREATE TABLE control_audit (
 
 Adding a site is therefore: create its coordination schema, apply the scheduler DDL, add one
 audited row. No redeploy, no restart, no code change.
+
+### 0.4 Validation bounds
+
+"Bounded" is only meaningful with a number. These are validated at the API and rejected
+there, so two implementations cannot invent different limits:
+
+| Value | Bound |
+| --- | --- |
+| `params_json` | ≤ 64 KiB serialized |
+| fixed delay | ≥ 1s, ≤ 24h — a zero delay is a spin, not a schedule |
+| `timeout_seconds` | ≥ 1s, ≤ 7 days |
+| `lease_seconds` | ≥ 10s, ≤ `timeout_seconds` |
+| `max_attempts` | 1 – 100 |
+| `max_recoveries` | 1 – 100 |
+| retry backoff | ≥ 1s, ≤ 6h, and monotonic |
+| `drain_timeout` | ≥ 30s, ≤ 1h |
+| `job_name`, `handler_key` | ≤ 128 chars, `[A-Za-z0-9._-]+` |
 
 ---
 
@@ -234,6 +259,7 @@ CREATE TABLE job_definition (
     schedule_kind      VARCHAR(16)  NOT NULL,  -- CRON | FIXED_DELAY
     schedule_expr      VARCHAR(128) NOT NULL,  -- cron expression, or delay in ms
     enabled            TINYINT(1)   NOT NULL DEFAULT 1,
+    retired            TINYINT(1)   NOT NULL DEFAULT 0,
     concurrency_policy VARCHAR(16)  NOT NULL,  -- QUEUE | FORBID
     misfire_policy     VARCHAR(16)  NOT NULL,  -- SKIP | FIRE_ONCE
     max_attempts       INT          NOT NULL,
@@ -257,17 +283,34 @@ in the admin UI under an optimistic `version` check and recorded in `job_audit`.
 registry, because it names compiled code. It is stored rather than derived so that renaming
 a Go symbol does not silently repoint a job.
 
-### Reconciliation
+### Where these rows come from
 
-The `CONTROL_PLANE` role materializes rows from the code registry: insert what is missing
-with the registration's declared defaults, **never overwrite what exists**. An existing row
-may carry an operator's edits, and a deployment must not undo them by restarting.
+**Operators create them, through the admin UI or API.** The scheduler holds no handler code
+and therefore no registry to materialize from; an earlier revision described reconciliation
+from a code registry, which was a leftover of a design where handlers were compiled into the
+scheduler.
 
-Reconciliation is therefore idempotent, which is what makes a misconfigured second control
-plane cost duplicated effort rather than damage.
+Creating a job means choosing a `handler_key` from those that live executors declare, plus a
+schedule, parameters and policy. The UI offers the declared handlers as a list, so a typo
+becomes an unselectable option rather than an orphan discovered later.
 
-Deleting a job from the registry does not delete its row. Retiring a job is an explicit
-audited action, so that history and any pending executions stay inspectable.
+A `handler_key` that no live executor declares is not rejected — an executor may simply be
+down — but the job is flagged as an orphan until one appears.
+
+### Retiring
+
+`retired` is a state of the definition, not a deletion:
+
+| | `enabled = 0` | `retired = 1` |
+| --- | --- | --- |
+| meaning | temporarily off | permanently done with |
+| new executions materialized | no | no |
+| existing non-terminal executions | left alone | **cancelled**, audited, with `terminal_reason = 'retired'` |
+| row and history | kept | kept |
+
+Retiring resolves outstanding work rather than stranding it. Without that rule a delayed
+retry sits `ready` forever against a job nothing will ever claim, while retention refuses to
+delete non-terminal rows — an unbounded table by construction.
 
 ---
 
@@ -279,7 +322,7 @@ CREATE TABLE job_state (
     next_fire_at      DATETIME     NULL,
     next_poll_at      DATETIME     NULL,
     ops_paused        TINYINT(1)   NOT NULL DEFAULT 0,
-    active_kind       VARCHAR(16)  NULL,      -- EXECUTION | POLL
+    active_kind       VARCHAR(16)  NULL,      -- EXECUTION
     active_execution  VARCHAR(160) NULL,
     active_owner      VARCHAR(128) NULL,      -- scheduler instance holding it
     active_run_token  CHAR(36)     NULL,
@@ -312,14 +355,13 @@ This row *is* the job's lock. `active_kind` says what holds it:
 
 | `active_kind` | Holder | Released by |
 | --- | --- | --- |
-| `EXECUTION` | a claimed cron or manual execution | result, retry or recovery |
-| `POLL` | a dispatched fixed-delay pass that has not yet persisted a row | result, or recovery |
+| `EXECUTION` | a claimed execution — cron, manual or fixed-delay pass | result, retry or recovery |
 | `NULL` | nobody | — |
 
-`POLL` exists because a fixed-delay pass is dispatched before anyone knows whether it will
-find work (§4). It still needs the lock — two overlapping passes over the same queue is
-exactly what a poller must not do — but it has no execution row to own the lease, so the
-state row carries it alone until the result arrives.
+There is one holder kind because there is one execution model. A fixed-delay pass creates an
+ordinary execution row before dispatch and deletes it afterwards if it found nothing
+(`scheduling.md` §2); it is not a special state-row-only holder, because such a holder
+cannot be reconciled with its executor after a scheduler dies.
 
 A single-valued holder is a deliberate constraint, and it is why there is no `PARALLEL`
 concurrency policy: heartbeat, result and recovery all guard on `active_run_token` and
@@ -353,7 +395,8 @@ CREATE TABLE job_execution (
     id             BIGINT       NOT NULL AUTO_INCREMENT,
     execution_key  VARCHAR(160) NOT NULL,
     job_name       VARCHAR(128) NOT NULL,
-    trigger_type   VARCHAR(16)  NOT NULL,  -- cron | manual
+    trigger_type   VARCHAR(16)  NOT NULL,  -- cron | manual | poll
+    manual_first   TINYINT(1)   NOT NULL DEFAULT 0,  -- 1 when trigger_type = 'manual'
     scheduled_at   DATETIME     NOT NULL,
     available_at   DATETIME     NOT NULL,
     status         VARCHAR(20)  NOT NULL,
@@ -372,13 +415,14 @@ CREATE TABLE job_execution (
     started_at     DATETIME     NULL,
     finished_at    DATETIME     NULL,
     failure_kind   VARCHAR(48)  NULL,
+    terminal_reason VARCHAR(24) NULL,       -- how a terminal state was reached
     result_summary VARCHAR(512) NULL,
     error_message  VARCHAR(512) NULL,
     created_at     DATETIME     NOT NULL,
     updated_at     DATETIME     NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_job_execution_key (execution_key),
-    KEY idx_job_execution_claim (status, available_at, id),
+    KEY idx_job_execution_claim (status, manual_first, available_at, id),
     KEY idx_job_execution_recovery (status, lease_until, id),
     KEY idx_job_execution_history (job_name, scheduled_at, id)
 );
@@ -416,12 +460,31 @@ without a filesort.
 | Status | Meaning |
 | --- | --- |
 | `ready` | available to claim, at or after `available_at` |
-| `running` | owned and executing |
+| `dispatching` | claimed, handed to an executor, acceptance not yet known |
+| `running` | accepted by an executor and executing |
 | `cancel_requested` | asked to stop; still owned, still leased |
 | `success` | terminal |
 | `dead` | terminal; retry budget exhausted or permanently failed |
 | `cancelled` | terminal |
 | `skipped` | terminal; `FORBID` contention |
+
+### `terminal_reason`
+
+`status` says where an execution ended; `terminal_reason` says how it got there, and the two
+are not interchangeable. `cancelled` alone cannot tell an operator whether a handler
+confirmed it stopped or whether the attempt was merely fenced with its side effects
+unverified — a distinction that matters most for exactly the jobs where it is expensive to
+guess.
+
+Values: `handler_confirmed`, `fenced`, `budget_exhausted`, `permanent_failure`, `retired`,
+`operator`.
+
+### `manual_first`
+
+A stored `1`/`0`, set at creation, ordered ahead of `available_at` in the claim index so an
+operator's manual run is selected before scheduled work of the same job. Exclusion alone
+gives no fairness: a fast poller becomes due again the moment it releases the lock, and
+without this column it can win indefinitely while a manual trigger waits.
 
 ### Two budgets
 
@@ -457,6 +520,35 @@ choose between re-dispatching blindly and giving up. Both are wrong; see `protoc
 `result_summary` and `error_message` are `VARCHAR(512)` and writers truncate explicitly
 rather than relying on the database. Silent truncation of an error message removes exactly
 the tail that explains the failure.
+
+---
+
+## 4a. `job_execution_attempt` — attempt history
+
+The execution row holds the **current** attempt; each retry overwrites its fields. Without a
+separate log, "attempt 1 failed with `upstream_5xx`, attempt 2's executor died, attempt 3
+succeeded" is unreconstructable, and the admin API cannot honour the attempt history it
+offers.
+
+```sql
+CREATE TABLE job_execution_attempt (
+    execution_key  VARCHAR(160) NOT NULL,
+    attempt_no     INT          NOT NULL,
+    executor_id    VARCHAR(128) NULL,
+    run_token      CHAR(36)     NOT NULL,
+    started_at     DATETIME     NULL,
+    finished_at    DATETIME     NULL,
+    outcome        VARCHAR(20)  NOT NULL,   -- success | failed | unknown | fenced
+    failure_kind   VARCHAR(48)  NULL,
+    summary        VARCHAR(512) NULL,
+    PRIMARY KEY (execution_key, attempt_no),
+    KEY idx_job_attempt_time (finished_at)
+);
+```
+
+One row is appended per attempt when it reaches a terminal state, including `unknown` for an
+attempt whose executor could never be reconciled. Retention deletes attempts with their
+execution.
 
 ---
 
@@ -564,8 +656,15 @@ Two clocks, and every column belongs to exactly one of them.
 
 | Clock | Columns | Source |
 | --- | --- | --- |
-| **business** | `next_fire_at`, `scheduled_at`, `available_at`, `started_at`, `finished_at`, `created_at`, `updated_at` | the configured `Location` |
-| **ownership** | `lease_until`, `heartbeat_at` | the database's `NOW()` |
+| **business** | `next_fire_at`, `next_poll_at`, `scheduled_at`, `available_at`, `started_at`, `finished_at`, `created_at`, `updated_at` | the configured `Location` |
+| **ownership** | `lease_until`, `heartbeat_at`, `deadline_at` | the database's `NOW()` |
+
+`deadline_at` is an **ownership** column, not a business one, because it answers an ownership
+question — has this attempt gone silent long enough to be treated as lost? Writing it from a
+business clock that a test environment can shift would make a healthy execution appear stale
+the moment someone fast-forwarded the clock. The wire carries a *duration*
+(`silence_deadline_seconds`), never an instant, so an executor never has to share a clock
+with anything.
 
 Ownership columns are the only ones ever compared against `NOW()`. This is not stylistic:
 if availability were written in business time and compared against database time, any

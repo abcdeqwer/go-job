@@ -90,8 +90,9 @@ differently" has no answer.
 Three rules, enforced by the scheduler:
 
 - **data, never instructions.** No command lines, scripts, URLs to fetch, or handler names.
-  The executor resolves `handler_key` against its own compiled registry. A scheduler able to
-  name arbitrary code would make its admin UI a remote shell;
+  The executor resolves `handler_key` against its own registry — the scheduler holds no
+  handler code at all. A scheduler able to name arbitrary code would be a remote shell with
+  an admin UI;
 - **bounded size**, rejected at the API rather than discovered when a row overflows;
 - **no secrets.** Parameters are stored, displayed in the UI and written to history. An
   executor reads credentials from its own configuration.
@@ -112,7 +113,7 @@ scheduler                         executor
    |<---------------- OK -------------|   a promise: a result will follow
    |                                  |   ... work happens ...
    |<-- ReportProgress ---------------|   every progress_interval
-   |--- proceed=true, deadline ------>|
+   |--- proceed=true, +silence budget >|
    |<-- ReportResult -----------------|
 ```
 
@@ -282,7 +283,18 @@ A job names a `handler_key`. The scheduler dispatches to a live instance of a gr
 declares that handler for that tenant.
 
 Selection is **round-robin among healthy instances below capacity, failing over to the next
-on a dispatch refusal**. That is the whole policy. There is deliberately no routing-strategy
+on a dispatch refusal**. That is the whole policy.
+
+**Capacity is advisory, and the refusal is authoritative.** Two scheduler instances can read
+`running=0, capacity=1` at the same moment and both choose the same executor; and a process
+registered for several tenants advertises capacity separately in each isolated schema, so
+the schedulers together can offer it more than it declared in any one. Neither is fixable
+with a counter, because the counters live in different databases by design.
+
+So the executor's own `RESOURCE_EXHAUSTED` is what actually bounds concurrency, and it must
+be returned against what the process can really run **across all tenants it serves** — not
+against the per-registration number. The scheduler's capacity accounting exists to spread
+load, not to enforce a limit, and a refusal is an ordinary outcome rather than an error. There is deliberately no routing-strategy
 family — no consistent hash, no least-frequently-used, no sticky broadcast — because each one
 is a mode that must be understood during an incident and none solves a problem that
 round-robin plus capacity does not.

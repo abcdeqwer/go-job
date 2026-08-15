@@ -94,24 +94,30 @@ Each is audited with actor, target and reason. Each requires the `OPERATOR` role
 
 | Action | Effect | Guard |
 | --- | --- | --- |
-| **Trigger** | creates a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one |
+| **Create** | a new job: handler, schedule, parameters, policy | `handler_key` chosen from what live executors declare |
+| **Trigger** | a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one — and is selected ahead of it, so it cannot starve |
 | **Pause / resume** | sets `ops_paused` | takes the state-row lock, so it cannot race a claim into one extra run |
 | **Edit** | schedule, concurrency, retry budget, timeouts | optimistic `version` CAS; rejected if the row changed underneath |
 | **Retry** | `dead` → `ready`, attempt budget reset | audited with a reason; never automatic |
 | **Cancel** | `running` → `cancel_requested` | see below |
-| **Retire** | removes a job from the schedule | explicit; deleting the handler from code does **not** do this implicitly |
+| **Retire** | ends a job permanently | **cancels its outstanding executions**, audited; the row and history are kept |
 
 ### Cancel is presented honestly
 
 A cancel request shows as `cancel_requested` until the handler confirms it stopped. The UI
 does not claim the job is cancelled while it may still be writing.
 
-When an execution reaches `cancelled`, the UI shows **which of two things happened**:
+When an execution reaches a terminal state, the UI reads `terminal_reason` and says which of
+these happened:
 
 - *cancelled (handler confirmed stopped)* — the handler returned after the signal;
-- *cancelled (fenced; side effects unverified)* — the lease expired and ownership was
-  fenced. The scheduler will accept no further results, but nothing here proves an
-  in-flight request was withdrawn or a partial write rolled back.
+- *cancelled (fenced; side effects unverified)* — the lease expired and ownership was fenced.
+  The scheduler will accept no further results, but nothing here proves an in-flight request
+  was withdrawn or a partial write rolled back;
+- *cancelled (job retired)* — resolved because its job was retired;
+- **and a cancel that arrived too late shows as `success`, not `cancelled`** — with the cancel
+  request visible in the audit trail. The work finished; recording it as cancelled would tell
+  an operator the opposite of the truth about a job that may have moved money.
 
 Collapsing both into "cancelled" invites an operator to assume nothing happened. For a job
 with external effects that is the most expensive available wrong assumption, so the UI
@@ -123,28 +129,43 @@ refuses to make it.
 
 The UI is a client of this API; the API is the contract.
 
+**Every job, execution and executor route is under an explicit tenant prefix.** A job name is
+unique only within a tenant, so a path without one is ambiguous and two implementations would
+resolve it differently — or worse, consistently but not as the operator expected.
+
 ```text
-GET    /api/jobs                       list with effective state
-GET    /api/jobs/{name}                detail, configuration, conditions
-PATCH  /api/jobs/{name}                edit; requires If-Match: <version>
-POST   /api/jobs/{name}/pause          body: {reason}
-POST   /api/jobs/{name}/resume         body: {reason}
-POST   /api/jobs/{name}/trigger        body: {reason}; returns execution key
-POST   /api/jobs/{name}/retire         body: {reason}
+GET    /api/tenants                                    registry, admission state, last_error
+POST   /api/tenants                                    add a site; body includes DSNs
+PATCH  /api/tenants/{tenant}                           enable/disable, re-point DSN
+GET    /api/tenants/{tenant}/handlers                  handler_keys live executors declare
 
-GET    /api/executions                 filter: job, status, from, to
-GET    /api/executions/{key}           detail including attempt history
-POST   /api/executions/{key}/retry     dead -> ready; body: {reason}
-POST   /api/executions/{key}/cancel    running -> cancel_requested; body: {reason}
+GET    /api/tenants/{tenant}/jobs                      list with effective state
+POST   /api/tenants/{tenant}/jobs                      create: handler_key, schedule, params
+GET    /api/tenants/{tenant}/jobs/{name}               detail, configuration, conditions
+PATCH  /api/tenants/{tenant}/jobs/{name}               edit; requires If-Match: <version>
+POST   /api/tenants/{tenant}/jobs/{name}/pause         body: {reason}
+POST   /api/tenants/{tenant}/jobs/{name}/resume        body: {reason}
+POST   /api/tenants/{tenant}/jobs/{name}/trigger       body: {reason, params?}
+POST   /api/tenants/{tenant}/jobs/{name}/retire        body: {reason}
 
-GET    /api/executors                  live executors and handler sets
-GET    /api/orphans                    enabled jobs with no live handler
-GET    /api/audit                      filter: job, actor, from, to
+GET    /api/tenants/{tenant}/executions                filter: job, status, from, to
+GET    /api/tenants/{tenant}/executions/{key}          detail plus attempt history
+POST   /api/tenants/{tenant}/executions/{key}/retry    dead -> ready; body: {reason}
+POST   /api/tenants/{tenant}/executions/{key}/cancel   body: {reason}
 
-GET    /healthz                        liveness
-GET    /readyz                         readiness
-GET    /metrics                        Prometheus exposition
+GET    /api/tenants/{tenant}/executors                 live executors and handler sets
+GET    /api/tenants/{tenant}/orphans                   enabled jobs no live executor serves
+GET    /api/tenants/{tenant}/audit                     filter: job, actor, from, to
+
+GET    /healthz                                        liveness
+GET    /readyz                                         readiness
+GET    /metrics                                        Prometheus exposition
 ```
+
+`POST /jobs` is how jobs come into existence — there is no other way. The scheduler holds no
+handler code, so creating a job means selecting a `handler_key` from
+`GET /handlers` (what live executors declare), plus a schedule, parameters and policy.
+Attempt history at `GET /executions/{key}` is served from `job_execution_attempt`.
 
 Conventions:
 

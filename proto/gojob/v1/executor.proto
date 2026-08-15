@@ -65,6 +65,18 @@ service JobExecutor {
 // ---------------------------------------------------------------------------
 // Scheduler-hosted service. Executors call these.
 // ---------------------------------------------------------------------------
+// Every call in both directions is authenticated at the transport: mutual TLS, or a
+// pre-shared credential carried in metadata. This is not optional hardening.
+//
+// The dispatch endpoint executes work on request, so an unauthenticated JobExecutor is
+// remote code execution by configuration. And an unauthenticated JobScheduler would let any
+// process register itself for any tenant, declare a valuable handler, advertise capacity,
+// and be handed that tenant's parameters and executions by ordinary round-robin routing —
+// physical database isolation does not protect a dispatch path that trusts its callers.
+//
+// The scheduler binds the authenticated identity to what it may claim: an identity is
+// authorized for a set of tenants and executor groups, and a Register naming anything
+// outside that set is refused. Identity is never taken from the request body.
 service JobScheduler {
   // Register announces an executor and its handlers. The scheduler probes the executor
   // (Describe, plus a GetExecution for a key it cannot hold) before accepting.
@@ -81,9 +93,11 @@ service JobScheduler {
   // least able to check in.
   rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
 
-  // ReportResult delivers a terminal outcome. Idempotent on (execution_key, run_token).
+  // ReportResult delivers a terminal outcome. Idempotent on (tenant, execution_key,
+  // run_token): a redelivery of a result already recorded returns OK with
+  // already_recorded=true, so a lost response never turns into a spurious ABORTED.
   //
-  //   ABORTED   this attempt was fenced; discard and do not retry the report
+  //   ABORTED   this attempt was fenced by a DIFFERENT token; discard and do not retry
   //   NOT_FOUND unknown execution; discard
   rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
 }
@@ -101,7 +115,8 @@ service JobScheduler {
 //
 // Three rules, enforced by the scheduler:
 //   - parameters are DATA, never instructions. No command lines, scripts, URLs to fetch or
-//     handler names. The executor resolves handler_key against its own compiled registry.
+//     handler names. The executor resolves handler_key against its own registry; the
+//     scheduler holds no handler code at all.
 //   - size is bounded, and the bound is rejected at the API rather than discovered when a
 //     row overflows.
 //   - no secrets. Parameters are stored, displayed and written to history; an executor
@@ -128,8 +143,14 @@ message DescribeResponse {
   // Handlers this executor can run. A job routes to a group declaring its handler_key.
   repeated string handler_keys = 2;
 
-  // Maximum concurrent executions this instance will hold. The scheduler will not exceed
-  // it; the executor must still answer RESOURCE_EXHAUSTED if it would.
+  // Concurrent executions this instance is willing to hold. ADVISORY: schedulers use it to
+  // spread load, but it cannot be enforced atomically — two scheduler instances may select
+  // the same executor at the same moment, and a process registered for several tenants
+  // advertises capacity separately in each.
+  //
+  // The authoritative limit is therefore the executor's own RESOURCE_EXHAUSTED, which it
+  // must return whenever accepting would exceed what it can actually run, counted across
+  // ALL tenants it serves.
   int32 capacity = 3;
 
   // Build identity, for the admin UI and for rollout diagnosis.
@@ -168,9 +189,16 @@ message RunRequest {
   // Business time of the fire instant this execution belongs to, RFC 3339.
   string scheduled_at = 7;
 
-  // Business time after which the scheduler treats silence as loss, RFC 3339. Extended by
-  // ReportProgress. It bounds silence, not runtime.
-  string deadline = 8;
+  // How long the executor may stay silent before the scheduler treats this attempt as lost,
+  // in seconds, counted from receipt. Extended by every ReportProgress.
+  //
+  // Deliberately a DURATION, not an absolute instant. Silence is an ownership decision, and
+  // ownership timestamps live in the scheduler's database clock; sending an absolute time
+  // would force the executor to compare it against its own clock and make liveness depend
+  // on skew between machines. A duration needs no shared clock at all.
+  //
+  // It bounds silence, not runtime — see timeout_seconds for the runtime cap.
+  int32 silence_deadline_seconds = 8;
 
   // Hard cap on total runtime in seconds, independent of the deadline. An execution that
   // keeps reporting progress is still stopped here.
@@ -194,6 +222,10 @@ message CancelRequest {
 message CancelResponse {
   // True if the executor knew the execution and signalled it to stop. False means it was
   // not held — already finished, or never received.
+  //
+  // A cancel that arrives after the handler has already succeeded does not erase that: the
+  // executor still reports its real outcome, and the scheduler records success. Cancellation
+  // requests a stop; it does not rewrite what happened.
   bool acknowledged = 1;
 }
 
@@ -272,7 +304,12 @@ message RegisterResponse {
 
 message HeartbeatRequest {
   string executor_id = 1;
-  int32 running = 2;
+
+  // Required. Registrations are per tenant, and so is this heartbeat: a process serving
+  // several tenants heartbeats once per tenant.
+  string tenant = 2;
+
+  int32 running = 3;
 }
 
 message HeartbeatResponse {
@@ -281,11 +318,17 @@ message HeartbeatResponse {
 }
 
 message ReportProgressRequest {
-  string execution_key = 1;
-  string run_token = 2;
+  // Required. execution_key is unique only WITHIN a tenant — two tenants may legitimately
+  // hold the same job name and therefore the same key — so every callback must name its
+  // tenant. Without it a load-balanced scheduler cannot tell which coordination schema to
+  // write, and no in-memory mapping can help because callbacks are instance-agnostic.
+  string tenant = 1;
+
+  string execution_key = 2;
+  string run_token = 3;
 
   // Optional, human-readable, for the admin UI. Liveness does not depend on it.
-  string message = 3;
+  string message = 4;
 }
 
 message ReportProgressResponse {
@@ -293,14 +336,17 @@ message ReportProgressResponse {
   // working after this is outside the contract and its result will be refused.
   bool proceed = 1;
 
-  // Extended deadline, RFC 3339.
-  string deadline = 2;
+  // Renewed silence budget in seconds, counted from receipt of this response.
+  int32 silence_deadline_seconds = 2;
 }
 
 message ReportResultRequest {
-  string execution_key = 1;
-  string run_token = 2;
-  ExecutionOutcome outcome = 3;
+  // Required, for the same reason as ReportProgressRequest.tenant.
+  string tenant = 1;
+
+  string execution_key = 2;
+  string run_token = 3;
+  ExecutionOutcome outcome = 4;
 }
 
 message ExecutionOutcome {
@@ -327,4 +373,8 @@ message ExecutionOutcome {
   bool did_work = 5;
 }
 
-message ReportResultResponse {}
+message ReportResultResponse {
+  // True when this exact (execution_key, run_token) result had already been recorded — a
+  // redelivery after a lost response. The executor treats it as success and stops retrying.
+  bool already_recorded = 1;
+}
