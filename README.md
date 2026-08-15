@@ -103,7 +103,7 @@ into a distributed-systems project:
 
 | Component | Requirement | Why |
 | --- | --- | --- |
-| **MySQL** | 8.0 or later, one database or schema per tenant | durability and coordination authority; `SELECT ... FOR UPDATE SKIP LOCKED` is required |
+| **MySQL** | 8.0 or later, one coordination schema per tenant | durability and coordination authority; `SELECT ... FOR UPDATE SKIP LOCKED` is required |
 | **Go** | 1.26 or later | the library and your handlers compile into one binary |
 | A migration tool | any — Flyway, golang-migrate, `psql`-style scripts, your own | this library exports versioned DDL and never executes it |
 
@@ -128,7 +128,12 @@ keep in sync.
 
 ```go
 sched, err := gojob.New(gojob.Config{
-    Tenants:  tenants,               // name -> DSN
+    Tenants: map[string]gojob.Tenant{
+        // Coordination holds the scheduler's own tables.
+        // Business is what handlers receive; it defaults to Coordination.
+        "acme": {Coordination: acmeSchedDSN, Business: acmeDSN},
+        "beta": {Coordination: betaDSN},     // one schema for both
+    },
     Location: time.UTC,              // business time zone
     Listen:   ":8090",               // admin UI, health, metrics
 })
@@ -239,7 +244,7 @@ misconfiguration that starts two control planes costs duplicated effort, not dam
 | `SCHEDULER_ROLE` | `WORKER`, `CONTROL_PLANE`, or both |
 | `WORKER_HANDLERS` | this deployment's execution assignment; defaults to the whole registry |
 | `LISTEN_ADDRESS` | admin UI, health, readiness and metrics |
-| tenant list | tenant name to DSN, from config or supplied programmatically |
+| tenant list | per tenant, a coordination DSN and an optional business DSN — see `doc/data-model.md` §0 |
 
 A handler named in configuration but missing from the binary is a fatal startup error — a
 packaging mistake, caught loudly. A handler outside this deployment's assignment is simply

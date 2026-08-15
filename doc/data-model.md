@@ -11,26 +11,73 @@ Table names carry a configurable prefix, shown here as `job_`.
 
 ## 0. Where these tables live
 
-The library requires **a** MySQL schema per tenant for coordination. Whether that is the
-tenant's business schema or a dedicated one is the host's decision; nothing in the protocol
-depends on the answer, and the library never needs to know what else is in the schema.
+The library requires **a** MySQL schema per tenant for its coordination tables. Whether
+that is the tenant's business schema or a dedicated one is chosen **by the adopter, in
+configuration** — it is not a build-time option and there is no code path in this library
+that differs between the two.
 
-The choice has exactly one consequence, and it is worth making deliberately:
+Each tenant supplies up to two DSNs:
 
-| Topology | Coordination schema | What it costs / buys |
+```go
+Tenants: map[string]gojob.Tenant{
+    // dedicated coordination schema
+    "acme": {Coordination: "…/acme_scheduler", Business: "…/acme"},
+
+    // shared: the same schema holds both
+    "beta": {Coordination: "…/beta"},
+},
+```
+
+`Coordination` is required and is where the tables in this document live. `Business` is
+optional and defaults to `Coordination`; it is what `ctx.DB()` hands to handlers. That is
+the entire selection mechanism, and it exists in exactly one place.
+
+### The difference is operational, not behavioural
+
+In this version the two topologies are **identical in correctness**. Nothing about
+ownership, durability or recovery changes, and no guarantee is stronger in one than the
+other.
+
+What differs is operations:
+
+| | Dedicated coordination schema | Shared with business |
 | --- | --- | --- |
-| **Shared** | the tenant's business schema | A handler can write its own progress **in the same transaction** as the scheduler's completion write. This is what makes cursor and checkpoint patterns airtight: the checkpoint and the "this run succeeded" record commit together or not at all. |
-| **Separate** | a dedicated scheduler schema | Clean operational separation — the scheduler can be backed up, tuned, migrated and access-controlled independently, and it holds no lock inside a business database. In exchange, a handler's business write and the scheduler's completion write are two transactions, so a crash between them is possible and the handler must be idempotent to survive it. |
+| Backup, tuning, access control | independent of business data | coupled |
+| Blast radius of scheduler churn | isolated | scheduler write load sits in the business schema |
+| Locks held inside the business database | none | the state row lives there |
+| Schemas to provision and migrate | one more per tenant | none extra |
+| Connection budget | two pools per tenant | one |
 
-Neither is wrong. **Separate is the better default**, because most handlers already need
-idempotency for other reasons and operational independence is worth more than a narrow
-atomicity window. Choose shared only for handlers whose correctness genuinely rests on
-committing progress and completion together.
+**Dedicated is the better default.** Shared is a reasonable simplification for small
+installations that would rather manage one schema.
 
-What is *not* offered is one shared coordination schema for all tenants with a `tenant_id`
-column. That would trade the isolation property this design is built on for a saving in
-schema count, and it would make every coordination query one forgotten predicate away from
-crossing a tenant boundary.
+### Why there is no atomicity argument here
+
+A tempting claim is that sharing a schema lets a handler commit its own progress in the
+**same transaction** as the scheduler's completion write, making checkpoint patterns
+airtight. That would be a real advantage — but it is not one this library provides, because
+it exposes no API through which a handler can join the completion transaction. A handler
+always opens its own transaction on `ctx.DB()`, and whether the coordination tables happen
+to live in the same schema is irrelevant to it.
+
+Such an API is deliberately absent rather than merely unbuilt:
+
+- it would bind handler code to the scheduler's transaction lifecycle;
+- it would work in only one topology, so code written against it breaks the day someone
+  moves the coordination schema — a trap that fires long after the decision that set it;
+- it closes exactly one of several crash points. A handler still has to survive crashing
+  before its own write, or after the completion write and before the next run observes it,
+  so idempotency is required regardless and the API buys less than it appears to.
+
+If a future version offers it, it will be an opt-in capability that fails loudly when the
+topology cannot support it — not a silent difference in guarantees between two
+configurations.
+
+### What is not offered
+
+One shared coordination schema for all tenants, with a `tenant_id` column. That trades the
+isolation property this whole design rests on for a saving in schema count, and it puts
+every coordination query one forgotten predicate away from crossing a tenant boundary.
 
 ### How this affects discovery
 
