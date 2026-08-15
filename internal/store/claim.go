@@ -179,13 +179,48 @@ type ClaimParams struct {
 	ExecutorID string
 	RunToken   string
 
-	LeaseSeconds   int
-	TimeoutSeconds int
-
 	// BackoffSeconds is how far available_at moves when the candidate is rejected for
 	// contention or unrunnability. Bounded, so a rejected row stops occupying the front of an
 	// ordered, bounded discovery page instead of blocking it forever.
 	BackoffSeconds int
+}
+
+// ClaimOutcome says what the claim transaction did. All three COMMIT: a rejection writes a
+// backoff or a terminal `skipped`, and rolling that back would leave the candidate at the
+// front of the next discovery page, spinning against a busy job at full rate.
+type ClaimOutcome int
+
+const (
+	// ClaimAcquired means the job lock is held and the execution is `dispatching`. The caller
+	// dispatches only after this commits.
+	ClaimAcquired ClaimOutcome = iota
+
+	// ClaimDeferred means the candidate was rejected — held by another execution, paused,
+	// or unrunnable — and its available_at has been pushed forward.
+	ClaimDeferred
+
+	// ClaimSkipped means FORBID marked this occurrence terminal.
+	ClaimSkipped
+)
+
+// ClaimResult is what a claim transaction committed.
+type ClaimResult struct {
+	Outcome ClaimOutcome
+
+	// FenceEpoch is set only for ClaimAcquired. Every subsequent write for this attempt
+	// carries it.
+	FenceEpoch int64
+
+	// Definition is the configuration as read inside the claim transaction. The lease and
+	// timeout applied to this attempt come from here, not from the caller — a caller that
+	// read the definition earlier could otherwise claim under one configuration and track
+	// under another.
+	Definition gojob.Definition
+
+	// Reason is nil for ClaimAcquired and otherwise wraps gojob.ErrContended or
+	// gojob.ErrNotRunnable, so the caller can log and meter the rejection without having to
+	// treat a committed decision as a failed call.
+	Reason error
 }
 
 // Claim is the whole of doc/protocol.md §2, as one short transaction.
@@ -204,10 +239,16 @@ type ClaimParams struct {
 // call is the point of no return, so everything needed to reason about it afterwards must
 // already be durable.
 //
-// Returns the fence epoch the caller must carry on every subsequent write for this attempt.
-// Dispatch happens only after this commits.
-func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (epoch int64, err error) {
-	err = s.tx(ctx, func(tx *sql.Tx) error {
+// A rejection is a COMMITTED decision, not a failed call. It is reported through
+// ClaimResult.Outcome rather than by returning an error, because returning an error would
+// roll back the very write that makes the rejection safe — the backoff that stops the
+// candidate spinning at the front of the next discovery page, or the terminal `skipped` row
+// FORBID just wrote. An error from this method means the transaction did not commit at all.
+//
+// Dispatch happens only after this commits, using ClaimResult.Definition's lease and timeout.
+func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (ClaimResult, error) {
+	var out ClaimResult
+	err := s.tx(ctx, func(tx *sql.Tx) error {
 		// 1. The state row first, always.
 		st, err := lockState(ctx, tx, p.JobName)
 		if err != nil {
@@ -220,23 +261,38 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (ep
 		if err != nil {
 			return err
 		}
-		if err := runnable(ctx, tx, def, st); err != nil {
-			if errors.Is(err, gojob.ErrNotRunnable) {
-				if bErr := deferCandidate(ctx, tx, p.ExecutionID, p.BackoffSeconds, s.clock.Now()); bErr != nil {
-					return bErr
-				}
+		out.Definition = def
+
+		// ops_paused is a RUNNABILITY condition, not contention. Reporting a paused job as
+		// "someone else is running it" is the conflation doc/protocol.md §4 forbids: it turns
+		// a job an operator deliberately stopped into one that merely looks busy, and the
+		// distinction is the whole content of the alert.
+		if st.OpsPaused {
+			out.Outcome, out.Reason = ClaimDeferred,
+				fmt.Errorf("%w: job %q is paused by an operator", gojob.ErrNotRunnable, p.JobName)
+			return deferCandidate(ctx, tx, p.ExecutionID, p.BackoffSeconds, s.clock.Now())
+		}
+		if rErr := runnable(ctx, tx, def, st); rErr != nil {
+			if !errors.Is(rErr, gojob.ErrNotRunnable) {
+				return rErr
 			}
-			return err
+			out.Outcome, out.Reason = ClaimDeferred, rErr
+			return deferCandidate(ctx, tx, p.ExecutionID, p.BackoffSeconds, s.clock.Now())
 		}
 
 		// A held job is the ONLY zero-row outcome that is ordinary. It is decided here,
-		// after the lock proved the row exists, so that a missing row or a paused job can
-		// never be misreported as "someone else is running it".
-		if st.Held() || st.OpsPaused {
-			return s.applyContention(ctx, tx, p, def, st)
+		// after the lock proved the row exists and after every operational condition has
+		// been ruled out, so that a missing row or a paused job can never be misreported as
+		// "someone else is running it".
+		if st.Held() {
+			return s.applyContention(ctx, tx, &out, p, def, st)
 		}
 
-		epoch = st.FenceEpoch + 1
+		out.Outcome = ClaimAcquired
+		out.FenceEpoch = st.FenceEpoch + 1
+		epoch := out.FenceEpoch
+		leaseSeconds := int(def.Lease / time.Second)
+		timeoutSeconds := int(def.Timeout / time.Second)
 
 		// 3. Acquire the job lock. The guard is `active_kind IS NULL`, NOT "or the lease
 		//    expired": a claim never steals an expired holder. If it could, the previous
@@ -257,7 +313,7 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (ep
 			    updated_at       = ?
 			WHERE job_name = ? AND ops_paused = 0 AND active_kind IS NULL`,
 			p.ExecutionKey, p.Owner, p.RunToken, nullString(p.ExecutorID),
-			epoch, p.LeaseSeconds, s.clock.Now(), p.JobName)
+			epoch, leaseSeconds, s.clock.Now(), p.JobName)
 		if err != nil {
 			return fmt.Errorf("acquire job lock %q: %w", p.JobName, err)
 		}
@@ -284,28 +340,28 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (ep
 			    updated_at     = ?
 			WHERE id = ? AND status = 'ready' AND attempt_no < max_attempts`,
 			p.Owner, nullString(p.ExecutorID), p.RunToken, epoch,
-			p.LeaseSeconds, p.TimeoutSeconds, s.clock.Now(), p.ExecutionID)
+			leaseSeconds, timeoutSeconds, s.clock.Now(), p.ExecutionID)
 		if err != nil {
 			return fmt.Errorf("claim execution %d: %w", p.ExecutionID, err)
 		}
 		return assertOne(res, "claim: mark dispatching")
 	})
 	if err != nil {
-		return 0, err
+		return ClaimResult{}, err
 	}
-	return epoch, nil
+	return out, nil
 }
 
 // applyContention runs the concurrency policy, having already proved under the lock that the
-// job is genuinely held.
-func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, p ClaimParams, def gojob.Definition, st StateRow) error {
+// job is genuinely held. It records the decision on out and returns nil, so the transaction
+// commits what it wrote.
+func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, out *ClaimResult, p ClaimParams, def gojob.Definition, st StateRow) error {
 	now := s.clock.Now()
 
 	// FORBID never applies to a manual trigger. It exists to stop a schedule piling up on
 	// itself; silently discarding an operator's explicit request is the opposite of what
-	// pressing the button means. A paused job also queues rather than being skipped —
-	// pausing is meant to defer work, not delete it.
-	if def.Concurrency == gojob.PolicyForbid && !st.OpsPaused {
+	// pressing the button means.
+	if def.Concurrency == gojob.PolicyForbid {
 		manual, err := isManual(ctx, tx, p.ExecutionID)
 		if err != nil {
 			return err
@@ -325,16 +381,18 @@ func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, p ClaimParams, 
 			if err := assertOne(res, "claim: FORBID skip"); err != nil {
 				return err
 			}
-			return fmt.Errorf("%w: job %q, execution skipped by FORBID", gojob.ErrContended, p.JobName)
+			out.Outcome = ClaimSkipped
+			out.Reason = fmt.Errorf("%w: job %q held by %s; occurrence skipped by FORBID",
+				gojob.ErrContended, p.JobName, st.ActiveExecution.String)
+			return nil
 		}
 	}
 
 	// QUEUE, and every manual trigger: leave it ready and push available_at forward so a
 	// blocked claim does not spin against a busy job.
-	if err := deferCandidate(ctx, tx, p.ExecutionID, p.BackoffSeconds, now); err != nil {
-		return err
-	}
-	return fmt.Errorf("%w: job %q held by %s", gojob.ErrContended, p.JobName, st.ActiveExecution.String)
+	out.Outcome = ClaimDeferred
+	out.Reason = fmt.Errorf("%w: job %q held by %s", gojob.ErrContended, p.JobName, st.ActiveExecution.String)
+	return deferCandidate(ctx, tx, p.ExecutionID, p.BackoffSeconds, now)
 }
 
 // deferCandidate pushes a rejected candidate's available_at forward.
