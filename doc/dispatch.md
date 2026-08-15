@@ -1,408 +1,383 @@
 # Executor contract
 
-This is the wire contract between the scheduler and an executor. It is plain HTTP and
-JSON, in both directions, so an executor can be written in any language.
+`proto/gojob/v1/executor.proto` is the contract. This document explains it and states the
+behaviour the types cannot express.
 
-An executor implements four endpoints and calls four. Nothing else is required of it, and
-in particular **an executor never touches the scheduler's database and never implements any
-part of the ownership protocol**. Deciding who owns an execution is subtle enough that it
-should exist in exactly one place; that place is the scheduler.
+Two services, in opposite directions:
 
----
+| Service | Hosted by | Called by |
+| --- | --- | --- |
+| `JobExecutor` | the executor | the scheduler |
+| `JobScheduler` | the scheduler | the executor |
 
-## 1. Shape
-
-```text
-  executor                                scheduler
-     |                                        |
-     |-- register ------------------------->  |   who I am, what I can run
-     |-- heartbeat ------------------------>  |   still alive, current load
-     |                                        |
-     |  <---------------------- run --------  |   run this execution
-     |-- accepted (202) ------------------->  |
-     |                                        |
-     |-- progress ------------------------->  |   still working; may I continue?
-     |-- result --------------------------->  |   done, here is what happened
-     |                                        |
-     |  <-------------------- cancel -------  |   stop if you can
-     |  <-------------------- status -------  |   what happened to X? (reconciliation)
-```
-
-Dispatch is **asynchronous**: the scheduler hands over an execution, the executor accepts
-it and reports later. A synchronous call that stayed open for the duration would tie an
-HTTP connection to a job that may run for hours and would turn every proxy timeout into a
-lost result.
+An executor **never touches the scheduler's database and never implements any part of the
+ownership protocol**. Deciding who owns an execution is subtle enough to exist in exactly
+one place, and that place is the scheduler. What an executor does is narrow: accept work,
+run it, say what happened.
 
 ---
 
-## 2. Identity
+## 1. Why gRPC, and what it actually buys
 
-| Field | Meaning |
-| --- | --- |
-| `executor_id` | unique per **process**: `<group>-<host>-<boot-nonce>`. A restart produces a new one, so a restarted executor never inherits its predecessor's registration. |
-| `group` | the logical executor a job routes to, e.g. `orders-worker`. Several instances share a group. |
-| `tenant` | which tenant's work this executor serves. |
-| `handler_key` | the unit of routing. A job names a handler; a group declares which handlers it implements. |
-| `execution_key` | the scheduler's durable identity for one logical run. **This is the idempotency key.** |
-| `run_token` | identifies one *attempt* of that execution. It fences results: a result carrying a stale token is refused. |
+The goal is to fail at **build time**, not at registration time. Discovering a missing
+endpoint when an executor first tries to register — then another when the first is fixed —
+is the failure mode this contract is shaped to avoid.
 
----
+Generated stubs move a whole class of problems earlier:
 
-## 3. Executor → scheduler
+| Problem | Hand-written HTTP | Generated stubs |
+| --- | --- | --- |
+| a method is not implemented | found when first called | **Go: compile error.** Other languages: `UNIMPLEMENTED` at startup probe |
+| wrong field type or name | runtime parse failure | **compile error, every language** |
+| hand-rolled serialization bug | a recurring source of defects | does not exist — the code is generated |
+| a new field is added to the contract | silently ignored | appears in generated code; visible in review |
+| probing "did you implement this?" | `404` is ambiguous — missing route, or missing key? | `UNIMPLEMENTED` and `NOT_FOUND` are different codes. Unambiguous |
 
-### 3.1 Register
+That last row is why registration-time verification actually works here (§6).
 
-```http
-POST /api/v1/executors/register
-Content-Type: application/json
+### Compile-time enforcement per language
 
-{
-  "executor_id": "orders-worker-a1b2c3",
-  "group":       "orders-worker",
-  "tenant":      "np",
-  "address":     "http://10.0.1.5:9100",
-  "handlers":    ["orders.rollup", "orders.reconcile"],
-  "revision":    "8f21c4e",
-  "capacity":    8
-}
-```
+- **Go** — generated servers carry `mustEmbedUnimplementedJobExecutorServer`. **An executor
+  must not embed `UnimplementedJobExecutorServer`.** Without it, failing to implement any
+  method is a compile error, and adding a method to the contract breaks the build of every
+  executor immediately — which is the point.
+- **Java** — `JobExecutorGrpc.JobExecutorImplBase` supplies defaults returning
+  `UNIMPLEMENTED`, so the compiler will not catch a missing method. The registration probe
+  does, at startup, before any work is routed.
+- **Python, Node, PHP** — dynamic; the probe is the enforcement.
 
-```json
-200 OK
-{ "heartbeat_interval_seconds": 10, "registration_ttl_seconds": 45 }
-```
+The contract is therefore strongest in Go and still fails early elsewhere. It never fails
+*silently* anywhere.
 
-`address` is where the scheduler will call. It must be reachable from the scheduler — see
-§7. `capacity` is how many concurrent executions this instance is willing to hold; the
-scheduler will not exceed it.
+### What no type system can enforce
 
-Registration is idempotent: re-registering the same `executor_id` updates the record.
+Semantics. That a duplicate `execution_key` returns `ALREADY_EXISTS`, that an accepted
+execution eventually reports a result, that running the same work twice is harmless — none
+of these are expressible in a signature. They are covered by the conformance suite (§7).
 
-### 3.2 Heartbeat
+### The four layers
 
-```http
-POST /api/v1/executors/heartbeat
-{ "executor_id": "orders-worker-a1b2c3", "running": 3 }
-```
+Each catches what the previous cannot. The point is that **each layer reports everything it
+finds at once**, rather than one problem per attempt:
 
-```json
-200 OK
-{ "known": true }
-```
-
-`known: false` means the scheduler has forgotten this executor — its TTL lapsed. The
-executor must re-register rather than continue heartbeating, which is what makes recovery
-after a scheduler restart automatic.
-
-An executor that misses `registration_ttl_seconds` is removed from routing. It is not
-killed and its running executions are not abandoned; §6 covers what happens to them.
-
-### 3.3 Progress
-
-For anything long enough that the scheduler would otherwise time it out.
-
-```http
-POST /api/v1/executions/{execution_key}/progress
-{ "run_token": "9c2f…", "message": "3000/10000 rows" }
-```
-
-```json
-200 OK
-{ "continue": true, "deadline": "2026-08-15T01:38:00+08:00" }
-```
-
-`continue: false` means **stop now**: the execution was cancelled, or this attempt was
-fenced because the scheduler already gave the work to someone else. An executor that keeps
-working after `continue: false` is outside the contract, and its results will be refused.
-
-Progress extends the deadline. An executor that stops reporting progress will have its
-execution treated as lost once the deadline passes.
-
-### 3.4 Result
-
-```http
-POST /api/v1/executions/{execution_key}/result
-{
-  "run_token":    "9c2f…",
-  "status":       "success",
-  "summary":      "rows=10000",
-  "failure_kind": null
-}
-```
-
-`status` is `success` or `failed`. `failure_kind` is a short stable string for grouping and
-alerting — `timeout`, `upstream_5xx`, `validation` — not a free-text message. `summary` is
-the one line an operator reads in history.
-
-```json
-200 OK      accepted
-409 Conflict {"error":"stale_run_token"}   this attempt was already fenced; discard
-404 Not Found                              unknown execution; discard
-```
-
-**A 409 is not a retry condition.** It means the scheduler has moved on and another attempt
-owns the work. The executor must stop and must not resend.
-
-Result delivery is retried by the executor on 5xx and network failure, with backoff. Result
-posts are idempotent on `(execution_key, run_token)`.
+| Layer | Catches | When |
+| --- | --- | --- |
+| build | missing methods, wrong types, serialization | compile |
+| conformance suite | semantics: dedupe, fencing, capacity, result delivery | executor's CI |
+| registration probe | declared-but-not-implemented, contract version mismatch | executor startup |
+| runtime detection | "accepted but never reported", duplicate token reports | continuously |
 
 ---
 
-## 4. Scheduler → executor
+## 2. Parameters
 
-### 4.1 Run
+`JobParams` carries a JSON-shaped structure to the handler. This is a first-class part of
+the contract, not an afterthought: a scheduler that can only say "run X" and not "run X for
+2026-08-14 with batch size 500" pushes that configuration into code, where operators cannot
+reach it.
 
-```http
-POST {address}/jobs/run
-Idempotency-Key: cron:orders.rollup:2026-08-15T01:30:00
+Parameters come from two places and are merged at execution creation:
 
-{
-  "execution_key": "cron:orders.rollup:2026-08-15T01:30:00",
-  "job_name":      "orders-rollup",
-  "handler_key":   "orders.rollup",
-  "tenant":        "np",
-  "run_token":     "9c2f…",
-  "attempt":       1,
-  "scheduled_at":  "2026-08-15T01:30:00+08:00",
-  "deadline":      "2026-08-15T01:38:00+08:00",
-  "params":        {}
-}
-```
-
-The executor answers immediately — it does not run the job first:
-
-```json
-202 Accepted   { "accepted": true }
-409 Conflict   { "accepted": false, "reason": "already_running" }
-429 Too Many   { "accepted": false, "reason": "at_capacity" }
-503            { "accepted": false, "reason": "shutting_down" }
-```
-
-**202 is a promise.** It means the executor has durably taken responsibility and will
-eventually post a result. If it cannot promise that, it must not answer 202.
-
-**409 must be answered when the executor already holds that `execution_key`**, and it is
-the executor's half of at-most-once dispatch. When a dispatch times out, the scheduler does
-not know whether the executor received it, so it re-sends with the same `Idempotency-Key`.
-An executor that starts a second run instead of answering 409 turns one network hiccup into
-a duplicate run.
-
-Deduplication is on `execution_key`, and it must survive the length of the run — an
-in-memory set of currently-held keys is sufficient, since a restarted executor has lost the
-work anyway and the scheduler will notice through §6.
-
-`deadline` is in business time and is authoritative. An executor should stop work of its own
-accord when it passes, rather than relying on being told.
-
-### Parameters
-
-`params` is a JSON object the handler receives verbatim. It comes from two places, merged
-at dispatch:
-
-1. **the job's configured default parameters**, edited and audited in the admin UI like any
-   other job setting;
+1. the job's **configured defaults**, edited and audited in the admin UI like any other
+   setting;
 2. **per-trigger overrides**, supplied when an operator triggers the job manually.
 
-The merged result is **snapshotted onto the execution row** when the execution is created,
-not resolved at dispatch time. History therefore shows what each run actually ran with,
-including runs whose configuration has since changed — otherwise "why did last Tuesday's
-run behave differently" is unanswerable.
+The merged value is **snapshotted onto the execution row when the execution is created**,
+not resolved at dispatch. History therefore shows what each run actually ran with, including
+runs whose configuration has since changed — otherwise "why did last Tuesday's run behave
+differently" has no answer.
 
-Three rules:
+Three rules, enforced by the scheduler:
 
-- `params` is **data, never instructions.** No command lines, no scripts, no URLs to fetch,
-  no handler names. The executor resolves `handler_key` against its own compiled registry;
-  a scheduler that could name arbitrary code would make its admin UI a remote shell;
-- size is bounded and the bound is enforced at the API, not discovered when a row
-  overflows;
-- **secrets do not travel here.** Parameters are stored in the database, shown in the UI and
-  written to history. An executor needing a credential reads it from its own configuration.
+- **data, never instructions.** No command lines, scripts, URLs to fetch, or handler names.
+  The executor resolves `handler_key` against its own compiled registry. A scheduler able to
+  name arbitrary code would make its admin UI a remote shell;
+- **bounded size**, rejected at the API rather than discovered when a row overflows;
+- **no secrets.** Parameters are stored, displayed in the UI and written to history. An
+  executor reads credentials from its own configuration.
 
-Values a handler could derive should be derived rather than passed: `scheduled_at` is in
-every dispatch, so a daily job computes its own business date instead of being told one that
-can drift from the fire instant it belongs to.
-
-### 4.2 Cancel
-
-```http
-POST {address}/jobs/cancel
-{ "execution_key": "…", "run_token": "9c2f…" }
-```
-
-```json
-200 OK { "acknowledged": true }
-```
-
-Acknowledgement means "I have signalled the work to stop", not "it has stopped".
-Cancellation is cooperative everywhere, and this contract does not pretend otherwise: the
-executor still posts a result when the work actually ends, and until it does the scheduler
-holds the execution in `cancel_requested`.
-
-### 4.3 Status — reconciliation
-
-```http
-GET {address}/jobs/{execution_key}
-```
-
-```json
-200 OK { "state": "running", "started_at": "…", "message": "3000/10000" }
-200 OK { "state": "finished", "status": "success", "summary": "rows=10000" }
-404 Not Found                       never seen, or already forgotten
-```
-
-The scheduler calls this when an execution has gone quiet — deadline passed, no progress,
-no result. It is what turns "I don't know" into a fact before any decision is made about
-retrying.
+Values a handler can derive should be derived rather than passed. `scheduled_at` accompanies
+every dispatch, so a daily job computes its own business date instead of being handed one
+that can drift from the fire instant it belongs to.
 
 ---
 
-## 5. Routing
+## 3. Dispatch
 
-A job names a `handler_key`. The scheduler dispatches to a **live instance of a group that
-declares that handler for that tenant**.
+`Run` returns immediately. The executor does **not** run the job before answering.
 
-Instance selection is **round-robin among healthy instances that are below capacity, with
-failover to the next instance on a dispatch failure**. That is the whole policy.
+```text
+scheduler                         executor
+   |-- Run(execution_key, ...) ------>|
+   |<---------------- OK -------------|   a promise: a result will follow
+   |                                  |   ... work happens ...
+   |<-- ReportProgress ---------------|   every progress_interval
+   |--- proceed=true, deadline ------>|
+   |<-- ReportResult -----------------|
+```
 
-There is deliberately no routing-strategy family — no consistent hash, no least-frequently-
-used, no sticky broadcast. Each additional strategy is a mode that must be understood
-during an incident, and none of them addresses a problem that round-robin plus capacity
-limits does not.
+An OK response to `Run` is **a promise**: the executor has durably taken responsibility and
+will eventually call `ReportResult`. An executor that cannot promise that must not answer
+OK.
 
-If no instance accepts, the execution stays `ready` and is retried on the next dispatch
-pass with a bounded backoff. It is never marked failed for lack of an executor: nothing was
-attempted, and an execution that reports a business failure when no business code ran is a
-lie in the history.
+Refusals are error codes rather than a boolean in the response body, so no caller can ignore
+one by forgetting to read a field:
 
-An enabled job whose handler **no live group declares** is an *orphan*. It is surfaced in
-the UI and alerted on, because nothing will ever run it (`admin.md` §4).
-
----
-
-## 6. Liveness: is a long execution alive or dead?
-
-A twenty-hour execution is not an edge case to be discouraged; it is a thing that must have
-a defined answer. The answer rests on **two independent signals**, and conflating them is
-the classic way to get this wrong.
-
-| Signal | Question it answers | Interval |
+| Code | Meaning | Scheduler does |
 | --- | --- | --- |
-| **registration heartbeat** (§3.2) | is the executor *process* alive? | ~10s, per process |
-| **execution progress** (§3.3) | is *this execution* still going? | ~30s, per execution |
+| `ALREADY_EXISTS` | this `execution_key` is already held | nothing — a re-send after a timeout landed correctly |
+| `RESOURCE_EXHAUSTED` | at capacity | try the next instance |
+| `UNAVAILABLE` | shutting down | try the next instance |
+| `FAILED_PRECONDITION` | unknown `handler_key` | log, alert; routing is wrong |
+
+**`ALREADY_EXISTS` is the executor's half of at-most-once dispatch.** When a dispatch times
+out, the scheduler does not know whether it arrived, so it re-sends with the same
+`execution_key`. An executor that starts a second run instead of refusing turns one network
+hiccup into a duplicate run. Deduplication is on `execution_key` and must last as long as
+the executor holds the work; an in-memory set is sufficient, because a restarted executor
+has lost the work anyway and §5 covers that case.
+
+---
+
+## 4. Liveness: is a long execution alive or dead?
+
+A twenty-hour execution is not an edge case to discourage; it needs a defined answer. That
+answer rests on **two independent signals**, and conflating them is the classic way to get
+this wrong.
+
+| Signal | Question | Interval |
+| --- | --- | --- |
+| `Heartbeat` | is the executor **process** alive? | ~10s, per process |
+| `ReportProgress` | is **this execution** still going? | ~30s, per execution |
 
 Neither substitutes for the other, because the interesting failures separate them:
 
 | Heartbeat | Progress | Conclusion |
 | --- | --- | --- |
 | fresh | fresh | healthy — **keep waiting, however long it takes** |
-| fresh | stale past deadline | the process is fine but this execution is wedged: deadlocked, spinning, or blocked on a socket. Query §4.3, then decide |
-| stale / gone | any | the executor is lost; every execution it held is lost with it |
-| fresh, `known:false` | — | the scheduler forgot it; the executor re-registers and its in-flight work is reconciled through §4.3 |
+| fresh | stale past deadline | the process is fine, this execution is wedged: deadlocked, spinning, blocked on a socket. Investigate via `GetExecution` |
+| stale / gone | any | the executor is lost, and every execution it held is lost with it |
+| `known=false` | — | the registration lapsed; the executor re-registers and declares its in-flight work (§5) |
 
-An executor that is alive but whose handler is stuck looks perfectly healthy to a
-process-level heartbeat. That is exactly the case the per-execution signal exists to catch,
-and it is why "the process is up" is never accepted as evidence that work is progressing.
+An executor that is alive while its handler is stuck looks perfectly healthy to a
+process-level heartbeat. That is precisely what the per-execution signal exists to catch,
+and why "the process is up" is never accepted as evidence that work is progressing.
 
-### The deadline is not a maximum duration
+### The deadline bounds silence, not runtime
 
-`deadline` bounds **silence**, not runtime. Every progress call pushes it forward, so an
-execution that keeps reporting is never reclaimed — twenty hours, or two hundred.
+Every `ReportProgress` pushes the deadline forward, so an execution that keeps reporting is
+never reclaimed — twenty hours, or two hundred.
 
-Three separate bounds exist and they are deliberately not merged:
+Three bounds exist and are deliberately not merged:
 
 | Bound | Meaning | Typical |
 | --- | --- | --- |
-| `progress_interval` | how often the executor must speak | 30s |
-| `deadline` | silence tolerated before the execution is investigated | 3 × `progress_interval` |
-| `timeout_seconds` | **hard cap on total runtime**, declared by the job | 24h for a long job |
+| `progress_interval_seconds` | how often the executor must speak | 30s |
+| `deadline` | silence tolerated before investigation | 3 × progress interval |
+| `timeout_seconds` | **hard cap on total runtime** | per job; 24h for a long one |
 
-A long job therefore configures a long `timeout_seconds` and an ordinary
-`progress_interval`. Raising the deadline to cover a job's full runtime would be the wrong
-fix: it converts "I will notice a stuck job in 90 seconds" into "I will notice it in 20
-hours".
+A long job configures a long `timeout_seconds` and an ordinary progress interval. Raising the
+deadline to cover a job's whole runtime would convert "I notice a stuck job in 90 seconds"
+into "I notice it in twenty hours".
 
 ### Progress must not depend on handler cooperation
 
-The executor framework emits progress **automatically on a timer while a handler is
-running**. It does not require the handler to call anything.
+The executor's framework calls `ReportProgress` **automatically on a timer while a handler
+runs**. The handler is not required to call anything.
 
-This matters because the handlers most likely to run for hours are exactly the ones least
-able to report: a single long-running query, a bulk load, a third-party call that blocks.
-If liveness depended on the handler remembering to check in, those jobs would be
-periodically declared dead while working perfectly.
+This matters because the handlers most likely to run for hours are the least able to report:
+a single long query, a bulk load, a blocking third-party call. If liveness depended on the
+handler remembering to check in, exactly those jobs would be declared dead while working
+perfectly.
 
-Handler-supplied progress messages (`"3000/10000 rows"`) remain available and are worth
-using — but they are for **observability**, so an operator can see movement, not for
-liveness. The two concerns are separated on purpose.
-
-The residual case — an executor whose handler is hung while the framework cheerfully
-reports progress — is why `timeout_seconds` exists as an independent hard cap, and why the
-UI shows time-since-last-*handler*-message alongside time-since-last-progress. A job whose
-framework is reporting but whose handler has said nothing for six hours is visible as such.
+Handler-supplied messages (`"3000/10000 rows"`) remain available and are worth using, but
+they are **observability**, not liveness. The residual case — a hung handler inside a
+cheerfully reporting framework — is what `timeout_seconds` exists for, and the UI shows
+time-since-last-*handler*-message next to time-since-last-progress so it is visible.
 
 ---
 
-## 7. Failure handling
+## 5. Reconciliation: `in_flight` at registration
 
-The hard cases, and what the scheduler does about each.
+The hardest question in a distributed scheduler is "did that actually run?" after either
+side restarts. This contract answers it by **having the executor declare what it is holding
+whenever it registers**, rather than by having the scheduler ask.
+
+```text
+executor restarts / reconnects
+  -> Register(in_flight: [{execution_key, run_token}, ...])
+  -> scheduler adopts what it still recognises,
+     and returns `fenced` for what it does not
+```
+
+That is more reliable than querying, because only the executor knows what it is really doing,
+and it costs one field on a message that is sent anyway.
+
+### `GetExecution` and the limits of asking
+
+`GetExecution` remains, for the case where the scheduler lost track while the executor kept
+running. It is reliable for exactly one question — **"are you running this right now?"** —
+and its `NOT_FOUND` must be read as **UNKNOWN, never as "it did not run"**:
+
+| Executor state | Answer | Means |
+| --- | --- | --- |
+| currently running | `RUNNING` | reliable |
+| just finished, still remembered | `FINISHED` + outcome | reliable |
+| restarted since | `NOT_FOUND` | **unknown** — it may have run partially, or fully, before dying |
+
+Making `NOT_FOUND` mean "did not run" would require the executor to persist execution state
+durably, which is real work to build a worse answer than one that already exists: **the
+handler's own idempotency key in business data.** A settlement that inserts
+`settlement_done(day)` in the same transaction as its output answers "did this run?"
+definitively, survives every restart, and costs one unique index.
+
+So the division is:
+
+| Question | Answered by |
+| --- | --- |
+| are you running it right now? | `GetExecution` / `in_flight` |
+| did this work ever actually happen? | the handler's idempotency key, in business data |
+
+This is why §8's first requirement is idempotency and not any of the RPCs.
+
+---
+
+## 6. Registration and probing
+
+Registration is a handshake, not an announcement. The scheduler verifies before routing:
+
+```text
+executor            Register(...)            scheduler
+        ------------------------------------>
+                                             calls back:
+        <---- Describe() -------------------  contract version, handlers, capacity
+        <---- GetExecution(random nonce) ---  must answer NOT_FOUND
+        ------------------------------------>
+                 registration active
+```
+
+The second probe is the important one: it asks for a key the executor **cannot** hold. A
+correct executor answers `NOT_FOUND`; one that never implemented the method answers
+`UNIMPLEMENTED`. Those are different codes, so "declared but not implemented" is caught at
+startup rather than during a failover months later.
+
+An incompatible `contract_version` is refused outright. A refused registration is a startup
+failure with a logged reason and an alert — never a silent partial capability.
+
+### Optional capabilities degrade visibly
+
+`Capability` lets an executor declare what it supports beyond the mandatory set. Absence is
+not an error; it changes what the scheduler offers:
+
+| Missing | Effect |
+| --- | --- |
+| `CAPABILITY_CANCEL` | the admin UI disables cancel for jobs routed here, rather than offering a button that does nothing |
+| `CAPABILITY_PROGRESS_DETAIL` | history shows framework keepalives only; no handler messages |
+
+---
+
+## 7. Routing
+
+A job names a `handler_key`. The scheduler dispatches to a live instance of a group that
+declares that handler for that tenant.
+
+Selection is **round-robin among healthy instances below capacity, failing over to the next
+on a dispatch refusal**. That is the whole policy. There is deliberately no routing-strategy
+family — no consistent hash, no least-frequently-used, no sticky broadcast — because each one
+is a mode that must be understood during an incident and none solves a problem that
+round-robin plus capacity does not.
+
+If no instance accepts, the execution stays `ready` and is retried with bounded backoff. It
+is **never marked failed for lack of an executor**: nothing was attempted, and recording a
+business failure when no business code ran is a lie in the history.
+
+An enabled job whose handler no live group declares is an **orphan**, surfaced in the UI and
+alerted on, because nothing will ever run it.
+
+---
+
+## 8. Failure handling
 
 | Situation | Scheduler behaviour |
 | --- | --- |
-| dispatch returns 202, result arrives | ordinary path |
-| dispatch times out, unknown whether received | re-dispatch with the same `Idempotency-Key`; the executor answers 409 if it already has it |
-| dispatch refused (409 / 429 / 503) | try the next instance; if none accept, leave `ready` with backoff |
-| accepted, then silence past the deadline | call `GET /jobs/{key}`; the answer decides |
-| status says `running` | extend and keep waiting; a slow job is not a failed one |
-| status says `finished` | adopt that result as if it had been posted |
-| status 404, or the executor is unreachable | the attempt is **lost**: fence the `run_token`, then retry per policy |
-| executor registration expires while holding work | the same lost-attempt path; registration TTL is not itself proof the work stopped |
+| `Run` OK, result arrives | ordinary path |
+| `Run` times out; unknown whether received | re-send with the same `execution_key`; the executor answers `ALREADY_EXISTS` if it has it |
+| `Run` refused | try the next instance; if none accept, stay `ready` with backoff |
+| accepted, then silence past the deadline | `GetExecution`; the answer decides |
+| `RUNNING` | extend and keep waiting — a slow job is not a failed one |
+| `FINISHED` | adopt the reported outcome |
+| `NOT_FOUND`, or unreachable | the attempt is **unknown**: fence the `run_token`, then retry per policy — which is safe only because handlers are idempotent (§9) |
+| registration expires while holding work | same unknown-attempt path; a lapsed TTL is not proof the work stopped |
 
 ### Fencing across a network
 
-The scheduler cannot stop a process on another machine. What it can do — and what
-`run_token` is for — is **refuse everything that attempt produces afterwards**. Once an
-attempt is fenced, its progress calls receive `continue: false` and its result posts
-receive `409`.
+The scheduler cannot stop a process on another machine. What `run_token` gives it is the
+ability to **refuse everything that attempt produces afterwards**: once fenced, its
+`ReportProgress` receives `proceed=false` and its `ReportResult` receives `ABORTED`.
 
-That bounds the damage to the scheduler's own state. It does not undo whatever the
-executor already did to the outside world, and the contract says so plainly rather than
-implying a guarantee it cannot deliver. This is why **an executor must be able to run the
-same `execution_key` twice without harm** — the ultimate protection is idempotent business
-logic, not the fence.
-
----
-
-## 8. Network and security
-
-Push requires the scheduler to reach executors, which is a real operational requirement and
-the main cost of this model:
-
-- executors listen on an address reachable **from the scheduler**, not from the public
-  internet. A private network, a service mesh, or an internal load balancer are all fine;
-- if several instances sit behind one address, the scheduler cannot choose between them and
-  its capacity accounting becomes an estimate. Prefer registering instances individually;
-- both directions are authenticated with a shared secret or mTLS. The dispatch endpoint
-  executes work on request, so an unauthenticated one is remote code execution by
-  configuration;
-- `params` are treated as data. Handlers are named and resolved by the executor from its
-  own registry; the scheduler never sends code, a command line, a script or a URL to fetch.
+That bounds the damage to the scheduler's own state. It does not undo what the executor
+already did to the outside world, and this contract says so rather than implying a guarantee
+it cannot deliver.
 
 ---
 
 ## 9. What an executor must guarantee
 
 Short enough to fit on one page, which is the point of separating executors from the
-scheduler at all:
+scheduler at all.
 
-1. **Answer 409 for an `execution_key` you already hold.** This is at-most-once dispatch.
-2. **Only answer 202 if you will really post a result.**
-3. **Post a result exactly once per attempt**, retrying on 5xx and network failure, stopping
-   permanently on 409.
-4. **Stop when told** — `continue: false`, a cancel request, or a passed deadline.
-5. **Be idempotent per `execution_key`.** The scheduler will occasionally deliver the same
-   logical work twice: after a lost attempt, after an operator retry, after a network
-   partition it cannot see through. Being run twice must be harmless.
-6. **Re-register when heartbeat says `known: false`.**
+1. **Be idempotent per `execution_key`.** This is first because everything else depends on
+   it. The scheduler will occasionally deliver the same logical work twice — after an
+   unknown attempt, after an operator retry, after a partition it cannot see through. Being
+   run twice must be harmless, and that property lives in business data, not in this
+   protocol.
+2. **Answer `ALREADY_EXISTS` for an `execution_key` you already hold.**
+3. **Only answer OK to `Run` if you will really report a result.**
+4. **Report a result exactly once per attempt**, retrying on transient errors and stopping
+   permanently on `ABORTED`.
+5. **Stop when told** — `proceed=false`, a `Cancel`, or a passed deadline.
+6. **Declare `in_flight` when you register**, and re-register when `Heartbeat` says
+   `known=false`.
 
 Everything else — leases, fences, claim ordering, recovery, misfire, retry budgets — is the
 scheduler's problem and stays inside it.
+
+---
+
+## 10. Conformance suite
+
+The suite is the enforcement layer for everything §1 says types cannot express. It is a
+black-box gRPC client run against an executor in its own CI:
+
+```sh
+gojob-conformance --target executor:9100 --tenant test
+```
+
+It must cover, at minimum:
+
+- `Run` twice with the same `execution_key` → second returns `ALREADY_EXISTS`, and the work
+  runs **once**;
+- `ReportResult` with a stale `run_token` → `ABORTED`, and the executor stops rather than
+  retrying;
+- `ReportProgress` returning `proceed=false` → the executor actually stops;
+- accepting a `Run` → a result eventually arrives;
+- dispatch beyond `capacity` → `RESOURCE_EXHAUSTED`, not silent queueing;
+- `GetExecution` for an unheld key → `NOT_FOUND`, not `UNIMPLEMENTED` and not an error;
+- `Cancel` for an unheld key → `acknowledged=false`, not an error;
+- an unknown `handler_key` → `FAILED_PRECONDITION`.
+
+Passing the suite is what makes something a conforming executor. "We read the document" is
+not.
+
+---
+
+## 11. Non-gRPC executors
+
+A gateway can transcode this contract to HTTP/JSON for teams that cannot run gRPC. It is
+supported and second-class, and the trade is explicit: **the build-time guarantees of §1 do
+not apply on that path.** Such an executor is verified by the registration probe and the
+conformance suite only, and its first missing method appears at startup rather than at
+compile time.
+
+Choosing that path is a decision to move enforcement later. It should be a decision, not an
+accident.

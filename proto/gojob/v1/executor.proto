@@ -1,0 +1,312 @@
+// The executor contract.
+//
+// This file is the single source of truth for how a scheduler and an executor talk.
+// It is generated into every executor's language, so a missing method or a wrong field
+// type is a build failure rather than something discovered at registration time.
+//
+// Two services, in opposite directions:
+//
+//   JobExecutor  — hosted by the executor,  called by the scheduler
+//   JobScheduler — hosted by the scheduler, called by the executor
+//
+// An executor implements JobExecutor completely. There is no partial implementation:
+// generated stubs make every method mandatory, and section "Conformance" in doc/dispatch.md
+// describes how that is enforced per language.
+syntax = "proto3";
+
+package gojob.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/abcdeqwer/go-job/gen/gojob/v1;gojobv1";
+option java_multiple_files = true;
+option java_package = "com.gojob.v1";
+
+// ---------------------------------------------------------------------------
+// Executor-hosted service. The scheduler calls these.
+// ---------------------------------------------------------------------------
+service JobExecutor {
+  // Describe reports what this executor is and can do.
+  //
+  // The scheduler calls it during registration, before routing any work, and treats a
+  // failure as a refused registration. It is also how contract-version compatibility is
+  // established.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Run hands over one execution.
+  //
+  // It returns immediately — the executor must NOT run the job before answering. An OK
+  // response is a promise that a result will eventually be reported through
+  // JobScheduler.ReportResult.
+  //
+  // Errors carry meaning and are part of the contract:
+  //   ALREADY_EXISTS      this execution_key is already held; the scheduler is re-sending
+  //                       after a timeout and must not be given a second run
+  //   RESOURCE_EXHAUSTED  at capacity; the scheduler will try another instance
+  //   UNAVAILABLE         shutting down; the scheduler will try another instance
+  //   FAILED_PRECONDITION unknown handler_key
+  rpc Run(RunRequest) returns (RunResponse);
+
+  // Cancel asks the executor to stop an execution.
+  //
+  // Acknowledgement means the stop was signalled, not that work has ceased. Cancellation
+  // is cooperative; the executor still reports a result when the work actually ends.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+
+  // GetExecution answers what happened to an execution the scheduler has lost track of.
+  //
+  // It is reliable for one question only: "are you running this right now?" A process that
+  // has restarted has no memory of earlier work and answers NOT_FOUND, which means
+  // UNKNOWN — never "it did not run". Durable proof that work happened belongs in the
+  // handler's own idempotency key, not here.
+  rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler-hosted service. Executors call these.
+// ---------------------------------------------------------------------------
+service JobScheduler {
+  // Register announces an executor and its handlers. The scheduler probes the executor
+  // (Describe, plus a GetExecution for a key it cannot hold) before accepting.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Heartbeat keeps a registration alive. A response with known=false means the
+  // registration lapsed and the executor must call Register again.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // ReportProgress extends an execution's deadline and asks whether to continue.
+  //
+  // The executor's framework calls this on a timer while a handler runs. It must not
+  // depend on the handler cooperating: the handlers most likely to run for hours are the
+  // least able to check in.
+  rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
+
+  // ReportResult delivers a terminal outcome. Idempotent on (execution_key, run_token).
+  //
+  //   ABORTED   this attempt was fenced; discard and do not retry the report
+  //   NOT_FOUND unknown execution; discard
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Parameters
+// ---------------------------------------------------------------------------
+
+// JobParams is what a handler receives from the scheduler.
+//
+// It is a JSON-shaped structure so every language's protobuf runtime can carry it and the
+// admin UI can edit it directly. Its value is merged from the job's configured defaults
+// and any per-trigger override, then snapshotted onto the execution when it is created —
+// so history shows what each run actually ran with, even after the configuration changes.
+//
+// Three rules, enforced by the scheduler:
+//   - parameters are DATA, never instructions. No command lines, scripts, URLs to fetch or
+//     handler names. The executor resolves handler_key against its own compiled registry.
+//   - size is bounded, and the bound is rejected at the API rather than discovered when a
+//     row overflows.
+//   - no secrets. Parameters are stored, displayed and written to history; an executor
+//     reads credentials from its own configuration.
+//
+// Values a handler can derive should be derived: scheduled_at accompanies every dispatch,
+// so a daily job computes its own business date rather than being told one that can drift
+// from the instant it belongs to.
+message JobParams {
+  google.protobuf.Struct values = 1;
+}
+
+// ---------------------------------------------------------------------------
+// JobExecutor messages
+// ---------------------------------------------------------------------------
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  // Contract version this executor was generated against. The scheduler refuses to
+  // register an incompatible executor rather than discovering the mismatch mid-dispatch.
+  string contract_version = 1;
+
+  // Handlers this executor can run. A job routes to a group declaring its handler_key.
+  repeated string handler_keys = 2;
+
+  // Maximum concurrent executions this instance will hold. The scheduler will not exceed
+  // it; the executor must still answer RESOURCE_EXHAUSTED if it would.
+  int32 capacity = 3;
+
+  // Build identity, for the admin UI and for rollout diagnosis.
+  string revision = 4;
+
+  // Optional capabilities. Absence is not an error: it downgrades what the scheduler
+  // offers for jobs routed here, visibly, rather than failing at runtime.
+  repeated Capability capabilities = 5;
+}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+
+  // Cancel is honoured. Without it the admin UI disables cancellation for this executor
+  // instead of offering a button that does nothing.
+  CAPABILITY_CANCEL = 1;
+
+  // Handler-supplied progress messages, beyond the framework's automatic keepalive.
+  CAPABILITY_PROGRESS_DETAIL = 2;
+}
+
+message RunRequest {
+  // Durable identity of one logical run. THIS IS THE IDEMPOTENCY KEY: an executor that
+  // already holds it must answer ALREADY_EXISTS rather than starting a second run.
+  string execution_key = 1;
+
+  // Identity of this attempt. Presented back with every progress and result call, and
+  // refused once fenced.
+  string run_token = 2;
+
+  string tenant = 3;
+  string job_name = 4;
+  string handler_key = 5;
+  int32 attempt = 6;
+
+  // Business time of the fire instant this execution belongs to, RFC 3339.
+  string scheduled_at = 7;
+
+  // Business time after which the scheduler treats silence as loss, RFC 3339. Extended by
+  // ReportProgress. It bounds silence, not runtime.
+  string deadline = 8;
+
+  // Hard cap on total runtime in seconds, independent of the deadline. An execution that
+  // keeps reporting progress is still stopped here.
+  int32 timeout_seconds = 9;
+
+  JobParams params = 10;
+}
+
+message RunResponse {
+  // Echoed for correlation in logs. Acceptance is signalled by an OK status, not a field:
+  // a refusal is an error code, so no caller can ignore it by forgetting to read a bool.
+  string execution_key = 1;
+}
+
+message CancelRequest {
+  string execution_key = 1;
+  string run_token = 2;
+  string reason = 3;
+}
+
+message CancelResponse {
+  // True if the executor knew the execution and signalled it to stop. False means it was
+  // not held — already finished, or never received.
+  bool acknowledged = 1;
+}
+
+message GetExecutionRequest {
+  string execution_key = 1;
+}
+
+message GetExecutionResponse {
+  ExecutionState state = 1;
+
+  // Set when state is EXECUTION_STATE_FINISHED.
+  ExecutionOutcome outcome = 2;
+
+  // Last handler-supplied progress message, if any.
+  string message = 3;
+
+  // RFC 3339 business time.
+  string started_at = 4;
+}
+
+enum ExecutionState {
+  EXECUTION_STATE_UNSPECIFIED = 0;
+  EXECUTION_STATE_RUNNING = 1;
+  EXECUTION_STATE_FINISHED = 2;
+}
+
+// ---------------------------------------------------------------------------
+// JobScheduler messages
+// ---------------------------------------------------------------------------
+
+message RegisterRequest {
+  // Unique per PROCESS: a restart produces a new id, so a restarted executor never
+  // inherits its predecessor's registration and never has to clean one up.
+  string executor_id = 1;
+
+  // Logical executor that jobs route to. Instances share a group.
+  string group = 2;
+
+  string tenant = 3;
+
+  // Where the scheduler reaches this instance for JobExecutor calls.
+  string address = 4;
+
+  // Executions this instance is currently running, declared at attach.
+  //
+  // This is how a scheduler learns the truth after either side restarts, without asking:
+  // an executor that reconnects announces what it still holds, and the scheduler adopts or
+  // fences accordingly. It is more reliable than querying, because only the executor knows
+  // what it is actually doing.
+  repeated InFlight in_flight = 5;
+}
+
+message InFlight {
+  string execution_key = 1;
+  string run_token = 2;
+}
+
+message RegisterResponse {
+  int32 heartbeat_interval_seconds = 1;
+  int32 registration_ttl_seconds = 2;
+
+  // How often the executor's framework must call ReportProgress for a running execution.
+  int32 progress_interval_seconds = 3;
+
+  // Executions the scheduler no longer recognises. The executor must stop them: they were
+  // fenced, cancelled, or belong to a generation that has moved on.
+  repeated string fenced = 4;
+}
+
+message HeartbeatRequest {
+  string executor_id = 1;
+  int32 running = 2;
+}
+
+message HeartbeatResponse {
+  // False means the registration lapsed; re-register rather than continuing to heartbeat.
+  bool known = 1;
+}
+
+message ReportProgressRequest {
+  string execution_key = 1;
+  string run_token = 2;
+
+  // Optional, human-readable, for the admin UI. Liveness does not depend on it.
+  string message = 3;
+}
+
+message ReportProgressResponse {
+  // False means stop now: cancelled, or this attempt was fenced. An executor that keeps
+  // working after this is outside the contract and its result will be refused.
+  bool proceed = 1;
+
+  // Extended deadline, RFC 3339.
+  string deadline = 2;
+}
+
+message ReportResultRequest {
+  string execution_key = 1;
+  string run_token = 2;
+  ExecutionOutcome outcome = 3;
+}
+
+message ExecutionOutcome {
+  bool success = 1;
+
+  // One line an operator reads in history.
+  string summary = 2;
+
+  // Short, stable, groupable — "timeout", "upstream_5xx", "validation". Not a message.
+  string failure_kind = 3;
+
+  // Detail for diagnosis. Truncated by the scheduler; do not rely on it being complete.
+  string error_detail = 4;
+}
+
+message ReportResultResponse {}
