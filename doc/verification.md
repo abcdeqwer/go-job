@@ -352,7 +352,16 @@ cannot regress silently.
     names a different tenant, or carries a different `schema_uuid` than the registry expects —
     tested against an empty schema, another tenant's schema, and a restored snapshot;
 113. a DSN change is refused unless the old schema is quiescent **and** the new one presents
-    the expected identity; neither check alone permits the cutover.
+    the expected identity; neither check alone permits the cutover;
+114. `POST /jobs` writes `job_definition` and `job_state` in one transaction, and the new job
+    actually runs: a cron job at its first instant at or after creation, a poller promptly
+    rather than after one delay, and neither fires for instants that passed before creation;
+115. a result arriving after `timeout_at` is refused: the cap wins regardless of which writer
+    reaches the database first, and the execution records `dead` with
+    `terminal_reason = 'timeout'` whether the executor noticed or the scheduler did;
+116. `DISPOSITION_TIMED_OUT` resolves to `dead` and is not retried;
+117. `tenant_observation` and `control_audit` are bounded: a cluster restarting repeatedly,
+    each process minting a new `instance_id`, does not grow either table without limit.
 
 ---
 

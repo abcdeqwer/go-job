@@ -372,6 +372,33 @@ becomes an unselectable option rather than an orphan discovered later.
 A `handler_key` that no live executor declares is not rejected — an executor may simply be
 down — but the job is flagged as an orphan until one appears.
 
+### Creating a job initializes both rows
+
+`POST /jobs` writes `job_definition` **and** `job_state` in one transaction. Nothing else
+creates a state row, and a definition without one is inert: both scans read `job_state`, and
+a claim fails closed when it is missing — so a job created without it would sit in the UI
+looking configured and never run, with nothing reporting an error.
+
+The initial state is not "empty". It answers two questions the schedule alone does not:
+
+| Field | Cron job | Fixed-delay job |
+| --- | --- | --- |
+| `next_fire_at` | the first fire at or after **creation time**, computed from the expression | `NULL` |
+| `next_poll_at` | `NULL` | **creation time** — the first pass runs promptly |
+| `config_version` | the definition's `version` | same |
+| everything else | `NULL` / defaults | same |
+
+A new poller starts immediately rather than after one delay, because the delay is defined as
+the gap *between passes* and there is no previous pass to measure from; waiting would make
+enabling a five-minute poller mean five minutes of nothing happening for no stated reason.
+
+A cron job never fires for instants before its creation: misfire policy applies to instants
+missed while the job existed, and applying it at creation would let a new `0 0 * * * *` job
+immediately fire for an hour that passed before anyone had configured it.
+
+Re-enabling a disabled job recomputes the same way, from the moment of re-enabling, for the
+same reason.
+
 ### Retiring
 
 `retired` is a state of the definition, not a deletion:
@@ -859,6 +886,8 @@ problem than a bug; it is a bug with a delay.
 | --- | --- |
 | `job_execution` | terminal rows only. `success` and `skipped` on a short window; `dead`, `cancelled` and manual runs kept for the longer audit window. **Non-terminal rows are never deleted.** |
 | `job_executor`, `job_executor_handler` | rows whose heartbeat is older than the liveness bound |
+| `tenant_observation` | rows whose `observed_at` is older than the liveness bound. Every restart mints a new `instance_id`, so without this the table grows once per process per tenant, forever — the fastest-growing table in the system on a cluster that redeploys often |
+| `control_audit` | the approved audit window, like `job_audit` |
 | `job_audit` | the approved audit window; never truncated silently |
 
 Cleanup is an **internal scheduler task**, not a job: it holds a named control lease

@@ -538,6 +538,7 @@ ready --claim--> dispatching --accepted (attempt_no+1)--> running --success--> s
                                                              +--cancel--> cancel_requested
                                                              +--stale lease--> recovery
 
+running | dispatching --timeout_at passes--> dead (terminal_reason 'timeout')
 cancel_requested --result arrives: success--> success     (the work finished; see below)
 cancel_requested --result arrives: failed---> dead | ready
 cancel_requested --handler confirms stopped-> cancelled
@@ -549,6 +550,27 @@ dispatching --result arrives before acceptance recorded--> success | dead | read
 dispatching --cancel or retire--> cancel_requested   (the executor may already have it)
 ready       --cancel or retire--> cancelled          (nothing is running)
 ```
+
+### The runtime cap wins against a late result
+
+Every terminal and retry transition additionally guards `timeout_at >= NOW()`. Once the cap
+has passed, the attempt is over as far as the scheduler is concerned, and a result arriving
+afterwards is refused with `ABORTED` like any other fenced write.
+
+Without that guard the outcome depends on which writer reaches the database first: a
+non-conforming executor still running past the cap could report success moments before the
+timeout scanner fenced it, and the execution would record `success` for a run the scheduler
+had already decided to stop. A cap that only sometimes applies is not a cap.
+
+`DISPOSITION_TIMED_OUT` — a conforming executor abandoning its own handler at the cap —
+resolves to `dead` with `terminal_reason = 'timeout'`. It is deliberately **not** retryable:
+a job that exhausted its entire runtime budget will most likely exhaust it again, and
+retrying is how one slow run becomes an afternoon of them. An operator who disagrees can
+retry it explicitly, which is exactly the judgement a human should make and the scheduler
+should not.
+
+The scheduler applies the same resolution when it fences a silent execution at the cap, so
+the record is identical whether the executor noticed or the scheduler did.
 
 ### A cancel that loses the race does not rewrite history
 
@@ -662,8 +684,8 @@ There is no separate failover algorithm: this *is* recovery, and step 3 of secti
 where it is handled. `dispatched_to` records which executor to ask, `GetExecution` supplies
 the answer, and adoption keeps the same `run_token` because the executor still holds it.
 
-`dispatched_to` must therefore be durable, written when the dispatch is accepted and before
-any result can arrive. An execution whose dispatch target is not recorded cannot be
+`dispatched_to` must therefore be durable, written **in the claim transaction, before `Run`
+is called** (section 2) — not on acceptance. An execution whose dispatch target is not recorded cannot be
 reconciled, and recovery would have to choose between re-dispatching blindly and giving up —
 both wrong.
 
@@ -745,8 +767,11 @@ Metrics:
   stopped — the failure mode nobody notices, because nothing is erroring;
 - live executors by group and build revision, and **enabled jobs whose handler no live
   executor serves**;
-- expired `running` executions whose handler has no live executor, reported separately from
-  the ready backlog, because nothing will recover them;
+- expired executions whose handler has no live executor. Recovery **does** resolve these —
+  an unreachable executor is the defined `unknown` outcome — so they are not stranded. They
+  are reported separately because they are resolving *without anyone knowing what happened*,
+  which is a different operational situation from a backlog and deserves attention even
+  though the machinery is handling it;
 - connection pool usage and waits.
 
 Readiness goes false when admission fails or degrades. A degraded tenant is visible without

@@ -82,8 +82,10 @@ Two derived views matter more than the list:
 - **orphaned jobs** — enabled, but no live executor declares the handler. Nothing will ever
   claim them. This is the single most valuable screen in the UI, because it catches the
   failure mode that produces no errors at all;
-- **stuck executions** — expired `running` rows whose handler has no live executor. Nothing
-  will recover them either, and that is a different problem from a backlog.
+- **unattributable executions** — expired rows whose handler has no live executor. Recovery
+  resolves them, so they are not stuck; what makes them worth a screen is that they resolve
+  as `unknown` — nobody can say whether the work ran. For a job with external effects that is
+  the set an operator has to reconcile by hand.
 
 ---
 
