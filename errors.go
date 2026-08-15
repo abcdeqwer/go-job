@@ -40,6 +40,18 @@ var (
 	// limit. It stops claiming, materializing and renewing — so a partitioned instance
 	// fences itself rather than remaining an invisible owner while a DSN cutover proceeds.
 	ErrControlStale = errors.New("gojob: control database is stale; this instance has self-fenced")
+
+	// ErrProtocol means a statement that the canonical lock order guarantees must apply did
+	// not. It is never contention — contention is detected at named steps and reported as
+	// ErrContended or ErrFenced — so it means the ordering was not held or a row vanished
+	// underneath a transaction. It aborts the operation rather than being retried, because
+	// retrying an invariant violation just repeats it.
+	ErrProtocol = errors.New("gojob: protocol invariant violated")
+
+	// ErrNotRunnable means a candidate failed a runnability condition (disabled, retired,
+	// paused, no live executor declaring its handler, schema mismatch). It is a logged
+	// rejection with a backoff, not a failure of the execution — nothing was attempted.
+	ErrNotRunnable = errors.New("gojob: job is not runnable")
 )
 
 func parseInt(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) }
