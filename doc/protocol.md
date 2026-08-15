@@ -89,8 +89,21 @@ however old it gets. Each class getting its own bounded share starves neither.
 
 The reason manual work needs a share at all is that exclusion alone does not give fairness:
 a fast poller releases the job lock and is immediately due again, and nothing stops it
-winning the next claim indefinitely while an operator's manual run waits. A trigger button
-that works only when the queue happens to be quiet is not a working trigger button.
+winning the next claim indefinitely while an operator's manual run waits.
+
+**A share is still not a bound.** Separate pages guarantee a manual row is *examined* every
+pass; they do not guarantee it ever *acquires* the job, because a poll materializer can win
+the state-row lock each time the previous pass releases it. So the job state row carries the
+actual mechanism:
+
+> While a manual execution for a job is `ready`, **materialization for that job is
+> suspended** — no new cron instant and no new poll pass is created — until the manual
+> execution reaches a terminal state.
+
+The manual run therefore acquires the job at the next release, and the bound is one
+in-flight execution plus its own duration, not a probability. Suspension is per job, so
+nothing else in the tenant is affected, and it cannot deadlock: the manual execution's own
+budgets and timeout make it terminal either way.
 
 ---
 
@@ -156,7 +169,7 @@ So dispatch has two outcomes, each a short fenced transaction:
 | OK / `ALREADY_EXISTS` | `dispatching` → `running` | **+1** | set |
 | `RESOURCE_EXHAUSTED`, `UNAVAILABLE` | `dispatching` → `ready`, release the job lock, try the next instance; when none accept, apply a bounded backoff | unchanged | unset |
 | `FAILED_PRECONDITION` (unknown handler) | `dispatching` → `ready`, alert: routing is wrong | unchanged | unset |
-| transport error, outcome unknown | stay `dispatching`; re-send to the **same** executor with the same `execution_key`, which answers `ALREADY_EXISTS` if it has it | +1 on eventual acceptance | set |
+| transport error, outcome unknown | stay `dispatching`; re-send to the **same** executor, which answers `ALREADY_EXISTS` if it has it — but **bounded**, see below | +1 on eventual acceptance | set |
 
 ```sql
 -- acceptance
@@ -179,6 +192,19 @@ dispatch never landed, and dispatches the same work elsewhere while the first ex
 Recording the intended target before an irreversible send is the general rule: the network
 call is the point of no return, so everything needed to reason about it afterwards must
 already be durable.
+
+**The unknown-outcome re-send is bounded**, in attempts and in time (default 5 attempts or
+60s). Without a bound the execution can be stranded permanently: an executor whose outbound
+heartbeats still succeed stays registration-live, so it keeps being chosen, while its `Run`
+path is unreachable and never answers. The scheduler would re-send forever, renewing both
+leases each cycle — so the lease never expires, recovery never runs, no attempt or timeout
+budget is ever consumed, and the row sits `dispatching` for good.
+
+On exhausting the bound the scheduler **stops renewing** and leaves the row to recovery,
+which reconciles with the executor and resolves it like any other unknown attempt. It also
+marks that executor's dispatch path unhealthy so routing stops preferring it, since an
+executor that heartbeats but cannot accept work is exactly the case registration liveness
+alone cannot see.
 
 A `dispatching` row whose lease expires is recovered exactly like a `running` one, and for
 the same reason: the scheduler that was mid-dispatch may have died after the executor
@@ -215,8 +241,17 @@ a leftover from a design in which handlers were compiled into the scheduler. **T
 holds no handler code.** It knows a `handler_key` only as a string that executors declare and
 operators select, so the only meaningful question is whether anything alive can run it.
 
-A job failing condition 3 is an **orphan**: it stays `ready`, is never dispatched, and is
-alerted on. It is never marked failed, because nothing was attempted.
+A job failing condition 3 is an **orphan**: it is never dispatched, never marked failed —
+nothing was attempted — and is alerted on.
+
+It does **not** simply stay where it is. A rejected candidate has its `available_at` pushed
+forward by a bounded orphan backoff in the same transaction that rejected it. Leaving it
+untouched would make it a permanent head-of-line block: candidate discovery is an ordered,
+bounded page, so a handful of old unrunnable rows would fill every page forever and newer
+runnable work would never be seen. The row stays `ready` and stays visible as an orphan; it
+just stops occupying the front of the queue.
+
+The same backoff applies to any runnability rejection, for the same reason.
 
 ---
 
@@ -475,11 +510,11 @@ reconcile with and step 3 is skipped.
 The normal claim path then assigns capacity and a new owner, so a recovery scan can never
 end up owning more work than a tenant's quota permits.
 
-**Recovery does not touch `attempt_no`.** It was incremented at claim, and the re-claim that
-follows recovery increments it again — which is exactly the budget a crash should cost.
-Incrementing in both places would exhaust a budget of three in two real handler starts. A
-handler that reliably kills its executor still terminates: claim, crash, recover, claim,
-crash, recover, claim → the limit is reached and the row goes `dead`.
+**Recovery does not touch `attempt_no`.** It was incremented when the dispatch was accepted,
+and the re-dispatch that follows recovery increments it again — which is exactly the budget a
+crash should cost. Incrementing in two places would exhaust a budget of three in two real
+handler starts. A handler that reliably kills its executor still terminates: accept, crash,
+recover, accept, crash, recover, accept → the limit is reached and the row goes `dead`.
 
 ### Graceful shutdown
 
@@ -506,7 +541,7 @@ cancel_requested --handler confirms stopped-> cancelled
 cancel_requested --stale lease, fenced------> cancelled   (never back to ready)
 
 ready --FORBID contention--> skipped
-dead  --authorized retry--> ready (attempt_no reset, audited)
+dead  --authorized retry--> ready (max_attempts raised, audited)
 dispatching --result arrives before acceptance recorded--> success | dead | ready
 dispatching --cancel or retire--> cancel_requested   (the executor may already have it)
 ready       --cancel or retire--> cancelled          (nothing is running)

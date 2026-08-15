@@ -90,11 +90,28 @@ CREATE TABLE tenant_observation (
 ```
 
 A DSN change is accepted only when **every live scheduler instance** reports the disable
-generation with `quiesced = 1`. Live means a fresh `observed_at`; an instance that stops
-reporting is either gone or partitioned, and the API says which condition is blocking rather
-than making the operator guess. Nothing here is a consensus protocol — it is an
-acknowledgement table with a freshness bound, which is enough because the failure being
-prevented is "somebody never heard", not "somebody disagrees".
+generation with `quiesced = 1`. Live means a fresh `observed_at`; the API names which
+instance is blocking rather than making the operator guess.
+
+That alone would still be unsound, and the hole is worth naming: an instance **partitioned
+from the control database** stops reporting, drops out of the "live" set, and the change
+proceeds — while it happily keeps claiming against the old schema, because its connection to
+the *tenant* database is fine. Absence of an acknowledgement is not evidence of quiescence.
+
+So the control database is also a **lease on the right to operate**:
+
+> A scheduler instance that has not successfully read `tenant_registry` within
+> `control_staleness_limit` (default 30s, and always well under the liveness bound the API
+> uses) **stops claiming, stops materializing and drops readiness** for every tenant. It
+> keeps renewing leases for work already in flight so nothing is stranded, and resumes when
+> the control database returns.
+
+A partitioned instance therefore fences *itself* before the API could ever conclude it is
+gone. The proof is not "everyone acknowledged" but "everyone either acknowledged or has
+stopped by construction", which is a property a partition cannot break.
+
+Nothing here is a consensus protocol — an acknowledgement table with a freshness bound, plus
+a self-fencing rule with a shorter one.
 
 **Draining is bounded.** "Let in-flight work finish" is not a terminating condition: an
 execution can hang, and a scheduler that waits for it forever means a disable or a DSN change
@@ -407,6 +424,7 @@ CREATE TABLE job_execution (
     job_name       VARCHAR(128) NOT NULL,
     trigger_type   VARCHAR(16)  NOT NULL,  -- cron | manual | poll
     manual_first   TINYINT(1)   NOT NULL DEFAULT 0,  -- 1 when trigger_type = 'manual'
+    request_id     VARCHAR(64)  NULL,       -- manual only; idempotency of the API call
     scheduled_at   DATETIME     NOT NULL,
     available_at   DATETIME     NOT NULL,
     status         VARCHAR(20)  NOT NULL,
@@ -433,6 +451,7 @@ CREATE TABLE job_execution (
     updated_at     DATETIME     NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_job_execution_key (execution_key),
+    UNIQUE KEY uk_job_execution_request (request_id),
     KEY idx_job_execution_claim (status, manual_first, available_at, id),
     KEY idx_job_execution_recovery (status, lease_until, id),
     KEY idx_job_execution_history (job_name, scheduled_at, id)
@@ -510,8 +529,17 @@ confirmed it stopped or whether the attempt was merely fenced with its side effe
 unverified — a distinction that matters most for exactly the jobs where it is expensive to
 guess.
 
-Values: `handler_confirmed`, `fenced`, `budget_exhausted`, `permanent_failure`, `retired`,
-`operator`.
+Values: `handler_confirmed`, `fenced`, `timeout`, `budget_exhausted`, `permanent_failure`,
+`retired`, `operator`.
+
+### `request_id`
+
+The durable half of manual-trigger idempotency. A retried `POST .../trigger` — a
+double-clicked button, a client resending after a timeout — carries the same `request_id`,
+the unique key rejects the second insert, and the API returns the execution the first call
+created. Without a stored mapping the idempotency contract in `admin.md` §6 would be a
+promise with nothing behind it, on the one operation an operator is most likely to repeat
+under stress.
 
 ### `manual_first`
 
@@ -712,8 +740,14 @@ Two clocks, and every column belongs to exactly one of them.
 | **business** | `next_fire_at`, `next_poll_at`, `scheduled_at`, `available_at`, `started_at`, `finished_at`, `created_at`, `updated_at` | the configured `Location` |
 | **ownership** | `lease_until`, `heartbeat_at`, `deadline_at`, `timeout_at` | the database's `NOW()` |
 
-`timeout_at` is set once, at dispatch acceptance, to `NOW() + timeout_seconds`, and is
-**never extended**. It has to be a durable ownership instant rather than a timer in the
+`timeout_at` is set once, **in the claim transaction** — alongside `dispatched_to`, before
+the `Run` call — to `NOW() + timeout_seconds`, and is **never extended**.
+
+Setting it on acceptance instead would leave the same crash window `dispatched_to` closes: a
+scheduler that dies after the executor accepted but before recording acceptance leaves a
+successor with no cap at all, which then grants a fresh one or none. Starting the clock at
+claim rather than acceptance charges the dispatch round trip to the job's budget — a second
+or two against a cap measured in minutes or hours, in exchange for a cap that survives. It has to be a durable ownership instant rather than a timer in the
 dispatching scheduler's memory: an execution can outlive the instance that started it, and a
 successor that inherited only a progress-extended silence deadline would have no way to know
 how much of the original cap had already elapsed — it would grant a fresh one, or none.

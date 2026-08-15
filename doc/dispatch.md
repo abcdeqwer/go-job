@@ -176,8 +176,19 @@ Neither substitutes for the other, because the interesting failures separate the
 | --- | --- | --- |
 | fresh | fresh | healthy — **keep waiting, however long it takes** |
 | fresh | stale past deadline | the process is fine, this execution is wedged: deadlocked, spinning, blocked on a socket. Investigate via `GetExecution` |
-| stale / gone | any | the executor is lost, and every execution it held is lost with it |
+| stale / gone | **stale too** | the executor is lost, and every execution it held is lost with it |
+| stale / gone | **fresh** | **progress wins.** Keep waiting, and treat the registration as lapsed only for *routing* |
 | `known=false` | — | the registration lapsed; the executor re-registers and declares its in-flight work (§5) |
+
+The fourth row is a precedence rule, and getting it backwards fences work that is visibly
+fine. A registration heartbeat and a progress call are separate loops in the executor, so one
+can fail while the other succeeds — a wedged registration goroutine, a rejected credential,
+a partition affecting one path. Fresh progress is **positive evidence about this execution**;
+an expired registration is only absence of evidence about the process. Positive evidence
+wins.
+
+The lapse still costs the executor its place in routing — it receives no new dispatches until
+it re-registers — but work already in flight and demonstrably progressing is not reclaimed.
 
 An executor that is alive while its handler is stuck looks perfectly healthy to a
 process-level heartbeat. That is precisely what the per-execution signal exists to catch,
@@ -351,7 +362,8 @@ alerted on, because nothing will ever run it.
 | `RUNNING` | extend and keep waiting — a slow job is not a failed one |
 | `FINISHED` | adopt the reported outcome |
 | `NOT_FOUND`, or unreachable | the attempt is **unknown**: fence the `run_token`, then retry per policy — which is safe only because handlers are idempotent (§9) |
-| registration expires while holding work | same unknown-attempt path; a lapsed TTL is not proof the work stopped |
+| registration expires while holding work, **no progress** | the unknown-attempt path; a lapsed TTL is not proof the work stopped, so reconcile before deciding |
+| registration expires while holding work, **progress still fresh** | keep waiting; remove from routing only. See §4 |
 
 ### Fencing across a network
 

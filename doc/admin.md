@@ -97,7 +97,7 @@ Each is audited with actor, target and reason. Each requires the `OPERATOR` role
 | **Trigger** | a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one — and is selected ahead of it, so it cannot starve |
 | **Pause / resume** | sets `ops_paused` | takes the state-row lock, so it cannot race a claim into one extra run |
 | **Edit** | schedule, concurrency, retry budget, timeouts | optimistic `version` CAS; rejected if the row changed underneath |
-| **Retry** | `dead` → `ready`, attempt budget reset | audited with a reason; never automatic |
+| **Retry** | `dead` → `ready`, **`max_attempts` raised** by the configured grant | audited with a reason; never automatic. `attempt_no` keeps climbing, because it is half the primary key of attempt history |
 | **Cancel** | `running` → `cancel_requested` | see below |
 | **Retire** | ends a job permanently | **cancels its outstanding executions**, audited; the row and history are kept |
 

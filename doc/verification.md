@@ -313,7 +313,28 @@ cannot regress silently.
 99. a repeated manual trigger carrying the same `request_id` returns the first execution and
     creates no second run;
 100. a `Register` from an identity with no `executor_identity` row for the claimed tenant and
-    group is refused.
+    group is refused;
+101. **a scheduler partitioned from the control database stops claiming and materializing
+    within `control_staleness_limit`**, while continuing to renew leases for work already in
+    flight — so a DSN change can never proceed past an instance that is still working the old
+    schema;
+102. `timeout_at` is written in the claim transaction: a scheduler killed after the executor
+    accepted but before recording acceptance leaves a successor with the **original** cap,
+    neither refreshed nor absent;
+103. orphaned and otherwise unrunnable executions have `available_at` pushed forward on
+    rejection, so a page of permanently unrunnable rows cannot hide every newer runnable one;
+104. an executor that heartbeats but never answers `Run` causes a bounded number of re-sends,
+    after which the row is left to recovery and the executor is deprioritised in routing — it
+    never sits `dispatching` indefinitely with its lease renewed;
+105. while a manual execution is `ready` for a job, no new cron instant or poll pass is
+    materialized for that job, so the manual run acquires the job at the next release;
+106. an executor whose registration lapses while its per-execution progress stays fresh keeps
+    its work — it is removed from routing only, and positive evidence about an execution
+    outranks absence of evidence about its process;
+107. recovery restores `next_poll_at` only when it ends the pass; a recovered pass returned to
+    `ready` leaves it `NULL`, so no second pass is materialized alongside it;
+108. a repeated trigger with the same `request_id` is rejected by the unique key and returns
+    the original execution.
 
 ---
 

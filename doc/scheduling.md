@@ -146,8 +146,19 @@ passes. Leaving the column due until the result arrives would let a second scann
 row a moment later and create a second pass; both are `ready`, so the second runs the instant
 the first finishes — no delay, and repeated scans build a backlog of passes over one queue.
 
-`NULL` means "a pass is outstanding". Only a **terminal** result — or recovery, which
-restores it — sets it again.
+`NULL` means "a pass is outstanding", and only a **terminal** outcome for that pass sets it
+again — whoever produces it:
+
+| Outcome | `next_poll_at` |
+| --- | --- |
+| result, terminal (success or `dead`) | result time + delay |
+| retryable failure → back to `ready` | **stays `NULL`** — the retry *is* the outstanding pass |
+| recovery → back to `ready` | **stays `NULL`** — same reason |
+| recovery → `dead` | recovery time + delay |
+
+Recovery restores the poll clock only when it *ends* the pass. Restoring it unconditionally
+would let the due scanner materialize a second pass while the recovered first one is still
+`ready`, which is the single-pass invariant gone.
 
 A *retryable* failure therefore does not set it either: the pass returns to `ready` with a
 backoff and `next_poll_at` stays `NULL`, so the retry is the next pass rather than a second
@@ -175,8 +186,10 @@ rather than working around it.
 ### A pass is an ordinary execution, deleted if it found nothing
 
 A pass creates a real `job_execution` row **before** it is dispatched, and is claimed,
-leased, fenced, recovered and completed by exactly the same code as a cron execution. On a
-successful pass reporting `did_work = false`, the terminal transaction **deletes** the row.
+leased, fenced, recovered and completed by exactly the same code as a cron execution. A
+successful pass reporting `did_work = false` is marked terminal and swept a few minutes
+later (`data-model.md` §4) — not deleted in the terminal transaction, because a redelivered
+result must still be answerable.
 
 An earlier revision tried to avoid the write entirely by holding the in-flight pass only on
 the state row, with no execution row until the result proved it worth keeping. That is
