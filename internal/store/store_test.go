@@ -77,10 +77,22 @@ func TestResolvedStatus(t *testing.T) {
 // The exceptions are listed explicitly, each with the reason it has no owner to fence
 // against. A new statement is fenced or it is on this list with an argument.
 func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
-	// An UPDATE is exempt only when there is provably no owner to fence against, and the
-	// exemption is derived from the statement's own guard rather than from its text — so a
-	// statement that stops being an acquisition also stops being exempt.
-	exemptions := []struct {
+	// An UPDATE needs a fence only when it can affect a RUNNING attempt. Two exemptions,
+	// both derived from the statement itself rather than from a list of blessed strings, so
+	// that a statement which stops qualifying also stops being exempt:
+	//
+	//  1. it writes no ownership or lifecycle column at all — the schedule-clock writes in
+	//     materialize.go, which run under the state row's lock and concern when the job is
+	//     next due, not who is running it;
+	//  2. its guard proves no owner exists, or names the holder deliberately.
+	ownershipColumns := map[string]bool{
+		"active_kind": true, "active_execution": true, "active_owner": true,
+		"active_run_token": true, "dispatched_to": true, "owner_instance": true,
+		"run_token": true, "fence_epoch": true, "lease_until": true, "heartbeat_at": true,
+		"deadline_at": true, "timeout_at": true, "status": true,
+		"attempt_no": true, "recovery_count": true,
+	}
+	guardExemptions := []struct {
 		predicate string
 		why       string
 	}{
@@ -102,8 +114,21 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 			continue
 		}
 
+		touchesOwnership := false
+		for _, a := range setAssignments(norm) {
+			col := strings.ToLower(strings.TrimPrefix(a.column, "js."))
+			if ownershipColumns[col] {
+				touchesOwnership = true
+				break
+			}
+		}
+		if !touchesOwnership {
+			exempt++
+			continue
+		}
+
 		var excused bool
-		for _, e := range exemptions {
+		for _, e := range guardExemptions {
 			if strings.Contains(where, e.predicate) {
 				excused = true
 				break
