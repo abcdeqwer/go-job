@@ -902,7 +902,7 @@ with its runs visible in the UI alongside real jobs.
 
 ## 10. Schema versioning
 
-`schema/mysql` holds the DDL as embedded, versioned files. This library **never executes
+`schema/mysql` holds the DDL as versioned files — `control/` and `tenant/`. This library **never executes
 DDL**: the host applies it with whatever migration tool it already runs.
 
 Admission verifies **identity before version**: the schema must present a `schema_identity`

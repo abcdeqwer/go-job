@@ -163,7 +163,7 @@ Each was argued and settled; a reviewer should treat re-opening one as needing n
 | `doc/data-model.md` | control database, per-tenant tables, two-clock rule, retention, schema versioning |
 | `doc/admin.md` | UI, API surface, auth |
 | `doc/verification.md` | 68 tests an implementation must pass, each naming its mechanism |
-| `schema/mysql/` | **empty** — DDL currently lives only in `data-model.md` |
+| `schema/mysql/` | the DDL, exported and versioned: `control/001_control.sql` (one per installation), `tenant/001_tenant.sql` (one per tenant) |
 
 Status: **design only.** No engine code exists. Nothing has been pushed to a remote.
 
@@ -204,8 +204,7 @@ implemented, version mismatch) → runtime detection (accepted but never reporte
 
 Stated rather than hidden:
 
-1. `schema/mysql/` is empty; the DDL exists only inside `data-model.md`.
-2. No conformance suite exists yet, though `dispatch.md` §10 specifies what it must cover.
+1. No conformance suite exists yet, though `dispatch.md` §10 specifies what it must cover.
 3. No reference executor SDK for any language.
 4. Multi-replica per-tenant concurrency quotas need lease-backed slot rows; in-process
    limits are per-process and documented as such.
