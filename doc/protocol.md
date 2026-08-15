@@ -12,7 +12,7 @@ work" has two answers at once, and keeping them distinct is what keeps the desig
 | Layer | Question | Mechanism | Specified in |
 | --- | --- | --- | --- |
 | **1 — internal** | which *scheduler instance* owns materializing, dispatching and tracking this execution? | MySQL: row lock, guarded CAS, lease, fence epoch | this document |
-| **2 — external** | which *executor instance* is running it, and is it still alive? | HTTP: dispatch, registration heartbeat, per-execution progress | `dispatch.md` |
+| **2 — external** | which *executor instance* is running it, and is it still alive? | gRPC: dispatch, registration heartbeat, per-execution progress | `dispatch.md` |
 
 Layer 1 is what the rest of this document specifies. Every scheduler instance is
 **identical and equal** — there is no leader, no designated node and no configured control

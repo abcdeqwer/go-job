@@ -38,6 +38,26 @@ func TestLatest(t *testing.T) {
 	}
 }
 
+// The horizon is a CLOSED interval, so a fire landing exactly on its far edge is in scope.
+func TestLatestIncludesTheHorizonBoundary(t *testing.T) {
+	e := MustParse("0 0 0 29 2 *")
+	ref := at(t, time.UTC, "2029-03-01 00:00:00")
+	// Exactly 366 days back from 2029-03-01 is 2028-03-01; widen by one more day so the only
+	// candidate, 2028-02-29, sits precisely on the boundary.
+	horizon := ref.Sub(at(t, time.UTC, "2028-02-29 00:00:00"))
+
+	got, ok, err := e.Latest(ref, horizon)
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if !ok {
+		t.Fatal("a fire exactly at at-horizon was excluded; the window is closed at both ends")
+	}
+	if want := at(t, time.UTC, "2028-02-29 00:00:00"); !got.Equal(want) {
+		t.Fatalf("Latest = %s, want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
 func TestLatestNoFireInHorizon(t *testing.T) {
 	e := MustParse("0 0 0 29 2 *") // leap day only
 	_, ok, err := e.Latest(at(t, time.UTC, "2026-06-01 00:00:00"), time.Hour)
@@ -161,7 +181,9 @@ func TestLatestAgreesWithEnumeration(t *testing.T) {
 			// Brute force: walk forward from the horizon, keeping the last fire <= ref.
 			var want time.Time
 			var found bool
-			cur := ref.Add(-horizon)
+			// The same nanosecond nudge as Latest: an oracle that repeats the implementation's
+			// boundary assumption agrees with it while both are wrong.
+			cur := ref.Add(-horizon).Add(-time.Nanosecond)
 			for i := 0; i < 200_000; i++ {
 				nxt, err := e.Next(cur)
 				if err != nil {

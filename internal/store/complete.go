@@ -248,6 +248,10 @@ func settlePollClock(ctx context.Context, tx *sql.Tx, h Holder, now time.Time) e
 	if def.ScheduleKind != gojob.ScheduleFixedDelay {
 		return nil
 	}
+	delay, err := def.Delay()
+	if err != nil {
+		return err
+	}
 
 	res, err := tx.ExecContext(ctx, `
 		UPDATE job_state js
@@ -259,7 +263,7 @@ func settlePollClock(ctx context.Context, tx *sql.Tx, h Holder, now time.Time) e
 		              WHERE je.id = ? AND je.job_name = js.job_name
 		                AND je.trigger_type = 'poll'
 		                AND je.status IN ('success', 'dead', 'cancelled', 'skipped'))`,
-		now.Add(def.Delay()), now, h.JobName, h.ExecutionID)
+		now.Add(delay), now, h.JobName, h.ExecutionID)
 	if err != nil {
 		return fmt.Errorf("settle poll clock for %q: %w", h.JobName, err)
 	}
@@ -366,12 +370,26 @@ func nullTime(t time.Time) any {
 // The request and its audit row are written in one transaction. The audit trail is what makes
 // "we asked, but it had already finished" visible after the real outcome wins, so it must not
 // be able to go missing while the request itself commits.
-func (s *Store) RequestCancel(ctx context.Context, id int64, jobName, executionKey, actor string) error {
+func (s *Store) RequestCancel(ctx context.Context, id int64, actor string) error {
 	if actor == "" {
 		return fmt.Errorf("%w: cancel with no actor", gojob.ErrProtocol)
 	}
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		// The audit names the execution this statement actually cancelled, read from the row
+		// itself rather than taken from the caller alongside the id. A caller that passed a
+		// mismatched name would otherwise produce an audit entry that is wrong and reads as
+		// authoritative — the one kind of record worse than none.
+		var jobName, executionKey string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT job_name, execution_key FROM job_execution WHERE id = ?`, id).
+			Scan(&jobName, &executionKey); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: execution %d", ErrNoSuchExecution, id)
+			}
+			return fmt.Errorf("read execution %d for cancel: %w", id, err)
+		}
+
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq  = write_seq + 1,

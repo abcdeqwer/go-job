@@ -23,7 +23,11 @@ import (
 // in the window. So the largest t with Next(t) <= at is L minus one second, and Next of it is
 // L exactly.
 func (e *Expression) Latest(at time.Time, horizon time.Duration) (time.Time, bool, error) {
-	lo := at.Add(-horizon)
+	// A nanosecond back, because Next is strictly after its argument: the documented window is
+	// the closed interval [at-horizon, at], and starting at the boundary itself would exclude a
+	// fire landing exactly on it. For a leap-day expression asked one year and a day later,
+	// that single instant is the only candidate there is.
+	lo := at.Add(-horizon).Add(-time.Nanosecond)
 
 	first, err := e.Next(lo)
 	if err != nil {

@@ -8,7 +8,10 @@
 // internal/. Executors do not import it — they generate from the .proto.
 package gojob
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // ScheduleKind distinguishes the two shapes of scheduled work. They are modelled separately
 // because they are different things: a cron job's identity is a fire instant, a poller's is
@@ -164,13 +167,24 @@ type Definition struct {
 }
 
 // Delay returns the configured pause between passes for a fixed-delay job.
-func (d Definition) Delay() time.Duration {
+//
+// It returns an error rather than zero for a malformed expression. Zero is a legal-looking
+// duration that means "no pause", so swallowing a parse failure would turn a corrupt row into
+// a poller running flat out against its source table — a much worse outcome than a scheduler
+// that refuses to schedule it and says why. The admin API validates the expression on write;
+// this is the second line of defence for a row that reached the table another way.
+func (d Definition) Delay() (time.Duration, error) {
 	if d.ScheduleKind != ScheduleFixedDelay {
-		return 0
+		return 0, nil
 	}
 	ms, err := parseInt(d.ScheduleExpr)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("gojob: job %q has schedule_kind FIXED_DELAY but schedule_expr %q is not a number of milliseconds",
+			d.JobName, d.ScheduleExpr)
 	}
-	return time.Duration(ms) * time.Millisecond
+	if ms <= 0 {
+		return 0, fmt.Errorf("gojob: job %q has a fixed delay of %d ms; a poller with no pause would run flat out",
+			d.JobName, ms)
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }

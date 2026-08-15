@@ -201,6 +201,10 @@ const (
 
 	// ClaimSkipped means FORBID marked this occurrence terminal.
 	ClaimSkipped
+
+	// ClaimExpired means the execution outran its runtime cap before it could be dispatched,
+	// and has been marked dead rather than started.
+	ClaimExpired
 )
 
 // ClaimResult is what a claim transaction committed.
@@ -263,6 +267,38 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 		}
 		out.Definition = def
 
+		// Lock the execution and prove it belongs to this job BEFORE any branch acts on it.
+		//
+		// ClaimParams carries a job name AND an execution id, and nothing outside this
+		// transaction guarantees they agree. Checking that only on the acquisition path leaves
+		// every rejection path — paused, unrunnable, QUEUE, FORBID — mutating a row chosen
+		// purely by caller-supplied id: a FORBID rejection for job A would mark job B's poll
+		// pass `skipped`, and settlePollClock would then correctly refuse to restart B's clock
+		// because it was asked about A. B is stranded, by a statement that named neither of
+		// them incorrectly.
+		//
+		// A component that hands out exclusive access has to fail closed on inconsistent input
+		// rather than trust that its caller assembled it correctly.
+		cur, err := lockExecution(ctx, tx, p.ExecutionID)
+		if err != nil {
+			return err
+		}
+		if cur.JobName != p.JobName || cur.ExecutionKey != p.ExecutionKey {
+			return fmt.Errorf("%w: claim names job %q key %q but execution %d is job %q key %q",
+				gojob.ErrProtocol, p.JobName, p.ExecutionKey, p.ExecutionID, cur.JobName, cur.ExecutionKey)
+		}
+
+		// A row whose runtime cap has already elapsed is over, and must never be dispatched
+		// again. It can reach `ready` in that state when a retry's backoff extends past the
+		// cap, and the timeout scan cannot see it there — `ready` rows have no owner to fence —
+		// so the claim is the path that has to end it.
+		if cur.TimeoutExpired {
+			out.Outcome = ClaimExpired
+			out.Reason = fmt.Errorf("%w: execution %d passed its runtime cap before it could be dispatched",
+				gojob.ErrNotRunnable, p.ExecutionID)
+			return expireReadyExecution(ctx, tx, p.ExecutionID, s.clock.Now())
+		}
+
 		// ops_paused is a RUNNABILITY condition, not contention. Reporting a paused job as
 		// "someone else is running it" is the conflation doc/protocol.md §4 forbids: it turns
 		// a job an operator deliberately stopped into one that merely looks busy, and the
@@ -322,27 +358,8 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 			return err
 		}
 
-		// 4. Then the execution row, locked, and proved to belong to the job whose lock was
-		//    just taken. Under the canonical order nobody else can hold it, so a lock failure
-		//    here is an assertion failure rather than a skip.
-		//
-		//    The identity check is not defensive noise. ClaimParams carries a job name AND an
-		//    execution id, and nothing outside this transaction guarantees they agree: a
-		//    caller that pairs job A's name with job B's execution would commit A's state row
-		//    as held while dispatching B under A's definition, lease, timeout and routing —
-		//    and B's own state row would stay free for another B execution to run beside it.
-		//    A component that hands out exclusive access must fail closed on inconsistent
-		//    input rather than trust that its caller assembled it correctly.
-		cur, err := lockExecution(ctx, tx, p.ExecutionID)
-		if err != nil {
-			return err
-		}
-		if cur.JobName != p.JobName || cur.ExecutionKey != p.ExecutionKey {
-			return fmt.Errorf("%w: claim names job %q key %q but execution %d is job %q key %q",
-				gojob.ErrProtocol, p.JobName, p.ExecutionKey, p.ExecutionID, cur.JobName, cur.ExecutionKey)
-		}
-
-		//    timeout_at is set HERE and never extended. It is a hard runtime cap, and a cap
+		// 4. Then the execution row, already locked and identity-checked above.
+		//    timeout_at is set on the FIRST claim and never again. It is a hard runtime cap, and a cap
 		//    computed at acceptance would not exist for a row that never gets that far — a
 		//    `dispatching` row whose executor never answers would have no budget at all.
 		res, err = tx.ExecContext(ctx, `
@@ -355,7 +372,7 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 			    fence_epoch    = ?,
 			    lease_until    = TIMESTAMPADD(SECOND, ?, NOW()),
 			    heartbeat_at   = NOW(),
-			    timeout_at     = TIMESTAMPADD(SECOND, ?, NOW()),
+			    timeout_at     = COALESCE(timeout_at, TIMESTAMPADD(SECOND, ?, NOW())),
 			    updated_at     = ?
 			WHERE id = ? AND job_name = ? AND status = 'ready' AND attempt_no < max_attempts`,
 			p.Owner, nullString(p.ExecutorID), p.RunToken, epoch,
@@ -447,6 +464,26 @@ func deferCandidate(ctx context.Context, tx *sql.Tx, id int64, backoffSeconds in
 		return fmt.Errorf("%w: defer candidate affected %d rows", gojob.ErrProtocol, n)
 	}
 	return nil
+}
+
+// expireReadyExecution ends a `ready` row whose runtime cap has elapsed. No owner exists, so
+// there is nothing to fence and no job lock to release.
+func expireReadyExecution(ctx context.Context, tx *sql.Tx, id int64, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE job_execution
+		SET write_seq       = write_seq + 1,
+		    status          = 'dead',
+		    terminal_reason = ?,
+		    failure_kind    = 'timeout',
+		    error_message   = 'runtime cap elapsed before dispatch',
+		    finished_at     = ?,
+		    updated_at      = ?
+		WHERE id = ? AND status = 'ready'`,
+		string(gojob.ReasonTimeout), now, now, id)
+	if err != nil {
+		return fmt.Errorf("expire execution %d: %w", id, err)
+	}
+	return assertOne(res, "claim: expire past-cap execution")
 }
 
 func isManual(ctx context.Context, tx *sql.Tx, id int64) (bool, error) {

@@ -126,7 +126,7 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 
 		touchesOwnership := false
 		for _, a := range setAssignments(norm) {
-			col := strings.ToLower(strings.TrimPrefix(a.column, "js."))
+			col := unqualified(a.column)
 			if ownershipColumns[col] {
 				touchesOwnership = true
 				break
@@ -219,7 +219,7 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 			continue
 		}
 		for _, a := range setAssignments(norm) {
-			if !ownership[strings.ToLower(a.column)] {
+			if !ownership[unqualified(a.column)] {
 				continue
 			}
 			assignments++
@@ -238,7 +238,7 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 	}
 
 	// And the comparisons: an ownership column may only be compared against NOW().
-	cmp := regexp.MustCompile(`(?i)\b(lease_until|heartbeat_at|deadline_at|timeout_at)\s*(<=|>=|<|>|=)\s*([A-Za-z0-9_?]+\(?\)?)`)
+	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(lease_until|heartbeat_at|deadline_at|timeout_at)\s*(<=|>=|<|>|=)\s*([A-Za-z0-9_?]+\(?\)?)`)
 	var comparisons int
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
@@ -261,7 +261,7 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 // Business columns must never be compared against the database clock — the mirror of the rule
 // above, and the one that fires an hour early after a zone change.
 func TestBusinessColumnsDoNotCompareAgainstNow(t *testing.T) {
-	cmp := regexp.MustCompile(`(?i)\b(available_at|scheduled_at|next_fire_at|next_poll_at|started_at|finished_at)\s*(<=|>=|<|>|=)\s*([A-Za-z0-9_?]+\(?\)?)`)
+	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(available_at|scheduled_at|next_fire_at|next_poll_at|started_at|finished_at)\s*(<=|>=|<|>|=)\s*([A-Za-z0-9_?]+\(?\)?)`)
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
 		i := strings.Index(strings.ToUpper(norm), " WHERE ")
@@ -275,6 +275,18 @@ func TestBusinessColumnsDoNotCompareAgainstNow(t *testing.T) {
 			}
 		}
 	}
+}
+
+// unqualified strips any table alias, so `je.lease_until` is recognised as the ownership
+// column it is. Stripping one hard-coded prefix meant a future `SET je.status = ...` would
+// have been treated as touching nothing — and the count floors elsewhere in these tests are
+// met by unrelated statements, so nothing would have failed.
+func unqualified(col string) string {
+	col = strings.ToLower(strings.TrimSpace(col))
+	if dot := strings.LastIndexByte(col, '.'); dot >= 0 {
+		col = col[dot+1:]
+	}
+	return col
 }
 
 type assignment struct{ column, value string }

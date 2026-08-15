@@ -196,6 +196,21 @@ func (s *Store) MaterializeCron(ctx context.Context, jobName string, compile Com
 		}
 		due := st.NextFireAt.Time
 
+		// Re-verify due-ness under the lock, exactly as MaterializePoll does.
+		//
+		// The due scan does not lock. Two replicas can both see a 10:00 row; the first
+		// materializes it and advances the clock to 11:00, and the second then acquires the
+		// now-uncontended row, reads 11:00, treats it as on time and creates the 11:00
+		// execution AN HOUR EARLY — with the parameters frozen at that moment, so a later
+		// definition edit cannot stop it running. More stale scanners pre-create more.
+		//
+		// SKIP LOCKED prevents two writers at the same instant; it does nothing about a writer
+		// arriving after the winner committed, which is what this check is for.
+		if due.After(now) {
+			out.Outcome, out.NextFireAt = MaterializedSuspended, due
+			return nil
+		}
+
 		// A fire at or after now-grace is ON TIME. Only strictly older instants are missed.
 		//
 		// The half-open window [due, onTimeFrom) is expressed to CountBetween — whose window is
@@ -432,7 +447,10 @@ func normalizeClocks(ctx context.Context, tx *sql.Tx, st StateRow, def gojob.Def
 		if err != nil {
 			return time.Time{}, fmt.Errorf("compile schedule for %q: %w", def.JobName, err)
 		}
-		nextFire, err = sched.Next(now)
+		// Next is strictly after its argument, so a nanosecond back makes this "the first
+		// fire AT OR AFTER now". Enabling a daily job exactly on its scheduled second must
+		// schedule it for that second, not silently lose a day.
+		nextFire, err = sched.Next(now.Add(-time.Nanosecond))
 		if err != nil {
 			return time.Time{}, fmt.Errorf("recompute next fire for %q: %w", def.JobName, err)
 		}
