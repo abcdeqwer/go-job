@@ -232,6 +232,13 @@ message RegisterRequest {
   // Logical executor that jobs route to. Instances share a group.
   string group = 2;
 
+  // The tenant this registration is for.
+  //
+  // A process may serve several tenants by calling Register once per tenant with the same
+  // executor_id. Each registration carries its own handlers, capacity and in_flight set,
+  // so one tenant's work is never routed on another tenant's evidence. Whether to run one
+  // process per tenant or one process for all of them is a deployment decision, not a
+  // constraint of this contract.
   string tenant = 3;
 
   // Where the scheduler reaches this instance for JobExecutor calls.
@@ -307,6 +314,17 @@ message ExecutionOutcome {
 
   // Detail for diagnosis. Truncated by the scheduler; do not rely on it being complete.
   string error_detail = 4;
+
+  // Whether this pass actually processed anything.
+  //
+  // Only meaningful for FIXED_DELAY jobs, where the scheduler dispatches a pass every few
+  // seconds and most passes find an empty queue. A pass reporting did_work=false leaves no
+  // execution row: it is counted in metrics and forgotten, so a three-second poller does
+  // not write tens of thousands of rows a day recording that there was nothing to do.
+  //
+  // CRON jobs ignore this field; their runs are always persisted, because a scheduled
+  // instant that produced nothing is itself a fact worth keeping.
+  bool did_work = 5;
 }
 
 message ReportResultResponse {}

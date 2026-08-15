@@ -1,36 +1,151 @@
 # Data model
 
-Every table lives in one MySQL schema per tenant. There is no `tenant_id` column anywhere:
-the connection *is* the tenant boundary. Two tenants may hold identical job names and
-identical row ids without any possibility of interference, and a query that forgets a
-tenant predicate cannot leak across tenants because no such predicate exists.
+One small **control** database holds the tenant registry and everything that is genuinely
+global. Everything else lives in **one coordination schema per tenant**, where there is no
+`tenant_id` column anywhere: the connection *is* the tenant boundary. Two tenants may hold
+identical job names and identical row ids without any possibility of interference, and a
+query that forgets a tenant predicate cannot leak across tenants because no such predicate
+exists.
+
+Adding a site is a row in the registry, not a redeploy.
 
 Table names carry a configurable prefix, shown here as `job_`.
 
 ---
 
-## 0. Where these tables live
+## 0. Two kinds of database
+
+| Database | How many | Holds |
+| --- | --- | --- |
+| **control** | exactly one | the tenant registry, admin accounts, control-plane leases and control audit |
+| **coordination** | one per tenant | everything else in this document — jobs, state, executions, executor registrations |
+
+The control database is the only place in this system that knows more than one tenant
+exists. It holds no business data, no execution state and no job configuration; a tenant's
+scheduling lives entirely in its own schema, and the isolation property of section 0.2 is
+unaffected.
+
+### 0.1 The tenant registry
+
+Sites are added over time, so the tenant list is **data, not deployment configuration**. A
+new site is a row, and schedulers pick it up without a restart.
+
+```sql
+CREATE TABLE tenant_registry (
+    tenant           VARCHAR(64)     NOT NULL,
+    coordination_dsn VARBINARY(2048) NOT NULL,   -- encrypted
+    business_dsn     VARBINARY(2048) NULL,       -- encrypted; NULL = same as coordination
+    enabled          TINYINT(1)      NOT NULL DEFAULT 1,
+    schema_version   VARCHAR(16)     NULL,       -- last version verified on this tenant
+    admitted_at      DATETIME        NULL,
+    last_error       VARCHAR(512)    NULL,
+    created_at       DATETIME        NOT NULL,
+    updated_at       DATETIME        NOT NULL,
+    PRIMARY KEY (tenant)
+);
+```
+
+**DSNs are encrypted at rest** with AES-GCM under a key the scheduler holds from its
+environment or a KMS. They contain database passwords, and this table is reachable from an
+admin UI. The API accepts a plaintext DSN over TLS, encrypts before storing, and **never
+returns one** — reads are masked to `user@host/schema`. An operator changing a DSN replaces
+it; there is no "show me the current password" affordance, because there is no legitimate
+use for one that outweighs the risk.
+
+### 0.2 Hot add, and why admission stops being all-or-nothing
+
+Schedulers poll `tenant_registry` on a short interval:
+
+| Change | Effect |
+| --- | --- |
+| a new `enabled` row appears | open a pool, verify the schema version, admit, start loops |
+| a row is disabled | stop claiming, let in-flight work finish, release the pool |
+| a DSN changes | drain and re-admit under the new DSN |
+
+This forces a design change worth stating explicitly. Admission was previously
+all-or-nothing across tenants: any tenant failing prevented readiness. **With hot add that
+becomes wrong** — a newly added tenant with a typo in its DSN would take down a scheduler
+that is happily serving twenty healthy tenants.
+
+So admission is **per tenant**:
+
+- a tenant that fails to admit records `last_error`, is surfaced in the UI, and is retried
+  on a backoff. Its failure is loud;
+- **other tenants are unaffected** and keep running;
+- process readiness reflects the control database and the tenants that were healthy at
+  startup — not every tenant that has ever been added.
+
+The startup case keeps its stricter behaviour: a tenant that was admitted when the process
+started and cannot be re-admitted after a restart is a regression, not a new site, and is
+alerted as such.
+
+### 0.3 The rest of the control database
+
+```sql
+-- Named leases for periodic work that should run once per cluster per interval:
+-- retention sweeps, orphan scans, expired-registration cleanup.
+-- A lease, not an election — see protocol.md §9.
+CREATE TABLE control_lease (
+    lease_name   VARCHAR(64)  NOT NULL,
+    holder_id    VARCHAR(128) NOT NULL,
+    run_token    CHAR(36)     NOT NULL,
+    lease_until  DATETIME     NOT NULL,
+    heartbeat_at DATETIME     NOT NULL,
+    PRIMARY KEY (lease_name)
+);
+
+-- Admin accounts are global: an operator logs in once and works across tenants.
+-- Present only when built-in authentication is used.
+CREATE TABLE admin_user (
+    username      VARCHAR(64)  NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role          VARCHAR(16)  NOT NULL,   -- VIEWER | OPERATOR
+    disabled      TINYINT(1)   NOT NULL DEFAULT 0,
+    created_at    DATETIME     NOT NULL,
+    updated_at    DATETIME     NOT NULL,
+    PRIMARY KEY (username)
+);
+
+-- Actions on the registry itself: adding, disabling or re-pointing a tenant.
+-- Per-job actions are audited in that tenant's own schema.
+CREATE TABLE control_audit (
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    actor      VARCHAR(64)  NOT NULL,
+    action     VARCHAR(48)  NOT NULL,
+    tenant     VARCHAR(64)  NULL,
+    detail     VARCHAR(1024) NULL,
+    created_at DATETIME     NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_control_audit_time (created_at)
+);
+```
+
+Adding a site is therefore: create its coordination schema, apply the scheduler DDL, add one
+audited row. No redeploy, no restart, no code change.
+
+---
+
+### 0.5 Where the per-tenant tables live
 
 The library requires **a** MySQL schema per tenant for its coordination tables. Whether
 that is the tenant's business schema or a dedicated one is chosen **by the adopter, in
 configuration** — it is not a build-time option and there is no code path in this library
 that differs between the two.
 
-Each tenant supplies up to two DSNs:
+Each tenant carries up to two DSNs in its `tenant_registry` row. `coordination_dsn` is
+required and is where the tables in this document live. `business_dsn` is optional and
+defaults to the coordination DSN; it is what a dispatched execution's handler works against.
 
-```go
-Tenants: map[string]gojob.Tenant{
-    // dedicated coordination schema
-    "acme": {Coordination: "…/acme_scheduler", Business: "…/acme"},
+Adding a site with a dedicated coordination schema, and one that shares, differ only in
+whether the second DSN is set:
 
-    // shared: the same schema holds both
-    "beta": {Coordination: "…/beta"},
-},
+```text
+tenant  coordination_dsn        business_dsn
+np      …/np_scheduler          …/np            -- dedicated
+np2     …/np2                   NULL            -- shared
 ```
 
-`Coordination` is required and is where the tables in this document live. `Business` is
-optional and defaults to `Coordination`; it is what `ctx.DB()` hands to handlers. That is
-the entire selection mechanism, and it exists in exactly one place.
+That is the entire selection mechanism, and it exists in exactly one place.
 
 ### The difference is operational, not behavioural
 
@@ -161,11 +276,13 @@ audited action, so that history and any pending executions stay inspectable.
 CREATE TABLE job_state (
     job_name          VARCHAR(128) NOT NULL,
     next_fire_at      DATETIME     NULL,
+    next_poll_at      DATETIME     NULL,
     ops_paused        TINYINT(1)   NOT NULL DEFAULT 0,
-    active_kind       VARCHAR(16)  NULL,      -- EXECUTION | LOOP
+    active_kind       VARCHAR(16)  NULL,      -- EXECUTION | POLL
     active_execution  VARCHAR(160) NULL,
-    active_worker_id  VARCHAR(128) NULL,
+    active_owner      VARCHAR(128) NULL,      -- scheduler instance holding it
     active_run_token  CHAR(36)     NULL,
+    dispatched_to     VARCHAR(128) NULL,      -- executor_id it was handed to
     fence_epoch       BIGINT       NOT NULL DEFAULT 0,
     lease_until       DATETIME     NULL,
     heartbeat_at      DATETIME     NULL,
@@ -175,29 +292,45 @@ CREATE TABLE job_state (
     updated_at        DATETIME     NOT NULL,
     PRIMARY KEY (job_name),
     KEY idx_job_state_due (next_fire_at),
+    KEY idx_job_state_poll (next_poll_at),
     KEY idx_job_state_lease (lease_until)
 );
 ```
 
-### One active holder, and what may hold it
+### Two "who" fields, because there are two layers
+
+`active_owner` is the **scheduler instance** that owns this job's current work.
+`dispatched_to` is the **executor instance** actually running it. They are separate columns
+because they fail independently: a scheduler instance can die while its executor runs
+happily on, and recovery has to reconcile with the executor rather than assume the work
+stopped (`protocol.md` §10). A single conflated "worker id" cannot express that.
+
+### One active holder
 
 This row *is* the job's lock. `active_kind` says what holds it:
 
 | `active_kind` | Holder | Released by |
 | --- | --- | --- |
-| `EXECUTION` | a claimed cron or manual execution | completion, retry or recovery |
-| `LOOP` | a fixed-delay polling loop | clean loop exit, or recovery |
+| `EXECUTION` | a claimed cron or manual execution | result, retry or recovery |
+| `POLL` | a dispatched fixed-delay pass that has not yet persisted a row | result, or recovery |
 | `NULL` | nobody | — |
 
-A single-valued holder is a deliberate constraint, and it is why there is no `PARALLEL`
-concurrency policy: heartbeat, completion, retry and recovery all guard on
-`active_run_token` and `fence_epoch` from this row, so two concurrent executions of one job
-would have no way to each own, renew and release it. A policy declaring "no job-level lock"
-would leave every one of those statements operating on a row that does not describe the
-writer.
+`POLL` exists because a fixed-delay pass is dispatched before anyone knows whether it will
+find work (§4). It still needs the lock — two overlapping passes over the same queue is
+exactly what a poller must not do — but it has no execution row to own the lease, so the
+state row carries it alone until the result arrives.
 
-Unifying loops and executions behind the same holder is what makes a manual trigger
-serialize against a running poller without a second mechanism.
+A single-valued holder is a deliberate constraint, and it is why there is no `PARALLEL`
+concurrency policy: heartbeat, result and recovery all guard on `active_run_token` and
+`fence_epoch` from this row, so two concurrent executions of one job would have no way to
+each own, renew and release it.
+
+It is also what makes a manual trigger serialize against a running poll without a second
+mechanism.
+
+`next_poll_at` is the fixed-delay counterpart of `next_fire_at`: set to *result time +
+delay* when a pass completes, which is what makes the delay measured from completion rather
+than from start.
 
 ### `ops_paused`
 
@@ -365,26 +498,15 @@ identity is unavailable: an action that cannot be attributed is rejected instead
 
 ---
 
-## 7. `job_admin_user` — optional
+## 7. Admin accounts live in the control database
 
-Present only when the built-in authentication is used. Hosts fronting the UI with their own
-SSO disable built-in login and this table stays empty.
+Not here. An operator logs in once and works across every tenant, so per-tenant accounts
+would mean one password per site and a login that breaks the moment a site is added. See
+`admin_user` in §0.3.
 
-```sql
-CREATE TABLE job_admin_user (
-    username      VARCHAR(64)  NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    role          VARCHAR(16)  NOT NULL,   -- VIEWER | OPERATOR
-    disabled      TINYINT(1)   NOT NULL DEFAULT 0,
-    created_at    DATETIME     NOT NULL,
-    updated_at    DATETIME     NOT NULL,
-    PRIMARY KEY (username)
-);
-```
-
-Two roles, deliberately: one that can look, one that can act. A permission model with more
-gradations is the host's business, and hosts that need it put the UI behind their own
-authorization.
+Two roles, deliberately: one that can look, one that can act. Finer-grained authorization is
+the adopter's business, and installations that need it put the UI behind their own access
+controls.
 
 ---
 
