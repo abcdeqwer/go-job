@@ -101,17 +101,38 @@ the *tenant* database is fine. Absence of an acknowledgement is not evidence of 
 So the control database is also a **lease on the right to operate**:
 
 > A scheduler instance that has not successfully read `tenant_registry` within
-> `control_staleness_limit` (default 30s, and always well under the liveness bound the API
-> uses) **stops claiming, stops materializing and drops readiness** for every tenant. It
-> keeps renewing leases for work already in flight so nothing is stranded, and resumes when
-> the control database returns.
+> `control_staleness_limit` (default 30s, well under the liveness bound the API uses)
+> **stops claiming, stops materializing, stops renewing leases, and drops readiness** for
+> every tenant, resuming when the control database returns.
 
-A partitioned instance therefore fences *itself* before the API could ever conclude it is
-gone. The proof is not "everyone acknowledged" but "everyone either acknowledged or has
-stopped by construction", which is a property a partition cannot break.
+Ceasing renewal is the part that matters, and an earlier revision got it exactly wrong by
+letting a partitioned instance keep renewing "so nothing is stranded". Nothing *is*
+stranded: its leases expire, and every other instance can still reach the tenant database
+and recover them normally. What renewal would preserve is precisely the thing being ruled
+out — an owner nobody can see, still holding work, while the API concludes it is gone.
 
-Nothing here is a consensus protocol — an acknowledgement table with a freshness bound, plus
-a self-fencing rule with a shorter one.
+**Quiescence is then proven by looking at the tenant's own schema, not by counting
+acknowledgements.** Acknowledgement can only ever say who *replied*; the question is whether
+anything is still held:
+
+```sql
+-- quiescent when both return zero, in the OLD coordination schema
+SELECT COUNT(*) FROM job_state     WHERE active_kind IS NOT NULL;
+SELECT COUNT(*) FROM job_execution
+ WHERE status IN ('ready','dispatching','running','cancel_requested');
+```
+
+That is direct evidence about the thing that matters, and it is unaffected by which
+instances happen to be reachable. The acknowledgement table remains useful — it tells an
+operator *why* a schema is not yet quiet, and which instance is still working — but it is a
+diagnostic, not the proof.
+
+A DSN change is therefore accepted when the old schema is quiescent by the scan above, and
+the self-fencing rule is what guarantees that state is reachable at all: without it a
+partitioned instance could renew forever and the scan would never come back zero.
+
+Nothing here is a consensus protocol — a direct scan, plus a self-fencing rule with a
+shorter bound than the API's.
 
 **Draining is bounded.** "Let in-flight work finish" is not a terminating condition: an
 execution can hang, and a scheduler that waits for it forever means a disable or a DSN change
@@ -607,18 +628,34 @@ offers.
 ```sql
 CREATE TABLE job_execution_attempt (
     execution_key  VARCHAR(160) NOT NULL,
-    attempt_no     INT          NOT NULL,
+    run_token      CHAR(36)     NOT NULL,   -- the attempt's identity
+    attempt_no     INT          NOT NULL,   -- budget ordinal; NOT unique
     executor_id    VARCHAR(128) NULL,
-    run_token      CHAR(36)     NOT NULL,
     started_at     DATETIME     NULL,
     finished_at    DATETIME     NULL,
     outcome        VARCHAR(20)  NOT NULL,   -- success | failed | unknown | fenced
     failure_kind   VARCHAR(48)  NULL,
     summary        VARCHAR(512) NULL,
-    PRIMARY KEY (execution_key, attempt_no),
+    PRIMARY KEY (execution_key, run_token),
+    KEY idx_job_attempt_ordinal (execution_key, attempt_no),
     KEY idx_job_attempt_time (finished_at)
 );
 ```
+
+**The primary key is `(execution_key, run_token)`, not `(execution_key, attempt_no)`.** A
+token identifies one attempt by construction; `attempt_no` counts *budget*, and the two are
+not the same thing. Using the ordinal as identity is unimplementable in a case that occurs
+in normal operation:
+
+> Attempt 1 is accepted, fails, and writes history row 1. The retry is claimed with token T2
+> while `attempt_no` is still 1 — it is incremented on acceptance. The executor accepts, its
+> reply is lost, and it restarts before the re-send. Recovery gets `NOT_FOUND`, classifies
+> T2 as **unknown**, and correctly leaves `attempt_no` alone, since no start was ever
+> confirmed. The history append then has to use ordinal 1, which already exists.
+
+Keying on the token records that unknown attempt exactly once with no collision, and
+`attempt_no` repeats across rows — which is the truth: two attempts really did share a budget
+number because only one of them was ever confirmed to have started.
 
 One row is appended per attempt when it reaches a terminal state, including `unknown` for an
 attempt whose executor could never be reconciled.

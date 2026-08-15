@@ -314,10 +314,13 @@ cannot regress silently.
     creates no second run;
 100. a `Register` from an identity with no `executor_identity` row for the claimed tenant and
     group is refused;
-101. **a scheduler partitioned from the control database stops claiming and materializing
-    within `control_staleness_limit`**, while continuing to renew leases for work already in
-    flight — so a DSN change can never proceed past an instance that is still working the old
-    schema;
+101. **a scheduler partitioned from the control database stops claiming, materializing AND
+    renewing within `control_staleness_limit`**, so the work it held becomes recoverable by
+    healthy instances and the old schema can actually reach zero;
+101a. a DSN change is accepted only when a **scan of the old coordination schema** shows no
+    held `job_state` row and no non-terminal execution — not when the reachable instances
+    happen to have acknowledged. Run it with one instance partitioned and still holding work:
+    the change must be refused;
 102. `timeout_at` is written in the claim transaction: a scheduler killed after the executor
     accepted but before recording acceptance leaves a successor with the **original** cap,
     neither refreshed nor absent;
@@ -334,7 +337,11 @@ cannot regress silently.
 107. recovery restores `next_poll_at` only when it ends the pass; a recovered pass returned to
     `ready` leaves it `NULL`, so no second pass is materialized alongside it;
 108. a repeated trigger with the same `request_id` is rejected by the unique key and returns
-    the original execution.
+    the original execution;
+109. an attempt whose acceptance reply was lost, and whose executor restarted before the
+    re-send, is recorded in attempt history as `unknown` **without** consuming `attempt_no`
+    and **without** colliding with the earlier attempt that shares that ordinal — the case
+    that proves attempt identity is the token, not the number.
 
 ---
 
