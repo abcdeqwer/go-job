@@ -1,90 +1,58 @@
 package cron
 
 import (
-	"fmt"
 	"time"
 )
-
-// probeWindows bound how far back Latest looks, finest first.
-//
-// The point is not the horizon itself but the walk length. Latest works by finding an anchor
-// A with Next(A) <= at, then walking forward; the number of steps in that walk is the number
-// of fires between A and `at`. Starting with the finest window keeps that small for a
-// fast schedule — a per-second expression matches the one-minute anchor and walks sixty
-// times, never the 31,536,000 a naive walk from a year-old next_fire_at would take.
-var probeWindows = []time.Duration{
-	time.Minute,
-	time.Hour,
-	24 * time.Hour,
-	7 * 24 * time.Hour,
-	31 * 24 * time.Hour,
-	366 * 24 * time.Hour,
-}
-
-// walkCap bounds the forward walk inside Latest, so a pathological expression fails loudly
-// instead of spinning.
-//
-// It has to clear the worst BURSTY schedule, not the worst uniform one. `* * 0-3 1 * *` fires
-// every second for four hours on the first of each month: asked for the latest fire on the
-// 15th, the finest window that contains any fire is the 31-day one, which anchors on the 1st
-// and must then cross 14,400 legitimate fires. A cap of 10,000 rejected that valid schedule —
-// and, because misfire handling calls Latest, left the row due forever, retrying and failing.
-//
-// A quarter of a million steps is a few hundred milliseconds on a path that runs only when a
-// job has actually misfired. Being slow there is much cheaper than being wrong.
-const walkCap = 250_000
 
 // Latest returns the most recent fire instant at or before `at`, searching back at most
 // `horizon`. ok is false when the expression has no fire in that window.
 //
 // It exists because misfire handling needs to know what the last fire WAS, and a cron
-// expression only knows how to go forwards. Enumerating forwards from a stale next_fire_at is
-// not an option: a per-second job whose scheduler was down for a week is 604,800 steps.
+// expression only knows how to go forwards.
+//
+// The implementation bisects over time rather than enumerating fires, so its cost depends on
+// the LENGTH of the horizon and not at all on how many times the expression fires inside it.
+// That distinction is the whole point. An enumerating version has to be capped, and any cap
+// is wrong for some legitimate schedule: `* * 0-3 1 * *` fires 14,400 times a month and
+// `* * * 1-7 * *` fires 604,800 times, both perfectly valid, and a cap sized past them is a
+// cap that no longer catches anything. Roughly twenty-five Next calls cover a full year to
+// the second, whatever the expression.
+//
+// The bisection rests on Next being monotonic: for any t before the last fire L, Next(t) <= L
+// <= at, and for any t at or after L, Next(t) > at — otherwise a fire later than L would exist
+// in the window. So the largest t with Next(t) <= at is L minus one second, and Next of it is
+// L exactly.
 func (e *Expression) Latest(at time.Time, horizon time.Duration) (time.Time, bool, error) {
-	var anchor time.Time
-	var found bool
-	for _, w := range probeWindows {
-		if w > horizon {
-			break
-		}
-		cand, err := e.Next(at.Add(-w))
-		if err != nil {
-			return time.Time{}, false, err
-		}
-		if !cand.After(at) {
-			anchor, found = cand, true
-			break
-		}
+	lo := at.Add(-horizon)
+
+	first, err := e.Next(lo)
+	if err != nil {
+		return time.Time{}, false, err
 	}
-	if !found {
-		// None of the standard windows contained a fire; try the caller's horizon exactly,
-		// so a horizon between two windows, or larger than the largest, still works.
-		cand, err := e.Next(at.Add(-horizon))
-		if err != nil {
-			return time.Time{}, false, err
-		}
-		if cand.After(at) {
-			return time.Time{}, false, nil
-		}
-		anchor = cand
+	if first.After(at) {
+		return time.Time{}, false, nil // no fire in the window at all
 	}
 
-	last := anchor
-	for i := 0; ; i++ {
-		if i > walkCap {
-			return time.Time{}, false, fmt.Errorf(
-				"cron %q: more than %d fires between the anchor and %s; the expression is denser than any schedule this is designed for",
-				e.src, walkCap, at.Format(time.RFC3339))
-		}
-		nxt, err := e.Next(last)
+	// Invariant: Next(lo) <= at, and hi is the exclusive upper bound of the search.
+	hi := at
+	for hi.Sub(lo) > time.Second {
+		mid := lo.Add(hi.Sub(lo) / 2)
+		nxt, err := e.Next(mid)
 		if err != nil {
 			return time.Time{}, false, err
 		}
 		if nxt.After(at) {
-			return last, true, nil
+			hi = mid
+		} else {
+			lo = mid
 		}
-		last = nxt
 	}
+
+	last, err := e.Next(lo)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return last, true, nil
 }
 
 // CountBetween returns how many fires fall in (from, to], stopping at limit.

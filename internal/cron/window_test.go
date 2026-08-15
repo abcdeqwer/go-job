@@ -78,9 +78,8 @@ func TestLatestIsNeverInTheFuture(t *testing.T) {
 	}
 }
 
-// A week-long outage on a per-second schedule must not turn into 604,800 iterations. The walk
-// is bounded by the finest probe window that contains a fire, so this is a sixty-step search
-// whatever the age of the stale instant.
+// A week-long outage on a per-second schedule must not turn into 604,800 iterations. The
+// bisection's cost tracks the horizon, so the age of the stale instant does not matter.
 func TestLatestIsCheapForADenseScheduleAfterALongOutage(t *testing.T) {
 	e := MustParse("* * * * * *")
 	ref := at(t, time.UTC, "2026-03-08 10:00:00")
@@ -96,29 +95,92 @@ func TestLatestIsCheapForADenseScheduleAfterALongOutage(t *testing.T) {
 		t.Fatalf("Latest = %s, want %s", got.Format(time.RFC3339), ref.Format(time.RFC3339))
 	}
 	if elapsed > 100*time.Millisecond {
-		t.Fatalf("Latest took %s; the anchor probe is not bounding the walk", elapsed)
+		t.Fatalf("Latest took %s; the search is enumerating fires rather than bisecting time", elapsed)
 	}
 }
 
-// A BURSTY schedule is the case the uniform test above misses: `* * 0-3 1 * *` fires every
-// second for four hours on the first of each month, so on the 15th the finest window holding
-// any fire is the 31-day one — and the walk from it crosses 14,400 legitimate fires. A cap
-// sized for uniform density rejects this valid schedule, and because misfire handling calls
-// Latest, the row stays due forever, retrying and failing.
-func TestLatestHandlesABurstySchedule(t *testing.T) {
-	e := MustParse("* * 0-3 1 * *")
-	ref := at(t, time.UTC, "2026-02-15 12:00:00")
+// Bursty schedules are where an enumerating implementation dies, and where each raised cap
+// merely moves the failure to a denser expression. The two here fire 14,400 and 604,800 times
+// per burst; the bisection does not care, because its cost tracks the horizon and not the
+// number of fires inside it.
+//
+// Getting this wrong is not a slow path — misfire handling calls Latest, so an error leaves
+// the row due forever, retrying and failing.
+func TestLatestHandlesBurstySchedules(t *testing.T) {
+	cases := []struct{ expr, at, want string }{
+		// Every second for four hours on the 1st: 14,400 fires per month.
+		{"* * 0-3 1 * *", "2026-02-15 12:00:00", "2026-02-01 03:59:59"},
+		// Every second for the first seven days: 604,800 fires per month.
+		{"* * * 1-7 * *", "2026-02-15 12:00:00", "2026-02-07 23:59:59"},
+	}
+	for _, c := range cases {
+		e := MustParse(c.expr)
+		start := time.Now()
+		got, ok, err := e.Latest(at(t, time.UTC, c.at), 366*24*time.Hour)
+		elapsed := time.Since(start)
 
-	got, ok, err := e.Latest(ref, 366*24*time.Hour)
-	if err != nil {
-		t.Fatalf("Latest: %v", err)
+		if err != nil {
+			t.Errorf("Latest(%q): %v", c.expr, err)
+			continue
+		}
+		if !ok {
+			t.Errorf("Latest(%q): no fire found", c.expr)
+			continue
+		}
+		if want := at(t, time.UTC, c.want); !got.Equal(want) {
+			t.Errorf("Latest(%q) = %s, want %s", c.expr, got.Format(time.RFC3339), want.Format(time.RFC3339))
+		}
+		if elapsed > 100*time.Millisecond {
+			t.Errorf("Latest(%q) took %s; cost must track the horizon, not the fire count",
+				c.expr, elapsed)
+		}
 	}
-	if !ok {
-		t.Fatal("no fire found for a schedule that fires 14,400 times a month")
-	}
-	// The last fire of the burst: 03:59:59 on the 1st.
-	if want := at(t, time.UTC, "2026-02-01 03:59:59"); !got.Equal(want) {
-		t.Fatalf("Latest = %s, want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+}
+
+// The bisection must agree with brute-force enumeration, including at the boundaries where an
+// off-by-one is invisible to a hand-picked expectation.
+func TestLatestAgreesWithEnumeration(t *testing.T) {
+	utc := time.UTC
+	for _, expr := range []string{"0 * * * * *", "*/7 * * * * *", "0 0 2 * * MON-FRI", "0 30 1 1,15 * *"} {
+		e := MustParse(expr)
+		for _, s := range []string{
+			"2026-03-01 10:00:00", "2026-03-01 10:00:01", "2026-03-02 02:00:00",
+			"2026-03-15 01:30:00", "2026-03-15 01:29:59", "2026-02-28 23:59:59",
+		} {
+			ref := at(t, utc, s)
+
+			// Three days, not a year: the brute-force side has to enumerate every fire, and
+			// `*/7` alone produces half a million in forty days. The bisection's correctness
+			// does not depend on horizon length, so a short one tests the same logic.
+			const horizon = 3 * 24 * time.Hour
+			got, ok, err := e.Latest(ref, horizon)
+			if err != nil {
+				t.Fatalf("Latest(%q, %s): %v", expr, s, err)
+			}
+
+			// Brute force: walk forward from the horizon, keeping the last fire <= ref.
+			var want time.Time
+			var found bool
+			cur := ref.Add(-horizon)
+			for i := 0; i < 200_000; i++ {
+				nxt, err := e.Next(cur)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if nxt.After(ref) {
+					break
+				}
+				want, found, cur = nxt, true, nxt
+			}
+
+			if ok != found {
+				t.Fatalf("Latest(%q, %s): ok=%v but enumeration found=%v", expr, s, ok, found)
+			}
+			if found && !got.Equal(want) {
+				t.Errorf("Latest(%q, %s) = %s, enumeration says %s",
+					expr, s, got.Format(time.RFC3339), want.Format(time.RFC3339))
+			}
+		}
 	}
 }
 

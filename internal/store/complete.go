@@ -21,17 +21,6 @@ type Outcome struct {
 	ExecutorID     string
 	StartedAt      time.Time
 	FinishedAt     time.Time
-
-	// NextPollAt restores a fixed-delay job's poll clock, and is set ONLY when this outcome
-	// ENDS the pass — see doc/scheduling.md §2. It is nil for every cron job and for every
-	// retryable failure, where the retry IS the outstanding pass and restoring the clock
-	// would let the due scanner materialize a second one alongside it.
-	//
-	// It is a caller-supplied business instant rather than something computed here because
-	// the delay lives in the definition, and reading job_definition inside this transaction
-	// would either need a join that locks it — which the hot path must never do — or a second
-	// query for a value the caller already holds.
-	NextPollAt *time.Time
 }
 
 // Complete moves an execution to a terminal state and releases the job lock, in one
@@ -54,7 +43,7 @@ func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 	}
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		if err := releaseJobLock(ctx, tx, h, o.Status == gojob.StatusSuccess, o.NextPollAt, now); err != nil {
+		if err := releaseJobLock(ctx, tx, h, o.Status == gojob.StatusSuccess, now); err != nil {
 			return err
 		}
 		if err := chargeUnacceptedAttempt(ctx, tx, h, now); err != nil {
@@ -89,7 +78,10 @@ func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 			return fmt.Errorf("%w: execution %d result refused under token %s epoch %d",
 				gojob.ErrFenced, h.ExecutionID, h.RunToken, h.FenceEpoch)
 		}
-		return recordAttempt(ctx, tx, h, o)
+		if err := recordAttempt(ctx, tx, h, o); err != nil {
+			return err
+		}
+		return settlePollClock(ctx, tx, h, now)
 	})
 }
 
@@ -107,12 +99,7 @@ func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds i
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		// A retry is a failed attempt whether or not the budget is spent, so the state row
 		// records a failure either way.
-		//
-		// NextPollAt is honoured only on the `dead` branch, which this cannot know before the
-		// CAS runs — so a fixed-delay caller passes it and the state row's poll clock is
-		// restored only if the execution actually ended. That decision is made below, and the
-		// lock release therefore takes no poll instant.
-		if err := releaseJobLock(ctx, tx, h, false, nil, now); err != nil {
+		if err := releaseJobLock(ctx, tx, h, false, now); err != nil {
 			return err
 		}
 		if err := chargeUnacceptedAttempt(ctx, tx, h, now); err != nil {
@@ -157,15 +144,7 @@ func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds i
 		if err := recordAttempt(ctx, tx, h, o); err != nil {
 			return err
 		}
-
-		// A fixed-delay pass that just went `dead` ends the pass, so the poll clock is
-		// restored. One that went back to `ready` does not: the retry IS the outstanding
-		// pass, and a restored clock would let the due scanner materialize a second one to
-		// race it — the single-pass invariant gone.
-		if o.NextPollAt != nil {
-			return restorePollClockIfDead(ctx, tx, h, *o.NextPollAt, now)
-		}
-		return nil
+		return settlePollClock(ctx, tx, h, now)
 	})
 }
 
@@ -210,11 +189,9 @@ func chargeUnacceptedAttempt(ctx context.Context, tx *sql.Tx, h Holder, now time
 // releaseJobLock clears the state row under the current ownership. Guarded by token and
 // epoch, so a fenced holder releases nothing.
 //
-// last_success_at, last_failure_at and next_poll_at are set from the same statement rather
-// than from follow-ups, so a crash cannot leave the lock released and the poll clock still
-// NULL — which would strand a fixed-delay job forever, since NULL means "a pass is
-// outstanding" and nothing else ever sets it.
-func releaseJobLock(ctx context.Context, tx *sql.Tx, h Holder, succeeded bool, nextPollAt *time.Time, now time.Time) error {
+// last_success_at and last_failure_at are set from the same statement rather than from a
+// follow-up, so a crash cannot leave the lock released and the outcome unrecorded.
+func releaseJobLock(ctx context.Context, tx *sql.Tx, h Holder, succeeded bool, now time.Time) error {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE job_state
 		SET write_seq        = write_seq + 1,
@@ -224,12 +201,10 @@ func releaseJobLock(ctx context.Context, tx *sql.Tx, h Holder, succeeded bool, n
 		    active_run_token = NULL,
 		    dispatched_to    = NULL,
 		    lease_until      = NULL,
-		    next_poll_at     = IF(? IS NULL, next_poll_at, ?),
 		    last_success_at  = IF(?, ?, last_success_at),
 		    last_failure_at  = IF(?, last_failure_at, ?),
 		    updated_at       = ?
 		WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?`,
-		nullTime2(nextPollAt), nullTime2(nextPollAt),
 		succeeded, now, succeeded, now, now,
 		h.JobName, h.RunToken, h.FenceEpoch)
 	if err != nil {
@@ -246,49 +221,54 @@ func releaseJobLock(ctx context.Context, tx *sql.Tx, h Holder, succeeded bool, n
 	return nil
 }
 
-// restorePollClockUnderLock sets next_poll_at with the state row already locked by the
-// caller and possibly still held by another execution.
+// settlePollClock restarts a fixed-delay job's poll loop, and does nothing at all otherwise.
 //
-// It exists for the one terminal outcome that is NOT produced by the holder: a FORBID skip,
-// where the pass being ended lost the job to something else. The holder-oriented guard in
-// restorePollClockIfDead — "the lock is free" — is false there by construction.
-func restorePollClockUnderLock(ctx context.Context, tx *sql.Tx, jobName string, nextPollAt, now time.Time) error {
-	res, err := tx.ExecContext(ctx, `
-		UPDATE job_state
-		SET write_seq    = write_seq + 1,
-		    next_poll_at = ?,
-		    updated_at   = ?
-		WHERE job_name = ?`, nextPollAt, now, jobName)
+// EVERY terminal path calls it unconditionally, and it takes no "is this a poller" parameter,
+// because the alternative shape — a *time.Time the caller supplies when it believes the
+// outcome ends a pass — is a place to forget. It was forgotten three times in three review
+// rounds: once for FORBID, once when a late refusal became terminal, once in recovery. The
+// answer is not a fourth reminder; it is that no caller gets to decide.
+//
+// Two conditions are checked in SQL rather than in Go, so a caller cannot get them wrong:
+//
+//   - the execution named must actually be a POLL pass. A terminal manual run on a
+//     fixed-delay job is not the end of a pass, and moving the clock for it postpones the
+//     next real pass by a whole delay;
+//   - it must actually be terminal. A retry that went back to `ready` IS the outstanding
+//     pass, and restoring the clock would let the due scan materialize a second to race it.
+//
+// The guard is deliberately not "the job lock is free": FORBID settles the clock while the
+// job is still held by whatever won the contention, and every caller holds the state row's
+// lock for the rest of its transaction anyway.
+func settlePollClock(ctx context.Context, tx *sql.Tx, h Holder, now time.Time) error {
+	def, err := readDefinition(ctx, tx, h.JobName)
 	if err != nil {
-		return fmt.Errorf("restore poll clock for %q: %w", jobName, err)
+		return err
 	}
-	return assertOne(res, "restore poll clock under lock")
-}
+	if def.ScheduleKind != gojob.ScheduleFixedDelay {
+		return nil
+	}
 
-// restorePollClockIfDead sets next_poll_at only when the execution it names actually reached
-// a terminal state. The state row has already been released by this point, so the guard is on
-// the execution's status rather than on ownership.
-func restorePollClockIfDead(ctx context.Context, tx *sql.Tx, h Holder, nextPollAt, now time.Time) error {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE job_state js
 		SET js.write_seq    = js.write_seq + 1,
 		    js.next_poll_at = ?,
 		    js.updated_at   = ?
 		WHERE js.job_name = ?
-		  AND js.active_kind IS NULL
 		  AND EXISTS (SELECT 1 FROM job_execution je
-		              WHERE je.id = ? AND je.status IN ('dead', 'success', 'cancelled', 'skipped'))`,
-		nextPollAt, now, h.JobName, h.ExecutionID)
+		              WHERE je.id = ? AND je.job_name = js.job_name
+		                AND je.trigger_type = 'poll'
+		                AND je.status IN ('success', 'dead', 'cancelled', 'skipped'))`,
+		now.Add(def.Delay()), now, h.JobName, h.ExecutionID)
 	if err != nil {
-		return fmt.Errorf("restore poll clock for %q: %w", h.JobName, err)
+		return fmt.Errorf("settle poll clock for %q: %w", h.JobName, err)
 	}
-	// Zero rows is correct and expected when the retry went back to `ready`.
-	n, err := affected(res, "restore poll clock")
+	n, err := affected(res, "settle poll clock")
 	if err != nil {
 		return err
 	}
 	if n > 1 {
-		return fmt.Errorf("%w: poll clock restore affected %d rows", gojob.ErrProtocol, n)
+		return fmt.Errorf("%w: poll clock settle affected %d rows", gojob.ErrProtocol, n)
 	}
 	return nil
 }
@@ -372,13 +352,6 @@ func nullTime(t time.Time) any {
 		return nil
 	}
 	return t
-}
-
-func nullTime2(t *time.Time) any {
-	if t == nil {
-		return nil
-	}
-	return *t
 }
 
 // RequestCancel moves a running execution to cancel_requested. It KEEPS the lease and the job

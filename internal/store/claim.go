@@ -405,15 +405,12 @@ func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, out *ClaimResul
 			out.Reason = fmt.Errorf("%w: job %q held by %s; occurrence skipped by FORBID",
 				gojob.ErrContended, p.JobName, st.ActiveExecution.String)
 
-			// `skipped` is terminal, so for a fixed-delay job this ENDS the outstanding pass
-			// and the poll clock must be restored — otherwise next_poll_at stays NULL, no
-			// completion or recovery path will ever revisit this skipped row, and the poller
-			// never runs again. The state row is still held by the winning execution, so this
-			// cannot go through restorePollClockIfDead, whose guard is that the lock is free.
-			if def.ScheduleKind == gojob.ScheduleFixedDelay {
-				return restorePollClockUnderLock(ctx, tx, p.JobName, now.Add(def.Delay()), now)
-			}
-			return nil
+			// `skipped` is terminal, so if this was a poll pass it has just ENDED and the
+			// poll clock must be restarted — otherwise next_poll_at stays NULL, nothing
+			// revisits this skipped row, and the poller never runs again.
+			return settlePollClock(ctx, tx, Holder{
+				JobName: p.JobName, ExecutionID: p.ExecutionID, ExecutionKey: p.ExecutionKey,
+			}, now)
 		}
 	}
 
@@ -556,18 +553,11 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 			return err
 		}
 
-		// Making a late refusal terminal created a new terminal path, and every terminal
-		// outcome for a fixed-delay pass must restore the poll clock — otherwise this refusal
-		// ends the outstanding pass and leaves next_poll_at NULL, which nothing else revisits.
-		// The guard inside restorePollClockIfDead means the ordinary `ready` branch is a no-op.
-		def, err := readDefinition(ctx, tx, p.JobName)
-		if err != nil {
-			return err
-		}
-		if def.ScheduleKind == gojob.ScheduleFixedDelay {
-			h := Holder{JobName: p.JobName, ExecutionID: p.ExecutionID, ExecutionKey: p.ExecutionKey}
-			return restorePollClockIfDead(ctx, tx, h, now.Add(def.Delay()), now)
-		}
-		return nil
+		// Making a late refusal terminal created a new terminal path, and a terminal poll pass
+		// must restart the clock. The guards inside settlePollClock make the ordinary `ready`
+		// branch, and every non-poll execution, a no-op.
+		return settlePollClock(ctx, tx, Holder{
+			JobName: p.JobName, ExecutionID: p.ExecutionID, ExecutionKey: p.ExecutionKey,
+		}, now)
 	})
 }

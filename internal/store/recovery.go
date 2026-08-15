@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
 )
@@ -174,12 +173,7 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 //
 // cancel_requested resolves to `cancelled`, never `ready`. Someone asked this run to stop; its
 // executor dying is not a reason to start it again.
-//
-// nextPollAt is honoured only when this recovery ENDS the pass — recovery to `dead`. Recovery
-// back to `ready` leaves the poll clock NULL, because the recovered pass is still the
-// outstanding one and restoring the clock would let the due scanner materialize a second to
-// race it (doc/scheduling.md §2).
-func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int, nextPollAt *time.Time) (gojob.Status, error) {
+func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob.Status, error) {
 	var landed gojob.Status
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		st, err := lockState(ctx, tx, v.JobName)
@@ -290,11 +284,10 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int, nextPo
 			return err
 		}
 
-		// Recovery restores a fixed-delay job's poll clock only when it ENDS the pass.
-		if nextPollAt != nil && landed != gojob.StatusReady {
-			return restorePollClockIfDead(ctx, tx, h, *nextPollAt, now)
-		}
-		return nil
+		// A recovery that ENDS the pass restarts the poll clock; one that returns the row to
+		// `ready` does not, because the recovered pass is still the outstanding one. Both cases
+		// call the same function — the status guard inside it decides.
+		return settlePollClock(ctx, tx, h, now)
 	})
 	if err != nil {
 		return "", err
@@ -390,9 +383,7 @@ func (s *Store) TimedOut(ctx context.Context, limit int) ([]Stale, error) {
 // lapse, because the owning scheduler is alive and would otherwise keep renewing forever. The
 // executor is asked to stop separately; whether it complies is not something this can prove,
 // which is why the terminal reason distinguishes the two ways `dead` is reached.
-// nextPollAt restores a fixed-delay job's poll clock: the cap always ENDS the pass, so unlike
-// Resolve there is no branch on where the execution landed.
-func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Time) error {
+func (s *Store) FenceTimedOut(ctx context.Context, v Stale) error {
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		st, err := lockState(ctx, tx, v.JobName)
@@ -435,7 +426,7 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Tim
 			RunToken:     v.RunToken,
 			FenceEpoch:   v.FenceEpoch,
 		}
-		if err := releaseJobLock(ctx, tx, h, false, nextPollAt, now); err != nil {
+		if err := releaseJobLock(ctx, tx, h, false, now); err != nil {
 			return err
 		}
 
@@ -458,13 +449,16 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Tim
 		if err := assertOne(res, "fence timed out: terminal CAS"); err != nil {
 			return err
 		}
-		return recordAttempt(ctx, tx, h, Outcome{
+		if err := recordAttempt(ctx, tx, h, Outcome{
 			AttemptOutcome: gojob.AttemptFenced,
 			ExecutorID:     v.DispatchedTo,
 			FinishedAt:     now,
 			FailureKind:    "timeout",
 			ResultSummary:  summary,
-		})
+		}); err != nil {
+			return err
+		}
+		return settlePollClock(ctx, tx, h, now)
 	})
 }
 
