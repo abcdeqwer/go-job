@@ -205,9 +205,16 @@ Three bounds exist and are deliberately not merged:
 | --- | --- | --- |
 | `progress_interval_seconds` | how often the executor must speak | 30s |
 | `silence_deadline_seconds` | silence tolerated before investigation | 3 × progress interval |
-| `timeout_seconds` | **hard cap on total runtime** | per job; 24h for a long one |
+| `remaining_timeout_seconds` | **what is left of the hard runtime cap** | per job; 24h for a long one |
 
-The runtime cap is enforced **on both sides, because neither alone suffices**:
+The scheduler sends what **remains** of the cap, not the job's configured value. Its own
+clock started when the execution was claimed, and dispatch takes time — a bounded
+unknown-outcome re-send is bounded, not instant. Sending the full cap would hand the executor
+a later deadline than the scheduler is enforcing, so the scheduler would fence a run the
+executor still believed it was entitled to perform, and a successor could overlap it. A
+dispatch whose remaining budget has already elapsed is not sent.
+
+The cap is enforced **on both sides, because neither alone suffices**:
 
 - the **executor** abandons the handler at the cap and reports failure with
   `failure_kind = "timeout"`;
@@ -421,6 +428,9 @@ It must cover, at minimum:
 - `GetExecution` for an unheld key → `NOT_FOUND`, not `UNIMPLEMENTED` and not an error;
 - `Cancel` for an unheld key → `acknowledged=false`, not an error;
 - an unknown `handler_key` → `FAILED_PRECONDITION`;
+- a result with `DISPOSITION_UNSPECIFIED` → rejected; the field is required;
+- a cancelled handler that stops → `DISPOSITION_STOPPED`, never `DISPOSITION_FAILED`, so the
+  scheduler does not retry work an operator stopped;
 - `Run` for the same `execution_key` in **two different tenants** → both accepted and run
   independently; deduplication is per `(tenant, execution_key)`;
 - `Run` for a held `execution_key` with a **different** `run_token` → `ALREADY_EXISTS`

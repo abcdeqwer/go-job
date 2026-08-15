@@ -200,6 +200,9 @@ path is unreachable and never answers. The scheduler would re-send forever, rene
 leases each cycle — so the lease never expires, recovery never runs, no attempt or timeout
 budget is ever consumed, and the row sits `dispatching` for good.
 
+The re-send bound is additionally capped by the execution's own `timeout_at`: a dispatch is
+never attempted, or re-attempted, once the runtime budget has elapsed.
+
 On exhausting the bound the scheduler **stops renewing** and leaves the row to recovery,
 which reconciles with the executor and resolves it like any other unknown attempt. It also
 marks that executor's dispatch path unhealthy so routing stops preferring it, since an

@@ -341,7 +341,18 @@ cannot regress silently.
 109. an attempt whose acceptance reply was lost, and whose executor restarted before the
     re-send, is recorded in attempt history as `unknown` **without** consuming `attempt_no`
     and **without** colliding with the earlier attempt that shares that ordinal — the case
-    that proves attempt identity is the token, not the number.
+    that proves attempt identity is the token, not the number;
+110. **scheduler and executor never disagree about the runtime cap**: with a dispatch delayed
+    close to the re-send bound, the executor's budget and the scheduler's `timeout_at` expire
+    within tolerance of each other, and the scheduler never fences a run the executor still
+    considers live. A dispatch whose remaining budget has elapsed is not sent at all;
+111. a result carrying `DISPOSITION_UNSPECIFIED` is rejected, and a cancelled handler
+    reporting `DISPOSITION_STOPPED` is never retried;
+112. admission refuses a tenant whose coordination schema presents no `schema_identity` row,
+    names a different tenant, or carries a different `schema_uuid` than the registry expects —
+    tested against an empty schema, another tenant's schema, and a restored snapshot;
+113. a DSN change is refused unless the old schema is quiescent **and** the new one presents
+    the expected identity; neither check alone permits the cutover.
 
 ---
 

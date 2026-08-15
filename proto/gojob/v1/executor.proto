@@ -205,8 +205,16 @@ message RunRequest {
   // It bounds silence, not runtime — see timeout_seconds for the runtime cap.
   int32 silence_deadline_seconds = 8;
 
-  // Hard cap on total runtime in seconds, independent of the silence deadline. An execution
-  // that keeps reporting progress is still stopped here.
+  // Runtime budget REMAINING for this attempt, in seconds, counted from receipt.
+  //
+  // Not the job's configured cap: the scheduler's clock on that cap starts when the
+  // execution is claimed, and dispatch can take measurable time — an unknown-outcome
+  // re-send is bounded but not instant. Sending the full cap would give the executor a
+  // later deadline than the scheduler is enforcing, so the scheduler would fence an
+  // execution the executor still believed it was entitled to run, and a successor could
+  // overlap it. Sending what is left makes both sides agree by construction.
+  //
+  // A dispatch whose remaining budget has already elapsed is not sent at all.
   //
   // Enforced on both sides, because neither alone is sufficient: the executor abandons the
   // handler and reports failure with failure_kind "timeout"; the scheduler independently
@@ -214,7 +222,7 @@ message RunRequest {
   // execution with terminal_reason "timeout". A handler that ignores cancellation cannot be
   // stopped by anyone — the fence bounds the damage, and the residue is visible rather than
   // silently tolerated.
-  int32 timeout_seconds = 9;
+  int32 remaining_timeout_seconds = 9;
 
   JobParams params = 10;
 }
@@ -399,17 +407,17 @@ message ReportResultRequest {
 }
 
 message ExecutionOutcome {
-  // Deprecated in favour of `disposition`, which distinguishes stopping-because-asked from
-  // failing. Retained so a rolling executor upgrade is not a flag day: when `disposition` is
-  // DISPOSITION_UNSPECIFIED the scheduler falls back to this field.
-  bool success = 1;
-
-  // What actually happened. STOPPED is the one an earlier revision had no way to express:
-  // an executor could report only success or failure, so a handler that exited because it
-  // was cancelled had to lie in one direction or the other. Reporting it as failure would
-  // send a cancelled run back through retry and restart the very work an operator stopped;
-  // reporting it as success would claim work completed that did not.
-  Disposition disposition = 6;
+  // What actually happened. REQUIRED: DISPOSITION_UNSPECIFIED is rejected.
+  //
+  // There is deliberately no boolean success field to fall back to. An earlier revision kept
+  // one "so a rolling executor upgrade is not a flag day", which invented a compatibility
+  // problem for a contract that has never been released — and made a real one: a boolean
+  // cannot express STOPPED, so an executor that halted because it was cancelled would report
+  // failure, and the scheduler would retry the very work an operator stopped. Mapping every
+  // post-cancel failure to STOPPED is equally wrong, because a genuine failure racing the
+  // cancel would be recorded as a cancellation. The information cannot be reconstructed, so
+  // it must be sent.
+  Disposition disposition = 1;
 
   // One line an operator reads in history.
   string summary = 2;

@@ -25,6 +25,37 @@ exists. It holds no business data, no execution state and no job configuration; 
 scheduling lives entirely in its own schema, and the isolation property of section 0.2 is
 unaffected.
 
+### 0.0 Every coordination schema names itself
+
+A coordination schema carries one row saying what it is:
+
+```sql
+CREATE TABLE schema_identity (
+    lock_row       TINYINT      NOT NULL DEFAULT 1,   -- exactly one row
+    tenant         VARCHAR(64)  NOT NULL,
+    schema_uuid    CHAR(36)     NOT NULL,             -- assigned at provisioning, immutable
+    schema_version VARCHAR(16)  NOT NULL,
+    created_at     DATETIME     NOT NULL,
+    PRIMARY KEY (lock_row),
+    CHECK (lock_row = 1)
+);
+```
+
+Admission refuses a tenant whose schema does not name **that tenant** and the `schema_uuid`
+the registry expects. Without it the whole isolation guarantee rests on a DSN string being
+typed correctly, and three ordinary mistakes are undetectable:
+
+| Mistake | Without identity | With it |
+| --- | --- | --- |
+| DSN points at another tenant's schema | that tenant's jobs run under this tenant's name | refused: tenant mismatch |
+| DSN points at a fresh empty schema | the tenant's jobs silently vanish; nothing looks broken | refused: no identity row |
+| DSN points at a restored snapshot | old configuration and old executions replay | refused: `schema_uuid` mismatch |
+
+`tenant_registry` therefore stores the expected `schema_uuid`, and a DSN change must state
+the identity it expects to find. Re-pointing at a genuinely new schema is an explicit
+re-provision — new UUID, recorded, audited — rather than something that can happen by editing
+a connection string.
+
 ### 0.1 The tenant registry
 
 Sites are added over time, so the tenant list is **data, not deployment configuration**. A
@@ -36,6 +67,7 @@ CREATE TABLE tenant_registry (
     coordination_dsn VARBINARY(2048) NOT NULL,   -- encrypted
     enabled          TINYINT(1)      NOT NULL DEFAULT 1,
     generation       BIGINT          NOT NULL DEFAULT 1,  -- bumped by every enable/disable
+    schema_uuid      CHAR(36)        NOT NULL,             -- identity this DSN must present
     schema_version   VARCHAR(16)     NULL,       -- last version verified on this tenant
     admitted_at      DATETIME        NULL,
     last_error       VARCHAR(512)    NULL,
@@ -127,9 +159,15 @@ instances happen to be reachable. The acknowledgement table remains useful — i
 operator *why* a schema is not yet quiet, and which instance is still working — but it is a
 diagnostic, not the proof.
 
-A DSN change is therefore accepted when the old schema is quiescent by the scan above, and
-the self-fencing rule is what guarantees that state is reachable at all: without it a
-partitioned instance could renew forever and the scan would never come back zero.
+A DSN change is therefore accepted when **both** hold: the old schema is quiescent by the
+scan above, and the new DSN presents a `schema_identity` row naming this tenant with the
+`schema_uuid` the request states it expects. Quiescence proves nothing is still running in
+the schema being left; identity proves the schema being adopted is the intended one. Either
+alone permits a silent disaster — the first lets a correct-looking cutover land on the wrong
+database, the second lets a correct database be adopted while the old one is still working.
+
+The self-fencing rule is what makes quiescence reachable at all: without it a partitioned
+instance could renew forever and the scan would never return zero.
 
 Nothing here is a consensus protocol — a direct scan, plus a self-fencing rule with a
 shorter bound than the API's.
@@ -838,7 +876,11 @@ with its runs visible in the UI alongside real jobs.
 `schema/mysql` holds the DDL as embedded, versioned files. This library **never executes
 DDL**: the host applies it with whatever migration tool it already runs.
 
-`schema.Version` declares the version the running library requires. Admission compares it
+Admission verifies **identity before version**: the schema must present a `schema_identity`
+row naming the tenant being admitted, with the `schema_uuid` the registry expects. A schema
+that is merely the right *version* can still be the wrong *database*.
+
+`schema.Version` declares the version the running scheduler requires. Admission compares it
 with what the database carries and **fails closed on a mismatch** — no silent degradation,
 no partial feature set, no writing to a column that may not exist.
 
