@@ -46,8 +46,7 @@ that was never the problem. The conditions, in evaluation order, are those in
 
 ### Job detail
 
-- current configuration, with the values that came from code defaults distinguished from
-  values an operator has since edited;
+- current configuration, with `updated_by` and `version` for its last edit;
 - recent executions;
 - which live executors declare this handler;
 - the audit trail for this job.
@@ -94,7 +93,7 @@ Each is audited with actor, target and reason. Each requires the `OPERATOR` role
 
 | Action | Effect | Guard |
 | --- | --- | --- |
-| **Create** | a new job: handler, schedule, parameters, policy | `handler_key` chosen from what live executors declare |
+| **Create** | a new job: handler, group, schedule, parameters, policy | the UI *offers* the handlers live executors declare; an unknown one is a **warning**, not a rejection |
 | **Trigger** | a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one — and is selected ahead of it, so it cannot starve |
 | **Pause / resume** | sets `ops_paused` | takes the state-row lock, so it cannot race a claim into one extra run |
 | **Edit** | schedule, concurrency, retry budget, timeouts | optimistic `version` CAS; rejected if the row changed underneath |
@@ -163,8 +162,19 @@ GET    /metrics                                        Prometheus exposition
 ```
 
 `POST /jobs` is how jobs come into existence — there is no other way. The scheduler holds no
-handler code, so creating a job means selecting a `handler_key` from
-`GET /handlers` (what live executors declare), plus a schedule, parameters and policy.
+handler code, so creating a job means naming a `handler_key`, plus a schedule, parameters and
+policy.
+
+`GET /handlers` lists what live executors currently declare, and the UI offers it as a
+picker. **It is a convenience, not a constraint**: a handler whose executor happens to be
+down or not yet deployed must still be nameable, or a job could never be created before its
+executor ships. An unrecognised handler is accepted with a warning and the job shows as an
+orphan until an executor declares it.
+
+A job may also name a required executor **group**, which is what distinguishes two groups
+declaring the same handler — a partial rollout, or two configurations of one service. A job
+naming no group accepts any group declaring its handler.
+
 Attempt history at `GET /executions/{key}` is served from `job_execution_attempt`.
 
 Conventions:

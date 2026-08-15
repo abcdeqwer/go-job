@@ -162,13 +162,16 @@ The binary takes no job list and no tenant list.
 One audited row in the control database, through the UI or the API:
 
 ```text
-tenant   coordination_dsn                business_dsn
-np       …/np_scheduler                  …/np
-np2      …/np2                           (null: one schema for both)
+tenant   coordination_dsn
+np       …/np_scheduler
+np2      …/np2
 ```
 
-Schedulers pick it up within one poll — **no restart**. Adding another site later is the
-same one row. DSNs are encrypted at rest and never read back in plaintext.
+Schedulers pick it up within one poll — **no restart**. Adding another site later is the same
+one row. DSNs are encrypted at rest and never read back in plaintext.
+
+Only the scheduler's own coordination schema is named here. Executors reach their business
+databases with their own configuration; the scheduler never holds a business credential.
 
 ### Connect an executor
 

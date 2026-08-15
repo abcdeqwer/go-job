@@ -126,17 +126,36 @@ one by forgetting to read a field:
 
 | Code | Meaning | Scheduler does |
 | --- | --- | --- |
-| `ALREADY_EXISTS` | this `execution_key` is already held | nothing — a re-send after a timeout landed correctly |
+| `ALREADY_EXISTS` | this `(tenant, execution_key)` is already held — the error names the token held | **depends on the token**, see below |
 | `RESOURCE_EXHAUSTED` | at capacity | try the next instance |
 | `UNAVAILABLE` | shutting down | try the next instance |
 | `FAILED_PRECONDITION` | unknown `handler_key` | log, alert; routing is wrong |
 
 **`ALREADY_EXISTS` is the executor's half of at-most-once dispatch.** When a dispatch times
-out, the scheduler does not know whether it arrived, so it re-sends with the same
-`execution_key`. An executor that starts a second run instead of refusing turns one network
-hiccup into a duplicate run. Deduplication is on `execution_key` and must last as long as
-the executor holds the work; an in-memory set is sufficient, because a restarted executor
-has lost the work anyway and §5 covers that case.
+out, the scheduler does not know whether it arrived, so it re-sends. An executor that starts
+a second run instead of refusing turns one network hiccup into a duplicate run.
+
+Two things must be exact about it:
+
+**Deduplicate on `(tenant, execution_key)`, never on the key alone.** Keys are unique only
+within a tenant — two tenants legitimately hold the same job name and therefore the same
+deterministic key — so a multi-tenant executor deduplicating on the key would refuse tenant
+B's work because tenant A's is running, and would let a `Cancel` or `GetExecution` for one
+tenant reach the other's execution.
+
+**The refusal names the token held**, because "already held" is two different situations:
+
+| Held token | Meaning | Scheduler does |
+| --- | --- | --- |
+| same as the one just sent | a re-send of this attempt landed | treat as acceptance |
+| a **different** token | an older attempt the scheduler already fenced is still running there | **not** acceptance — this attempt never started. Leave it `ready`, and let the old attempt's own reconciliation resolve it |
+
+Without the token, the second case is indistinguishable from the first, and the scheduler
+would mark an attempt `running` that no handler ever started — then adopt the *old* attempt's
+progress and result as if they belonged to it.
+
+Deduplication must last as long as the executor holds the work. An in-memory map is
+sufficient: a restarted executor has lost the work anyway, and §5 covers that case.
 
 ---
 
@@ -174,8 +193,21 @@ Three bounds exist and are deliberately not merged:
 | Bound | Meaning | Typical |
 | --- | --- | --- |
 | `progress_interval_seconds` | how often the executor must speak | 30s |
-| `deadline` | silence tolerated before investigation | 3 × progress interval |
+| `silence_deadline_seconds` | silence tolerated before investigation | 3 × progress interval |
 | `timeout_seconds` | **hard cap on total runtime** | per job; 24h for a long one |
+
+The runtime cap is enforced **on both sides, because neither alone suffices**:
+
+- the **executor** abandons the handler at the cap and reports failure with
+  `failure_kind = "timeout"`;
+- the **scheduler** independently fences the attempt when the cap passes with no result,
+  sends `Cancel`, and resolves the execution with `terminal_reason = "timeout"`. It does not
+  wait for the executor to notice, because the case the cap exists for is a handler that has
+  stopped noticing anything.
+
+A handler that ignores cancellation cannot be stopped by either. The fence bounds what it
+can still affect in the scheduler, the job's slot is released, and the residue is reported
+rather than silently tolerated.
 
 A long job configures a long `timeout_seconds` and an ordinary progress interval. Raising the
 deadline to cover a job's whole runtime would convert "I notice a stuck job in 90 seconds"
@@ -376,7 +408,14 @@ It must cover, at minimum:
 - dispatch beyond `capacity` → `RESOURCE_EXHAUSTED`, not silent queueing;
 - `GetExecution` for an unheld key → `NOT_FOUND`, not `UNIMPLEMENTED` and not an error;
 - `Cancel` for an unheld key → `acknowledged=false`, not an error;
-- an unknown `handler_key` → `FAILED_PRECONDITION`.
+- an unknown `handler_key` → `FAILED_PRECONDITION`;
+- `Run` for the same `execution_key` in **two different tenants** → both accepted and run
+  independently; deduplication is per `(tenant, execution_key)`;
+- `Run` for a held `execution_key` with a **different** `run_token` → `ALREADY_EXISTS`
+  naming the token actually held;
+- a handler exceeding `timeout_seconds` → the executor abandons it and reports
+  `failure_kind = "timeout"` rather than running on;
+- `Cancel` and `GetExecution` for a key held under another tenant → `NOT_FOUND`.
 
 Passing the suite is what makes something a conforming executor. "We read the document" is
 not.

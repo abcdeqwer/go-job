@@ -34,7 +34,6 @@ new site is a row, and schedulers pick it up without a restart.
 CREATE TABLE tenant_registry (
     tenant           VARCHAR(64)     NOT NULL,
     coordination_dsn VARBINARY(2048) NOT NULL,   -- encrypted
-    business_dsn     VARBINARY(2048) NULL,       -- encrypted; NULL = same as coordination
     enabled          TINYINT(1)      NOT NULL DEFAULT 1,
     schema_version   VARCHAR(16)     NULL,       -- last version verified on this tenant
     admitted_at      DATETIME        NULL,
@@ -59,8 +58,19 @@ Schedulers poll `tenant_registry` on a short interval:
 | Change | Effect |
 | --- | --- |
 | a new `enabled` row appears | open a pool, verify the schema version, admit, start loops |
+| a new `enabled` row appears | open a pool, verify the schema version, admit, start loops |
 | a row is disabled | stop claiming, drain, release the pool |
-| a DSN changes | drain, then re-admit under the new DSN |
+
+**Re-pointing a DSN is not a hot change.** Changing `coordination_dsn` on an enabled tenant
+is rejected. The reason is a split brain that no amount of draining fixes: schedulers poll
+the registry independently, so instance A can adopt the new DSN while instance B is still
+working the old schema — two `job_state` rows for one tenant, in two databases, each
+correctly excluding only itself, dispatching the same job twice.
+
+Re-pointing is therefore two audited steps: **disable, wait for the drain to complete, then
+change the DSN and re-enable.** The drain is what guarantees no scheduler is working the old
+schema when the new one appears, and making it explicit means an operator cannot skip it by
+accident.
 
 **Draining is bounded.** "Let in-flight work finish" is not a terminating condition: an
 execution can hang, and a scheduler that waits for it forever means a disable or a DSN change
@@ -152,84 +162,36 @@ there, so two implementations cannot invent different limits:
 
 ### 0.5 Where the per-tenant tables live
 
-The library requires **a** MySQL schema per tenant for its coordination tables. Whether
-that is the tenant's business schema or a dedicated one is chosen **by the adopter, in
-configuration** — it is not a build-time option and there is no code path in this library
-that differs between the two.
+The scheduler needs **one** MySQL schema per tenant, for the coordination tables in this
+document. Whether that schema also holds business data is not its concern and it has no way
+to tell: it stores one DSN per tenant and uses it.
 
-Each tenant carries up to two DSNs in its `tenant_registry` row. `coordination_dsn` is
-required and is where the tables in this document live. `business_dsn` is optional and
-defaults to the coordination DSN; it is what a dispatched execution's handler works against.
+An earlier revision carried a second `business_dsn` "for handlers". That was a leftover of
+the embedded-library design and is removed. In this architecture the scheduler holds no
+handler code, `RunRequest` carries no DSN, and parameters must contain no secrets — so a
+business DSN in the scheduler's control database would have no consumer, while adding a
+production credential to a table that nothing reads. **Executors reach their own databases
+with their own configuration.**
 
-Adding a site with a dedicated coordination schema, and one that shares, differ only in
-whether the second DSN is set:
-
-```text
-tenant  coordination_dsn        business_dsn
-np      …/np_scheduler          …/np            -- dedicated
-np2     …/np2                   NULL            -- shared
-```
-
-That is the entire selection mechanism, and it exists in exactly one place.
-
-### The difference is operational, not behavioural
-
-In this version the two topologies are **identical in correctness**. Nothing about
-ownership, durability or recovery changes, and no guarantee is stronger in one than the
-other.
-
-What differs is operations:
+Adopters may still put the coordination tables in a business schema or a dedicated one. That
+choice is invisible to the scheduler and purely operational:
 
 | | Dedicated coordination schema | Shared with business |
 | --- | --- | --- |
-| Backup, tuning, access control | independent of business data | coupled |
+| Backup, tuning, access control | independent | coupled |
 | Blast radius of scheduler churn | isolated | scheduler write load sits in the business schema |
-| Locks held inside the business database | none | the state row lives there |
 | Schemas to provision and migrate | one more per tenant | none extra |
-| Connection budget | two pools per tenant | one |
 
-**Dedicated is the better default.** Shared is a reasonable simplification for small
-installations that would rather manage one schema.
+**Dedicated is the better default.** Shared is a reasonable simplification for a small
+installation that would rather manage one schema.
 
-### Why there is no atomicity argument here
+### How executors are discovered
 
-A tempting claim is that sharing a schema lets a handler commit its own progress in the
-**same transaction** as the scheduler's completion write, making checkpoint patterns
-airtight. That would be a real advantage — but it is not one this library provides, because
-it exposes no API through which a handler can join the completion transaction. A handler
-always opens its own transaction on `ctx.DB()`, and whether the coordination tables happen
-to live in the same schema is irrelevant to it.
-
-Such an API is deliberately absent rather than merely unbuilt:
-
-- it would bind handler code to the scheduler's transaction lifecycle;
-- it would work in only one topology, so code written against it breaks the day someone
-  moves the coordination schema — a trap that fires long after the decision that set it;
-- it closes exactly one of several crash points. A handler still has to survive crashing
-  before its own write, or after the completion write and before the next run observes it,
-  so idempotency is required regardless and the API buys less than it appears to.
-
-If a future version offers it, it will be an opt-in capability that fails loudly when the
-topology cannot support it — not a silent difference in guarantees between two
-configurations.
-
-### What is not offered
-
-One shared coordination schema for all tenants, with a `tenant_id` column. That trades the
-isolation property this whole design rests on for a saving in schema count, and it puts
-every coordination query one forgotten predicate away from crossing a tenant boundary.
-
-### How this affects discovery
-
-There is no discovery protocol, and this is the point: workers do not broadcast, do not
-register with a service registry, and do not expose an endpoint for a controller to call.
-An executor configured with a scheduler endpoint **is** discovered, because it registers
-itself into `job_executor` in that tenant's schema and the admin UI reads the same table.
-
-Registration therefore requires no shared business database, no network path from the
-control plane to workers, and no configuration listing which workers exist. Two processes
-that can reach the same coordination schema can coordinate; two that cannot, cannot. That
-is the whole model.
+There is no discovery protocol: executors do not broadcast, do not appear in a service
+registry, and are not listed in any configuration. An executor **registers itself** at a
+scheduler endpoint it is configured with, and the scheduler records it in that tenant's
+`job_executor` table (§5). Two processes that can reach each other and authenticate can
+work together; two that cannot, cannot. That is the whole model.
 
 ---
 
@@ -256,6 +218,7 @@ that produced the current `next_fire_at`. When it falls behind, the schedule is 
 CREATE TABLE job_definition (
     job_name           VARCHAR(128) NOT NULL,
     handler_key        VARCHAR(128) NOT NULL,
+    executor_group     VARCHAR(64)  NULL,      -- NULL = any group declaring the handler
     schedule_kind      VARCHAR(16)  NOT NULL,  -- CRON | FIXED_DELAY
     schedule_expr      VARCHAR(128) NOT NULL,  -- cron expression, or delay in ms
     enabled            TINYINT(1)   NOT NULL DEFAULT 1,
@@ -305,12 +268,23 @@ down — but the job is flagged as an orphan until one appears.
 | --- | --- | --- |
 | meaning | temporarily off | permanently done with |
 | new executions materialized | no | no |
-| existing non-terminal executions | left alone | **cancelled**, audited, with `terminal_reason = 'retired'` |
+| existing non-terminal executions | left alone | **`cancel_requested`**, audited — see below |
 | row and history | kept | kept |
 
 Retiring resolves outstanding work rather than stranding it. Without that rule a delayed
 retry sits `ready` forever against a job nothing will ever claim, while retention refuses to
 delete non-terminal rows — an unbounded table by construction.
+
+But it **requests** the stop; it does not declare the outcome. A `ready` execution goes
+straight to `cancelled` because nothing is running. A *running* one becomes
+`cancel_requested` and resolves through the ordinary path (`protocol.md` §8): if its handler
+was already finishing successfully, the result still wins and the row records `success`.
+Retirement that forced every row to `cancelled` would write "cancelled by retirement" over a
+run that had in fact completed — and for a job that moves money, a history that says the
+opposite of what happened is worse than no history.
+
+Termination is therefore bounded by the same lease and `timeout_seconds` machinery as any
+other cancellation, not by retirement inventing its own.
 
 ---
 
@@ -444,8 +418,15 @@ Deterministic and whole-second:
 
 ```text
 cron:nightly-rollup:2026-08-15T01:30:00
-manual:01J9Z6QWERTY
+poll:sync-orders:01J9Z6QWERTY
+manual:01J9Z6QWERTZ
 ```
+
+A cron key is derived from the fire instant, which is what makes duplicate materialization a
+unique-key violation rather than a second run. Manual and poll keys carry a fresh
+monotonic identifier instead: neither has a fire instant to be derived from, and a
+timestamp-derived poll key would collide with a retained pass after a business-clock shift,
+while a reusable per-job key would make every pass after the first a duplicate.
 
 The unique index is what makes concurrent materialization safe: two schedulers that both
 decide a fire instant is due produce one row and one error, never two runs.
@@ -468,6 +449,22 @@ without a filesort.
 | `cancelled` | terminal |
 | `skipped` | terminal; `FORBID` contention |
 
+### Empty fixed-delay passes are retained briefly, then swept
+
+A pass reporting `did_work = false` is marked terminal like any other execution and left in
+place; retention removes it after a short window (default 15 minutes), not the terminal
+transaction.
+
+Deleting it immediately would break result idempotency: the executor is required to redeliver
+a result whose response was lost, and a scheduler with no row and no tombstone could only
+answer `NOT_FOUND` for a result it had in fact accepted moments earlier. Since `NOT_FOUND`
+tells an executor to discard, that is survivable — but it also teaches executor authors that
+the terminal codes are unreliable, which is exactly the lesson that makes `ABORTED` get
+ignored somewhere it matters.
+
+A window slightly longer than the executor's result-retry budget costs a few minutes of rows
+and keeps every terminal answer truthful.
+
 ### `terminal_reason`
 
 `status` says where an execution ended; `terminal_reason` says how it got there, and the two
@@ -485,6 +482,16 @@ A stored `1`/`0`, set at creation, ordered ahead of `available_at` in the claim 
 operator's manual run is selected before scheduled work of the same job. Exclusion alone
 gives no fairness: a fast poller becomes due again the moment it releases the lock, and
 without this column it can win indefinitely while a manual trigger waits.
+
+### An operator retry grants budget; it does not reset the counter
+
+`attempt_no` is monotonic for the life of an execution, because it is half the primary key of
+`job_execution_attempt`. Resetting it on an authorized retry would make the next attempt
+number 1 again and collide with history already written.
+
+So a retry of a `dead` execution **raises `max_attempts`** by the configured grant and
+returns the row to `ready`. Attempt numbers keep climbing, history stays append-only, and the
+audit records who granted the extra budget and why.
 
 ### Two budgets
 

@@ -130,7 +130,14 @@ Each was argued and settled; a reviewer should treat re-opening one as needing n
 | 9 | Fixed-delay = one dispatched pass at a time, `next_poll_at` from the **result** | delay measured from completion; also removes the manual-trigger starvation an executor-side loop lease would create |
 | 10 | Empty passes (`did_work=false`) leave no execution row | a three-second poller would otherwise write 28,800 rows a day per tenant |
 | 11 | Claims never steal an expired lease; recovery is the only reclaim path | two reclaim paths can disagree and strand a `running` row forever |
-| 12 | `attempt_no` incremented at claim only | recovery incrementing it too exhausts a budget of three in two real starts |
+| 12 | `attempt_no` incremented **on dispatch acceptance** only — not at claim, not by recovery | it counts handler starts; a refused or unanswered dispatch started nothing, and incrementing in two places exhausts a budget of three in two real starts |
+| 12a | `dispatched_to` is written in the claim transaction, before the `Run` call | recording the intended target only after the reply loses work when the scheduler dies between send and record |
+| 12b | Executors deduplicate on `(tenant, execution_key)`, and `ALREADY_EXISTS` names the token held | keys are unique only within a tenant, and "already held" by *my* attempt and by a *fenced older* attempt need opposite responses |
+| 12c | The reconciling `GetExecution` happens outside any transaction, with a deadline | an RPC under two row locks can pin a job indefinitely against a wedged executor |
+| 12d | Manual and scheduled work each get a bounded share of each candidate pass | a single priority ordering swaps manual starvation for scheduled starvation |
+| 12e | Re-pointing a tenant DSN requires disable → drain → change → enable | schedulers poll the registry independently, so a hot re-point splits one tenant across two schemas, each excluding only itself |
+| 12f | An operator retry raises `max_attempts`; it never resets `attempt_no` | attempt numbers are half the primary key of the attempt history |
+| 12g | No `business_dsn` in the control database | the scheduler holds no handler code and dispatches no DSN, so it would be a production credential with no consumer |
 | 13 | Cancellation is two-step (`cancel_requested` → `cancelled`) | cancelling a context is cooperative; releasing the slot early permits overlap |
 | 14 | Tenant list is a control-database registry, hot-added | sites are added over time; a redeploy per site is the wrong cost |
 | 15 | Admission is per tenant, not all-or-nothing | with hot add, one bad new tenant must not stop a scheduler serving twenty good ones |

@@ -81,9 +81,10 @@ static analysis for everything else.
     An assertion that merely proves the manual run does not overlap the poll would pass
     against a design in which it never runs at all. That is the specific defect this test
     exists to catch;
-25. a pass reporting `did_work=false` leaves no execution row and is visible only in
-    metrics; one reporting `did_work=true` persists a row; a **failed** pass persists a row
-    regardless of `did_work`;
+25. a pass reporting `did_work=false` is retained briefly and then swept, so a redelivered
+    result can still be answered `already_recorded=true`; one reporting `did_work=true`
+    persists for the ordinary retention window; a **failed** pass persists regardless of
+    `did_work`;
 26. an executor that dies mid-pass leaves an expired execution that recovery reconciles and
     resolves, after which the next pass can be dispatched;
 27. pausing a job stops further passes being dispatched, and the in-flight one is allowed to
@@ -181,9 +182,11 @@ are breaking:
     correctly, and no second executor starts before recovery completes;
 54. database connection loss during a handler: ownership is lost cleanly, the fence prevents
     further writes, and the execution is later recovered;
-55. a handler that ignores context cancellation and runs past its lease: its writes are
-    rejected by the fence, and the fact that it cannot be stopped is visible rather than
-    silently tolerated;
+55. a handler that ignores context cancellation and runs past its lease: its **scheduler-state
+    writes** — progress, result, lock release — are all rejected by the fence, and the fact
+    that it cannot be stopped is reported rather than silently tolerated. Its business writes
+    are explicitly **not** covered: nothing in this system sits between a handler and its own
+    database, and a test asserting otherwise could never pass;
 56. clock skew between hosts does not affect ownership, because ownership never reads a host
     clock;
 57. a slow database making heartbeats late: ownership loss is detected and the handler
@@ -257,15 +260,38 @@ cannot regress silently.
     sustained polling — mutual exclusion is not fairness;
 78. heartbeat renews both rows in one transaction in the canonical order, and sustained
     heartbeat/completion contention produces no deadlock;
-79. retiring a job cancels its outstanding executions with `terminal_reason = 'retired'` and
-    leaves no non-terminal row behind;
-80. disabling a tenant or changing its DSN completes within `drain_timeout`, fencing whatever
-    is still outstanding rather than waiting indefinitely;
+79. retiring a job stops new materialization, moves `ready` executions to `cancelled` and
+    running ones to `cancel_requested`; a running handler that succeeds anyway is recorded as
+    `success`, not overwritten as cancelled; every row reaches a terminal state within the
+    job's own lease and timeout bounds, with no extra mechanism;
+80. disabling a tenant completes within `drain_timeout`, fencing whatever is still
+    outstanding rather than waiting indefinitely; **changing `coordination_dsn` on an enabled
+    tenant is rejected**, so no interval exists in which two schedulers work one tenant across
+    two schemas;
 81. the cron cases of `scheduling.md` §1 — day-of-month/day-of-week OR semantics, rejected
     `L`/`W`/`#`, rejected impossible dates, spring-forward and fall-back — each produce the
     single documented answer;
 82. every validation bound in `data-model.md` §0.4 is rejected at the API, not discovered
-    later.
+    later;
+83. `Cancel` and `GetExecution` are tenant-scoped: a key held for tenant A is invisible to a
+    request naming tenant B;
+84. a `Run` refused with `ALREADY_EXISTS` naming a **different** token does not mark the new
+    attempt `running`, and the scheduler never adopts the older attempt's progress or result
+    as the new attempt's;
+85. a scheduler killed between sending `Run` and recording acceptance does not cause a second
+    dispatch: `dispatched_to` was written before the send, so recovery reconciles;
+86. `timeout_seconds` is enforced by the executor **and** independently by the scheduler; a
+    handler that ignores cancellation still yields a terminal execution with
+    `terminal_reason = 'timeout'` and a released slot;
+87. an operator retry of a `dead` execution raises `max_attempts` and continues the attempt
+    numbering; the attempt-history insert never collides;
+88. a manual trigger is never `skipped` by `FORBID`; it queues and eventually runs;
+89. sustained manual load does not prevent cron and poll executions from being discovered,
+    and sustained poll load does not prevent manual ones — each class has a bounded share;
+90. a job naming a required `executor_group` is dispatched only to that group, even when
+    another group declares the same `handler_key`;
+91. recovery holds no database lock while calling `GetExecution`, and a wedged executor that
+    never answers does not block completion, cancellation or another recovery for that job.
 
 ---
 

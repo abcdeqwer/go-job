@@ -40,8 +40,12 @@ service JobExecutor {
   // JobScheduler.ReportResult.
   //
   // Errors carry meaning and are part of the contract:
-  //   ALREADY_EXISTS      this execution_key is already held; the scheduler is re-sending
-  //                       after a timeout and must not be given a second run
+  //   ALREADY_EXISTS      this (tenant, execution_key) is already held. The error's
+  //                       ExecutionHeld detail carries the run_token actually held, because
+  //                       "already held" is two different situations: a re-send of the SAME
+  //                       attempt after a timeout (adopt it), or a NEW attempt colliding
+  //                       with an older one the scheduler already fenced (do not adopt —
+  //                       the old handler is still running and this attempt never started)
   //   RESOURCE_EXHAUSTED  at capacity; the scheduler will try another instance
   //   UNAVAILABLE         shutting down; the scheduler will try another instance
   //   FAILED_PRECONDITION unknown handler_key
@@ -173,8 +177,9 @@ enum Capability {
 }
 
 message RunRequest {
-  // Durable identity of one logical run. THIS IS THE IDEMPOTENCY KEY: an executor that
-  // already holds it must answer ALREADY_EXISTS rather than starting a second run.
+  // Durable identity of one logical run, unique WITHIN A TENANT. The executor's
+  // deduplication key is therefore (tenant, execution_key) — never execution_key alone,
+  // which would let one multi-tenant executor conflate two tenants' work.
   string execution_key = 1;
 
   // Identity of this attempt. Presented back with every progress and result call, and
@@ -200,8 +205,15 @@ message RunRequest {
   // It bounds silence, not runtime — see timeout_seconds for the runtime cap.
   int32 silence_deadline_seconds = 8;
 
-  // Hard cap on total runtime in seconds, independent of the deadline. An execution that
-  // keeps reporting progress is still stopped here.
+  // Hard cap on total runtime in seconds, independent of the silence deadline. An execution
+  // that keeps reporting progress is still stopped here.
+  //
+  // Enforced on both sides, because neither alone is sufficient: the executor abandons the
+  // handler and reports failure with failure_kind "timeout"; the scheduler independently
+  // fences the attempt when the cap passes without a result, sends Cancel, and resolves the
+  // execution with terminal_reason "timeout". A handler that ignores cancellation cannot be
+  // stopped by anyone — the fence bounds the damage, and the residue is visible rather than
+  // silently tolerated.
   int32 timeout_seconds = 9;
 
   JobParams params = 10;
@@ -211,12 +223,22 @@ message RunResponse {
   // Echoed for correlation in logs. Acceptance is signalled by an OK status, not a field:
   // a refusal is an error code, so no caller can ignore it by forgetting to read a bool.
   string execution_key = 1;
+
+  // The token the executor is now running. Equal to RunRequest.run_token on a fresh accept.
+  string run_token = 2;
+}
+
+// Detail attached to an ALREADY_EXISTS error from Run, and to GetExecutionResponse.
+// It answers "held by which attempt?", which the key alone cannot.
+message ExecutionHeld {
+  string held_run_token = 1;
 }
 
 message CancelRequest {
-  string execution_key = 1;
-  string run_token = 2;
-  string reason = 3;
+  string tenant = 1;
+  string execution_key = 2;
+  string run_token = 3;
+  string reason = 4;
 }
 
 message CancelResponse {
@@ -230,11 +252,16 @@ message CancelResponse {
 }
 
 message GetExecutionRequest {
-  string execution_key = 1;
+  string tenant = 1;
+  string execution_key = 2;
 }
 
 message GetExecutionResponse {
   ExecutionState state = 1;
+
+  // Which attempt the executor is reporting on. A scheduler that asked about token T2 and
+  // is told about T1 must not adopt the answer: it describes a different attempt.
+  string run_token = 6;
 
   // Set when state is EXECUTION_STATE_FINISHED.
   ExecutionOutcome outcome = 2;
@@ -262,6 +289,10 @@ message RegisterRequest {
   string executor_id = 1;
 
   // Logical executor that jobs route to. Instances share a group.
+  //
+  // A job may name a required group, which is how two groups declaring the same handler_key
+  // — a partial rollout, or two configurations of one service — stay distinguishable. A job
+  // that names none accepts any group declaring its handler.
   string group = 2;
 
   // The tenant this registration is for.

@@ -66,23 +66,31 @@ job.
 Because the state row must be locked first, **candidate discovery is a non-locking read**
 whose result the claim transaction re-verifies:
 
+Two bounded queries per pass, not one ordered query:
+
 ```sql
-SELECT id, job_name
-FROM job_execution
-WHERE status = 'ready'
-  AND available_at <= ?          -- business time, supplied by the scheduler
-ORDER BY manual_first DESC, available_at, id
-LIMIT ?;
+-- manual work
+SELECT id, job_name FROM job_execution
+WHERE status = 'ready' AND manual_first = 1 AND available_at <= ?
+ORDER BY available_at, id LIMIT ?;
+
+-- scheduled work
+SELECT id, job_name FROM job_execution
+WHERE status = 'ready' AND manual_first = 0 AND available_at <= ?
+ORDER BY available_at, id LIMIT ?;
 ```
 
-`manual_first` is a stored column set at creation — `1` for `trigger_type = 'manual'`, `0`
-otherwise — so operator-initiated work is selected ahead of scheduled work of the same job.
+`manual_first` is stored at creation — `1` for `trigger_type = 'manual'`, `0` otherwise.
 
-Without it, exclusion alone does not give **fairness**: a fast poller releases the job lock
-and immediately becomes due again, and nothing stops it winning the next claim
-indefinitely while an operator's manual run waits. Mutual exclusion is not liveness, and a
-trigger button that works only when the queue happens to be quiet is not a working trigger
-button.
+Two queries rather than `ORDER BY manual_first DESC` because a single ordered query with a
+`LIMIT` **swaps one starvation for another**: if enough manual executions stay ready, every
+bounded candidate page returns only manual rows and cron work is never discovered at all,
+however old it gets. Each class getting its own bounded share starves neither.
+
+The reason manual work needs a share at all is that exclusion alone does not give fairness:
+a fast poller releases the job lock and is immediately due again, and nothing stops it
+winning the next claim indefinitely while an operator's manual run waits. A trigger button
+that works only when the queue happens to be quiet is not a working trigger button.
 
 ---
 
@@ -119,6 +127,7 @@ WHERE job_name   = ?
 UPDATE job_execution
 SET status         = 'dispatching',
     owner_instance = ?,
+    dispatched_to  = ?,        -- chosen BEFORE the send; see below
     run_token      = ?,
     fence_epoch    = ?,
     lease_until    = TIMESTAMPADD(SECOND, ?, NOW()),
@@ -153,7 +162,6 @@ So dispatch has two outcomes, each a short fenced transaction:
 -- acceptance
 UPDATE job_execution
 SET status        = 'running',
-    dispatched_to = ?,
     attempt_no    = attempt_no + 1,
     started_at    = COALESCE(started_at, ?),
     deadline_at   = TIMESTAMPADD(SECOND, ?, NOW()),
@@ -162,15 +170,30 @@ WHERE id = ? AND status = 'dispatching'
   AND run_token = ? AND fence_epoch = ?;
 ```
 
-`dispatched_to` is written on acceptance, before any result can arrive, so a takeover always
-knows which executor to reconcile with (section 10).
+**`dispatched_to` is written in the claim transaction, before the `Run` call is made** — not
+on acceptance. The target is known as soon as the executor is selected, and writing it only
+after the reply creates a window that loses work: the executor accepts, the scheduler dies
+before recording where it sent it, and recovery finds `dispatched_to` unset, concludes the
+dispatch never landed, and dispatches the same work elsewhere while the first executor runs.
+
+Recording the intended target before an irreversible send is the general rule: the network
+call is the point of no return, so everything needed to reason about it afterwards must
+already be durable.
 
 A `dispatching` row whose lease expires is recovered exactly like a `running` one, and for
 the same reason: the scheduler that was mid-dispatch may have died after the executor
 accepted.
 
-`attempt_no` is incremented on acceptance and nowhere else. Recovery never touches it
-(section 7).
+`attempt_no` is incremented **on acceptance** and nowhere else — not at claim, not by
+recovery. It counts handler starts, and a dispatch that was refused, or never answered, did
+not start one.
+
+One consequence is worth stating rather than discovering: if an executor accepts and the
+acceptance reply is lost, `attempt_no` has not yet been incremented. The re-send resolves it
+— the executor answers `ALREADY_EXISTS` naming the same token, which is an acceptance and
+increments then. If the executor instead restarts and answers `NOT_FOUND`, the attempt is
+unknown and is charged as a recovery rather than an attempt, which is the honest accounting:
+nobody can say whether the handler ran.
 
 ---
 
@@ -201,6 +224,9 @@ Two, and no more in the first delivery:
 - **`QUEUE`** — leave the execution `ready` and push `available_at` forward by a bounded
   contention backoff, so a blocked claim does not spin against a busy job. Default.
 - **`FORBID`** — mark this occurrence `skipped`, recording which execution holds the job.
+  **It never applies to a manual trigger.** `FORBID` exists to stop a schedule piling up on
+  itself; applying it to an operator's explicit request would silently discard the request,
+  which is the opposite of what pressing the button means. A manual execution always queues.
 
 A policy is evaluated **only after** the state-row `SELECT ... FOR UPDATE` has proved the
 row exists and is genuinely held. Any other zero-row outcome — a missing state row, a
@@ -304,8 +330,9 @@ cannot mark itself successful, cannot release the job lock, cannot record a retr
 one of those statements carries a stale token or epoch and affects zero rows. The new owner
 cannot be corrupted by the old one.
 
-The fence does **not** protect the handler's own **business writes**. Nothing in this
-library sits between a handler and its database. If a handler keeps writing after losing
+The fence does **not** protect the handler's own **business writes**. Nothing in this system
+sits between a handler and its database — and no verification case may claim otherwise, since
+no mechanism here could satisfy it. If a handler keeps writing after losing
 ownership, those writes land.
 
 That is the boundary this design draws, and it is why `Fence()` exists and why business
@@ -399,17 +426,35 @@ nothing about the *executor*, which may be running the work perfectly well. An e
 revision had recovery move `running` straight to `ready`, which would start a second
 executor while the first was still writing.
 
-So, in one transaction following the canonical order:
+**The reconciling call happens outside any transaction.** An RPC to a process that may be
+wedged must never be made while holding a row lock: a connection that stays open and never
+answers would pin `job_state` and `job_execution` indefinitely, blocking completion,
+cancellation and every other recovery for that job. The call therefore carries an explicit
+deadline (default 5s), and "unreachable" means that deadline elapsed or the call failed —
+a defined outcome, not a vague one.
+
+Recovery is three phases:
+
+**Phase 1 — read, no locks.** Find the expired row and note `dispatched_to`, `run_token`,
+`fence_epoch`.
+
+**Phase 2 — reconcile, no locks, bounded.** If `dispatched_to` is set, call `GetExecution`
+with its deadline. If the executor answers about a **different** `run_token` than the one
+being recovered, discard the answer: it describes another attempt.
+
+**Phase 3 — one short transaction, canonical order**, applying the decision under guards
+that re-verify everything phase 1 read; if any guard fails, another instance got there first
+and this recovery simply abandons:
 
 1. lock `job_state`, then the execution row;
-2. verify the old token, fence epoch and expired lease;
-3. if `dispatched_to` is set, **call `GetExecution` on that executor** and act on the answer:
+2. verify the old token, fence epoch and expired lease still hold;
+3. apply the phase-2 answer:
 
    | Executor says | Action |
    | --- | --- |
    | `RUNNING` | **adopt**: take the lease with a new `fence_epoch` and the **same** `run_token`, and resume tracking. The work was never interrupted, and rotating the token would fence a healthy run |
    | `FINISHED` | adopt the reported outcome and complete the execution normally |
-   | `NOT_FOUND`, or unreachable | the attempt is **unknown**; continue to step 4 |
+   | `NOT_FOUND`, unreachable, or a different token | the attempt is **unknown**; continue to step 4 |
 
 4. release the state row guarded by the old ownership, clearing `active_kind`;
 5. increment `fence_epoch` and `recovery_count`;
