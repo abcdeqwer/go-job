@@ -37,24 +37,31 @@ type DueJob struct {
 // one scan interval, because the state row still says the job is due; the in-process timer
 // heap only reduces latency.
 func (s *Store) DueCron(ctx context.Context, limit int) ([]DueJob, error) {
-	return s.due(ctx, "next_fire_at", limit)
+	return s.due(ctx, `
+		SELECT job_name, next_fire_at FROM job_state
+		WHERE next_fire_at IS NOT NULL AND next_fire_at <= ? AND ops_paused = 0
+		ORDER BY next_fire_at LIMIT ?`, limit)
 }
 
 // DuePoll finds fixed-delay jobs whose delay has elapsed. next_poll_at is NULL while a pass
 // is outstanding, which is what reserves the loop, so a NULL row is simply not due.
 func (s *Store) DuePoll(ctx context.Context, limit int) ([]DueJob, error) {
-	return s.due(ctx, "next_poll_at", limit)
+	return s.due(ctx, `
+		SELECT job_name, next_poll_at FROM job_state
+		WHERE next_poll_at IS NOT NULL AND next_poll_at <= ? AND ops_paused = 0
+		ORDER BY next_poll_at LIMIT ?`, limit)
 }
 
-func (s *Store) due(ctx context.Context, column string, limit int) ([]DueJob, error) {
-	// The column is one of two package constants, never caller input.
-	q := fmt.Sprintf(`SELECT job_name, %s FROM job_state
-	                  WHERE %s IS NOT NULL AND %s <= ? AND ops_paused = 0
-	                  ORDER BY %s LIMIT ?`, column, column, column, column)
-
-	rows, err := s.db.QueryContext(ctx, q, s.clock.Now(), limit)
+// due runs one of the two scans above.
+//
+// The two queries are written out rather than generated from a column name. A statement
+// assembled with fmt.Sprintf reaches this package's static checks with `%s` where its columns
+// should be, so the check that business columns are never compared against NOW() would inspect
+// `%s <= ?` and conclude nothing — the same blind spot as concatenation, one level quieter.
+func (s *Store) due(ctx context.Context, query string, limit int) ([]DueJob, error) {
+	rows, err := s.db.QueryContext(ctx, query, s.clock.Now(), limit)
 	if err != nil {
-		return nil, fmt.Errorf("scan due (%s): %w", column, err)
+		return nil, fmt.Errorf("scan due jobs: %w", err)
 	}
 	defer rows.Close()
 
@@ -62,7 +69,7 @@ func (s *Store) due(ctx context.Context, column string, limit int) ([]DueJob, er
 	for rows.Next() {
 		var d DueJob
 		if err := rows.Scan(&d.JobName, &d.DueAt); err != nil {
-			return nil, fmt.Errorf("scan due row (%s): %w", column, err)
+			return nil, fmt.Errorf("scan due row: %w", err)
 		}
 		out = append(out, d)
 	}
@@ -140,7 +147,7 @@ func (s *Store) MaterializeCron(ctx context.Context, jobName string, sched Sched
 			// and the config-drift scan recomputes next_fire_at from the current schedule —
 			// which is also what stops a re-enabled job replaying its dormant instants.
 			out.Outcome = MaterializedSkipped
-			return clearFireClock(ctx, tx, jobName, now)
+			return clearFireClock(ctx, tx, jobName, def.Version, now)
 		}
 
 		// While a manual execution for this job is `ready`, materialization is suspended.
@@ -258,6 +265,15 @@ func (s *Store) MaterializePoll(ctx context.Context, jobName, executionKey strin
 		}
 		now := s.clock.Now()
 
+		// The state row is locked, so a NULL here means a pass this scan cannot see is already
+		// outstanding — the row was materialized between the non-locking due scan and now.
+		// Checked FIRST, because every branch below writes next_poll_at and the guarded write
+		// would assert against a row that legitimately has nothing left to clear.
+		if !st.NextPollAt.Valid {
+			out.Outcome = MaterializedSuspended
+			return nil
+		}
+
 		if !def.Enabled || def.Retired {
 			out.Outcome = MaterializedSkipped
 			return clearPollClock(ctx, tx, jobName, now)
@@ -268,13 +284,6 @@ func (s *Store) MaterializePoll(ctx context.Context, jobName, executionKey strin
 			return err
 		}
 		if suspended {
-			out.Outcome = MaterializedSuspended
-			return nil
-		}
-
-		// The state row is locked, so a NULL here means a pass this scan cannot see is already
-		// outstanding — the row was materialized between the non-locking due scan and now.
-		if !st.NextPollAt.Valid {
 			out.Outcome = MaterializedSuspended
 			return nil
 		}
@@ -325,7 +334,7 @@ func (s *Store) Recompute(ctx context.Context, jobName string, sched Schedule) (
 		now := s.clock.Now()
 
 		if def.ScheduleKind != gojob.ScheduleCron || !def.Enabled || def.Retired {
-			return clearFireClock(ctx, tx, jobName, now)
+			return clearFireClock(ctx, tx, jobName, def.Version, now)
 		}
 		next, err = sched.Next(now)
 		if err != nil {
@@ -379,13 +388,20 @@ func advanceFireClock(ctx context.Context, tx *sql.Tx, jobName string, next time
 	return assertOne(res, "materialize: advance fire clock")
 }
 
-func clearFireClock(ctx context.Context, tx *sql.Tx, jobName string, now time.Time) error {
+// clearFireClock parks a job that must not fire — disabled, retired, or not a cron job at all.
+//
+// It advances config_version along with the clock. Without that the drift scan, which selects
+// rows where config_version <> the definition's version, would return this job on every pass
+// forever: recomputation would park it again, leave the version behind again, and the scan
+// would find it again. A cheap query run in a tight loop is still a loop.
+func clearFireClock(ctx context.Context, tx *sql.Tx, jobName string, version int64, now time.Time) error {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE job_state
-		SET write_seq    = write_seq + 1,
-		    next_fire_at = NULL,
-		    updated_at   = ?
-		WHERE job_name = ?`, now, jobName)
+		SET write_seq      = write_seq + 1,
+		    next_fire_at   = NULL,
+		    config_version = ?,
+		    updated_at     = ?
+		WHERE job_name = ?`, version, now, jobName)
 	if err != nil {
 		return fmt.Errorf("clear fire clock for %q: %w", jobName, err)
 	}
