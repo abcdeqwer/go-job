@@ -322,9 +322,26 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 			return err
 		}
 
-		// 4. Then the execution row. Under the canonical order nobody else can hold it, so
-		//    zero rows here is an assertion failure rather than a skip.
+		// 4. Then the execution row, locked, and proved to belong to the job whose lock was
+		//    just taken. Under the canonical order nobody else can hold it, so a lock failure
+		//    here is an assertion failure rather than a skip.
 		//
+		//    The identity check is not defensive noise. ClaimParams carries a job name AND an
+		//    execution id, and nothing outside this transaction guarantees they agree: a
+		//    caller that pairs job A's name with job B's execution would commit A's state row
+		//    as held while dispatching B under A's definition, lease, timeout and routing —
+		//    and B's own state row would stay free for another B execution to run beside it.
+		//    A component that hands out exclusive access must fail closed on inconsistent
+		//    input rather than trust that its caller assembled it correctly.
+		cur, err := lockExecution(ctx, tx, p.ExecutionID)
+		if err != nil {
+			return err
+		}
+		if cur.JobName != p.JobName || cur.ExecutionKey != p.ExecutionKey {
+			return fmt.Errorf("%w: claim names job %q key %q but execution %d is job %q key %q",
+				gojob.ErrProtocol, p.JobName, p.ExecutionKey, p.ExecutionID, cur.JobName, cur.ExecutionKey)
+		}
+
 		//    timeout_at is set HERE and never extended. It is a hard runtime cap, and a cap
 		//    computed at acceptance would not exist for a row that never gets that far — a
 		//    `dispatching` row whose executor never answers would have no budget at all.
@@ -340,9 +357,9 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 			    heartbeat_at   = NOW(),
 			    timeout_at     = TIMESTAMPADD(SECOND, ?, NOW()),
 			    updated_at     = ?
-			WHERE id = ? AND status = 'ready' AND attempt_no < max_attempts`,
+			WHERE id = ? AND job_name = ? AND status = 'ready' AND attempt_no < max_attempts`,
 			p.Owner, nullString(p.ExecutorID), p.RunToken, epoch,
-			leaseSeconds, timeoutSeconds, s.clock.Now(), p.ExecutionID)
+			leaseSeconds, timeoutSeconds, s.clock.Now(), p.ExecutionID, p.JobName)
 		if err != nil {
 			return fmt.Errorf("claim execution %d: %w", p.ExecutionID, err)
 		}
@@ -387,6 +404,15 @@ func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, out *ClaimResul
 			out.Outcome = ClaimSkipped
 			out.Reason = fmt.Errorf("%w: job %q held by %s; occurrence skipped by FORBID",
 				gojob.ErrContended, p.JobName, st.ActiveExecution.String)
+
+			// `skipped` is terminal, so for a fixed-delay job this ENDS the outstanding pass
+			// and the poll clock must be restored — otherwise next_poll_at stays NULL, no
+			// completion or recovery path will ever revisit this skipped row, and the poller
+			// never runs again. The state row is still held by the winning execution, so this
+			// cannot go through restorePollClockIfDead, whose guard is that the lock is free.
+			if def.ScheduleKind == gojob.ScheduleFixedDelay {
+				return restorePollClockUnderLock(ctx, tx, p.JobName, now.Add(def.Delay()), now)
+			}
 			return nil
 		}
 	}
@@ -476,6 +502,12 @@ func (s *Store) Accept(ctx context.Context, id int64, runToken string, epoch int
 // dispatched_to is cleared on both rows because the send provably did not land — which is
 // what distinguishes this from the transport-error case, where the outcome is unknown and the
 // row deliberately stays `dispatching` with its target recorded.
+//
+// A refusal that arrives AFTER the runtime cap ends the execution instead of returning it to
+// `ready`. A `ready` row is invisible to the timeout scan, and the next claim would overwrite
+// timeout_at with a fresh cap — so an execution whose budget had already elapsed would quietly
+// be granted a second one, and the protocol's "never dispatch, or re-dispatch, once the
+// runtime budget has elapsed" would hold only when nothing raced it.
 func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
@@ -498,16 +530,25 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 			return fmt.Errorf("%w: job %q under token %s epoch %d", gojob.ErrFenced, p.JobName, p.RunToken, epoch)
 		}
 
+		// The cap condition is spelled out on each branch rather than built by string
+		// concatenation. Concatenated SQL is invisible to the static checks in this package's
+		// tests — which read statements out of the source — and a statement they cannot see is
+		// a statement whose fence, clock and write_seq nobody is checking.
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
-			    status = 'ready',
-			    available_at   = TIMESTAMPADD(SECOND, ?, ?),
+			    status          = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), 'dead', 'ready'),
+			    terminal_reason = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), ?, NULL),
+			    failure_kind    = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), 'timeout', failure_kind),
+			    finished_at     = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), ?, NULL),
+			    available_at    = IF(timeout_at IS NOT NULL AND timeout_at < NOW(),
+			                         available_at, TIMESTAMPADD(SECOND, ?, ?)),
 			    owner_instance = NULL, dispatched_to = NULL, run_token = NULL,
 			    lease_until = NULL, heartbeat_at = NULL, updated_at = ?
 			WHERE id = ? AND status = 'dispatching'
 			  AND run_token = ? AND fence_epoch = ?`,
-			p.BackoffSeconds, now, now, p.ExecutionID, p.RunToken, epoch)
+			string(gojob.ReasonTimeout), now, p.BackoffSeconds, now, now,
+			p.ExecutionID, p.RunToken, epoch)
 		if err != nil {
 			return fmt.Errorf("return execution %d to ready: %w", p.ExecutionID, err)
 		}

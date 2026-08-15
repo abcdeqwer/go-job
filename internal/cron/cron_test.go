@@ -301,11 +301,27 @@ func TestHalfHourDSTShift(t *testing.T) {
 	// Lord Howe springs forward on the first Sunday in October: 02:00 -> 02:30.
 	from := at(t, lh, "2026-10-04 00:00:00")
 	got := next(t, "0 15 2 * * *", from) // 02:15 does not exist that day
-	if got.Hour() != 2 || got.Minute() != 30 {
-		t.Fatalf("got %s, want the 02:30 gap end", got.Format(time.RFC3339))
+
+	// Asserting only the hour and minute would pass on 02:30 of any LATER day, which is the
+	// ordinary case and proves nothing about the gap. The date is the whole point.
+	y, mo, d := got.Date()
+	if y != 2026 || mo != time.October || d != 4 {
+		t.Fatalf("got %s; the gap-end fire must be on 2026-10-04, not a later day",
+			got.Format(time.RFC3339))
 	}
-	if !got.After(from) {
-		t.Fatalf("%s is not after %s", got, from)
+	if got.Hour() != 2 || got.Minute() != 30 || got.Second() != 0 {
+		t.Fatalf("got %s, want the 02:30:00 gap end", got.Format(time.RFC3339))
+	}
+	if _, off := got.Zone(); off != 11*3600 {
+		t.Fatalf("got %s with offset %d; the gap end is on the far side of the transition (+11)",
+			got.Format(time.RFC3339), off)
+	}
+
+	// And exactly once: the next fire is the following day's real 02:15.
+	nxt := next(t, "0 15 2 * * *", got)
+	y, mo, d = nxt.Date()
+	if y != 2026 || mo != time.October || d != 5 || nxt.Hour() != 2 || nxt.Minute() != 15 {
+		t.Fatalf("next fire = %s, want 2026-10-05 02:15", nxt.Format(time.RFC3339))
 	}
 }
 

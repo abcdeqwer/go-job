@@ -246,6 +246,25 @@ func releaseJobLock(ctx context.Context, tx *sql.Tx, h Holder, succeeded bool, n
 	return nil
 }
 
+// restorePollClockUnderLock sets next_poll_at with the state row already locked by the
+// caller and possibly still held by another execution.
+//
+// It exists for the one terminal outcome that is NOT produced by the holder: a FORBID skip,
+// where the pass being ended lost the job to something else. The holder-oriented guard in
+// restorePollClockIfDead — "the lock is free" — is false there by construction.
+func restorePollClockUnderLock(ctx context.Context, tx *sql.Tx, jobName string, nextPollAt, now time.Time) error {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE job_state
+		SET write_seq    = write_seq + 1,
+		    next_poll_at = ?,
+		    updated_at   = ?
+		WHERE job_name = ?`, nextPollAt, now, jobName)
+	if err != nil {
+		return fmt.Errorf("restore poll clock for %q: %w", jobName, err)
+	}
+	return assertOne(res, "restore poll clock under lock")
+}
+
 // restorePollClockIfDead sets next_poll_at only when the execution it names actually reached
 // a terminal state. The state row has already been released by this point, so the guard is on
 // the execution's status rather than on ownership.

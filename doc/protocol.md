@@ -613,6 +613,25 @@ should not.
 The scheduler applies the same resolution when it fences a silent execution at the cap, so
 the record is identical whether the executor noticed or the scheduler did.
 
+### A cancel outranks the cap
+
+An execution can be both `cancel_requested` and past `timeout_at` — a common pairing, because
+a run someone cancels is often a run that was taking too long. Two rules meet there: §7 says
+`cancel_requested` resolves to `cancelled`, and this section says a capped execution is
+`dead`.
+
+**`cancelled` wins**, on both the stale-lease path and the live-timeout path. It names the
+outcome an operator asked for, and `dead` would report a failure nobody caused — to a person
+who is, at that moment, looking at the cancel they just issued. The fact that the cap elapsed
+is not lost: `failure_kind` still records `timeout`, and the attempt is recorded `fenced` with
+side effects unverified.
+
+The precedence has to be stated because the two paths would otherwise disagree. The timeout
+scan reads a row without a lock and acts on it afterwards, so an operator's cancel can land in
+between; both the stale-lease reclaim and the timeout fence therefore re-read the execution
+**under the state row's lock** and decide from what they find there, not from what the scan
+saw.
+
 ### A cancel that loses the race does not rewrite history
 
 An operator can commit `running -> cancel_requested` a moment after the handler already

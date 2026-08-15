@@ -92,7 +92,8 @@ const (
 // that token — while a new epoch is what evicts the dead scheduler's in-flight writes. The
 // two identifiers exist precisely so this case can keep one and rotate the other.
 //
-// Returns the new epoch to track under.
+// Returns the new epoch to track under. It returns ErrCapElapsed when the execution outran
+// its runtime cap while the reconciliation call was in flight; the caller fences it instead.
 func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSeconds int) (int64, error) {
 	var epoch int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -104,6 +105,24 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 		// first, and this recovery simply abandons rather than competing.
 		if !st.Held() || st.ActiveRunToken.String != v.RunToken || st.FenceEpoch != v.FenceEpoch {
 			return fmt.Errorf("%w: job %q was recovered by another instance", gojob.ErrContended, v.JobName)
+		}
+
+		// Re-read the execution UNDER THE LOCK, for the same reason Resolve does: phase 2's
+		// reconciliation RPC is bounded but not instant, and the row can change during it.
+		// The case that matters here is the cap: an executor that answers RUNNING moments
+		// after timeout_at has passed would otherwise be adopted and given a fresh lease,
+		// keeping an over-budget handler alive and tracked until some later timeout scan
+		// noticed. A cap that only applies when nothing races it is not a cap.
+		cur, err := lockExecution(ctx, tx, v.ID)
+		if err != nil {
+			return err
+		}
+		if cur.RunToken != v.RunToken || cur.FenceEpoch != v.FenceEpoch {
+			return fmt.Errorf("%w: execution %d was recovered by another instance", gojob.ErrContended, v.ID)
+		}
+		if cur.TimeoutExpired {
+			return fmt.Errorf("%w: execution %d passed its runtime cap during reconciliation",
+				ErrCapElapsed, v.ID)
 		}
 		epoch = v.FenceEpoch + 1
 		now := s.clock.Now()
@@ -383,6 +402,32 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Tim
 		if !st.Held() || st.ActiveRunToken.String != v.RunToken || st.FenceEpoch != v.FenceEpoch {
 			return fmt.Errorf("%w: job %q moved on before the cap was applied", gojob.ErrContended, v.JobName)
 		}
+
+		// Re-read under the lock. Between the non-locking timeout scan and this transaction an
+		// operator can commit `cancel_requested`, and recording that run as `dead (timeout)`
+		// would report a failure to a person who is looking at the cancel they just issued.
+		cur, err := lockExecution(ctx, tx, v.ID)
+		if err != nil {
+			return err
+		}
+		if cur.RunToken != v.RunToken || cur.FenceEpoch != v.FenceEpoch {
+			return fmt.Errorf("%w: execution %d moved on before the cap was applied", gojob.ErrContended, v.ID)
+		}
+		if cur.Status.Terminal() {
+			return fmt.Errorf("%w: execution %d reached %s before the cap was applied",
+				gojob.ErrContended, v.ID, cur.Status)
+		}
+
+		// A cancel outranks the cap, matching resolvedStatus: `cancelled` names the outcome an
+		// operator asked for, and `dead` would report a failure nobody caused. The failure kind
+		// still records that the cap elapsed, so the fact is not lost.
+		landed, reason := gojob.StatusDead, gojob.ReasonTimeout
+		summary := "runtime cap elapsed; side effects unverified"
+		if cur.Status == gojob.StatusCancelRequested {
+			landed, reason = gojob.StatusCancelled, gojob.ReasonFenced
+			summary = "cancel requested, then the runtime cap elapsed; side effects unverified"
+		}
+
 		h := Holder{
 			JobName:      v.JobName,
 			ExecutionID:  v.ID,
@@ -399,14 +444,14 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Tim
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
-			    status = 'dead', terminal_reason = ?, finished_at = ?,
+			    status = ?, terminal_reason = ?, finished_at = ?,
 			    failure_kind = 'timeout',
 			    error_message = 'runtime cap elapsed; execution fenced by the scheduler',
 			    fence_epoch = fence_epoch + 1,
 			    lease_until = NULL, heartbeat_at = NULL, deadline_at = NULL, updated_at = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?`,
-			string(gojob.ReasonTimeout), now, now, v.ID, v.RunToken, v.FenceEpoch)
+			string(landed), string(reason), now, now, v.ID, v.RunToken, v.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("fence timed-out execution %d: %w", v.ID, err)
 		}
@@ -418,13 +463,18 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale, nextPollAt *time.Tim
 			ExecutorID:     v.DispatchedTo,
 			FinishedAt:     now,
 			FailureKind:    "timeout",
-			ResultSummary:  "runtime cap elapsed; side effects unverified",
+			ResultSummary:  summary,
 		})
 	})
 }
 
 // ErrNoSuchExecution is returned by lookups for a row that has been retained away.
 var ErrNoSuchExecution = errors.New("gojob: no such execution")
+
+// ErrCapElapsed means an execution passed its runtime cap while a reconciliation call was in
+// flight, so it must be fenced rather than adopted. It is a distinct error because the caller
+// has a different action to take, not merely a different message to log.
+var ErrCapElapsed = errors.New("gojob: execution passed its runtime cap during reconciliation")
 
 // ExecutionByKey answers a redelivered result: an executor reporting twice, or reporting
 // after its scheduler died, must get the same answer both times rather than have the second

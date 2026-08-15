@@ -92,14 +92,24 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 		"deadline_at": true, "timeout_at": true, "status": true,
 		"attempt_no": true, "recovery_count": true,
 	}
+	// The first two exemptions are self-proving: a row whose status is pinned to `ready`, or
+	// a job whose active_kind is pinned NULL, cannot have an owner, so there is nothing a
+	// fence could protect. They cannot be abused, because "acts on a running attempt" and
+	// "guarded on status = 'ready'" are contradictory.
+	//
+	// The third is NOT self-proving — it acts on a row that IS owned — so it additionally
+	// requires the statement to be the operator cancel itself. Without that second condition
+	// the entry is a door any future ownership write could walk through by copying one
+	// predicate.
 	guardExemptions := []struct {
-		predicate string
-		why       string
+		predicate  string
+		alsoAssign string
+		why        string
 	}{
-		{"active_kind IS NULL", "acquisition: the job is unheld, and that IS the guard"},
-		{"status = 'ready'", "the row has never been dispatched, so it carries no token"},
-		{"status IN ('dispatching', 'running')", "operator cancel: acts against whoever holds the job, by design"},
-		{"js.active_kind IS NULL", "poll clock restore: the lock is already released, and the guard is the execution's terminal status"},
+		{"active_kind IS NULL", "", "acquisition: the job is unheld, and that IS the guard"},
+		{"status = 'ready'", "", "the row has never been dispatched, so it carries no token"},
+		{"status IN ('dispatching', 'running')", "status = 'cancel_requested'",
+			"operator cancel: acts against whoever holds the job, by design"},
 	}
 
 	var owned, exempt int
@@ -129,10 +139,14 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 
 		var excused bool
 		for _, e := range guardExemptions {
-			if strings.Contains(where, e.predicate) {
-				excused = true
-				break
+			if !strings.Contains(where, e.predicate) {
+				continue
 			}
+			if e.alsoAssign != "" && !strings.Contains(norm, e.alsoAssign) {
+				continue
+			}
+			excused = true
+			break
 		}
 		if excused {
 			exempt++
@@ -490,6 +504,54 @@ func whereClause(norm string) string {
 		return ""
 	}
 	return norm[i+len(" WHERE "):]
+}
+
+// Statements must be whole string literals, never assembled with `+`.
+//
+// Every other static check in this file reads SQL out of the source. A statement built by
+// concatenation reaches those checks as a fragment — so its fence, its clocks and its
+// write_seq stop being verified, silently, and the checks keep reporting success. That is
+// worse than not having them.
+func TestNoConcatenatedSQL(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				bin, ok := n.(*ast.BinaryExpr)
+				if !ok || bin.Op != token.ADD {
+					return true
+				}
+				for _, side := range []ast.Expr{bin.X, bin.Y} {
+					lit, ok := side.(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					if looksLikeSQL(strings.Trim(lit.Value, "`\"")) {
+						t.Errorf("%s: SQL assembled with `+`; the static checks read whole "+
+							"literals and would silently stop verifying this statement",
+							fset.Position(bin.Pos()))
+					}
+				}
+				return true
+			})
+		}
+	}
+}
+
+func looksLikeSQL(v string) bool {
+	head := strings.ToUpper(strings.TrimSpace(v))
+	for _, kw := range []string{"SELECT ", "UPDATE ", "INSERT ", "DELETE "} {
+		if strings.HasPrefix(head, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // sqlStatementsInPackage returns every string literal in the package's non-test files that
