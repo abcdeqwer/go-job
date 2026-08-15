@@ -35,6 +35,7 @@ CREATE TABLE tenant_registry (
     tenant           VARCHAR(64)     NOT NULL,
     coordination_dsn VARBINARY(2048) NOT NULL,   -- encrypted
     enabled          TINYINT(1)      NOT NULL DEFAULT 1,
+    generation       BIGINT          NOT NULL DEFAULT 1,  -- bumped by every enable/disable
     schema_version   VARCHAR(16)     NULL,       -- last version verified on this tenant
     admitted_at      DATETIME        NULL,
     last_error       VARCHAR(512)    NULL,
@@ -67,10 +68,33 @@ the registry independently, so instance A can adopt the new DSN while instance B
 working the old schema — two `job_state` rows for one tenant, in two databases, each
 correctly excluding only itself, dispatching the same job twice.
 
-Re-pointing is therefore two audited steps: **disable, wait for the drain to complete, then
-change the DSN and re-enable.** The drain is what guarantees no scheduler is working the old
-schema when the new one appears, and making it explicit means an operator cannot skip it by
-accident.
+Re-pointing is therefore three audited steps — **disable, confirm quiescence, then change the
+DSN and re-enable** — and the middle one is the part that has to be mechanical rather than a
+pause. "Wait a bit after disabling" proves nothing: a replica partitioned from the control
+database, or simply slow to poll, has not seen the disable and is still claiming against the
+old schema when the new one appears.
+
+So the registry carries a `generation`, bumped by every enable or disable, and each scheduler
+records the generation it has observed:
+
+```sql
+CREATE TABLE tenant_observation (
+    tenant          VARCHAR(64)  NOT NULL,
+    instance_id     VARCHAR(128) NOT NULL,
+    generation      BIGINT       NOT NULL,   -- highest this instance has applied
+    quiesced        TINYINT(1)   NOT NULL,   -- it holds nothing for this tenant
+    observed_at     DATETIME     NOT NULL,
+    PRIMARY KEY (tenant, instance_id),
+    KEY idx_tenant_observation_gen (tenant, generation)
+);
+```
+
+A DSN change is accepted only when **every live scheduler instance** reports the disable
+generation with `quiesced = 1`. Live means a fresh `observed_at`; an instance that stops
+reporting is either gone or partitioned, and the API says which condition is blocking rather
+than making the operator guess. Nothing here is a consensus protocol — it is an
+acknowledgement table with a freshness bound, which is enough because the failure being
+prevented is "somebody never heard", not "somebody disagrees".
 
 **Draining is bounded.** "Let in-flight work finish" is not a terminating condition: an
 execution can hang, and a scheduler that waits for it forever means a disable or a DSN change
@@ -122,6 +146,18 @@ CREATE TABLE admin_user (
     created_at    DATETIME     NOT NULL,
     updated_at    DATETIME     NOT NULL,
     PRIMARY KEY (username)
+);
+
+-- Which authenticated identity may register as what. Without this table the authorization
+-- rule in dispatch.md has no source of truth, and "bound to (tenant, group)" is a sentence
+-- rather than a check.
+CREATE TABLE executor_identity (
+    identity       VARCHAR(255) NOT NULL,   -- mTLS subject, or credential id
+    tenant         VARCHAR(64)  NOT NULL,
+    executor_group VARCHAR(64)  NOT NULL,
+    disabled       TINYINT(1)   NOT NULL DEFAULT 0,
+    created_at     DATETIME     NOT NULL,
+    PRIMARY KEY (identity, tenant, executor_group)
 );
 
 -- Actions on the registry itself: adding, disabling or re-pointing a tenant.
@@ -385,7 +421,8 @@ CREATE TABLE job_execution (
     fence_epoch    BIGINT       NOT NULL DEFAULT 0,
     lease_until    DATETIME     NULL,
     heartbeat_at   DATETIME     NULL,
-    deadline_at    DATETIME     NULL,       -- extended by executor progress
+    deadline_at    DATETIME     NULL,       -- silence deadline; extended by progress
+    timeout_at     DATETIME     NULL,       -- hard runtime cap; never extended
     started_at     DATETIME     NULL,
     finished_at    DATETIME     NULL,
     failure_kind   VARCHAR(48)  NULL,
@@ -495,16 +532,17 @@ audit records who granted the extra budget and why.
 
 ### Two budgets
 
-`attempt_no` bounds real handler starts and is incremented **only at claim**.
+`attempt_no` bounds real handler starts and is incremented **only on dispatch acceptance**.
 `recovery_count` bounds crash-and-reclaim cycles.
 
 They are separate because they answer different questions. A job that fails cleanly three
 times and a job that kills its executor three times both stop, but an operator needs to tell
 them apart, and only the second is a reason to look at memory limits.
 
-`attempt_no` is deliberately *not* incremented by recovery: the re-claim that follows a
-crash increments it, so incrementing in both places would exhaust a budget of three in two
-real starts.
+`attempt_no` is deliberately *not* incremented by claiming, nor by recovery. A claim that is
+refused by a busy executor started nothing, and a recovery is charged to `recovery_count`
+instead — so a budget of three buys three real handler starts, which is what an operator
+setting it expects.
 
 ### `params_json` is a snapshot, not a reference
 
@@ -516,11 +554,12 @@ It is copied rather than joined on purpose. History has to answer "what did last
 run actually use", and a join would answer "what would it use if it ran now" — a different
 question, and the wrong one whenever someone has since edited the configuration.
 
-### `dispatched_to` must be durable
+### `dispatched_to` must be durable **before the send**
 
-Written in the same transaction as the claim. Without it, a scheduler instance taking over
-after another died has no way to ask the right executor what happened, and would have to
-choose between re-dispatching blindly and giving up. Both are wrong; see `protocol.md` §10.
+Written in the claim transaction, naming the executor already selected — never after the
+reply. A scheduler that dies between sending `Run` and recording where it sent it would leave
+recovery with an unset target, and recovery would conclude the dispatch never landed and
+dispatch the same work elsewhere while the first executor runs it. See `protocol.md` §2.
 
 ### Truncation
 
@@ -554,8 +593,15 @@ CREATE TABLE job_execution_attempt (
 ```
 
 One row is appended per attempt when it reaches a terminal state, including `unknown` for an
-attempt whose executor could never be reconciled. Retention deletes attempts with their
-execution.
+attempt whose executor could never be reconciled.
+
+**The append is part of the same transaction as the execution's terminal or retry
+transition**, guarded identically. Writing it separately would leave the two disagreeing
+whenever a crash landed between them — and since redelivery of a result is answered *from*
+this table (`dispatch.md` §3), a missing row turns an accepted result into a spurious
+`ABORTED`.
+
+Retention deletes attempts with their execution.
 
 ---
 
@@ -664,9 +710,17 @@ Two clocks, and every column belongs to exactly one of them.
 | Clock | Columns | Source |
 | --- | --- | --- |
 | **business** | `next_fire_at`, `next_poll_at`, `scheduled_at`, `available_at`, `started_at`, `finished_at`, `created_at`, `updated_at` | the configured `Location` |
-| **ownership** | `lease_until`, `heartbeat_at`, `deadline_at` | the database's `NOW()` |
+| **ownership** | `lease_until`, `heartbeat_at`, `deadline_at`, `timeout_at` | the database's `NOW()` |
 
-`deadline_at` is an **ownership** column, not a business one, because it answers an ownership
+`timeout_at` is set once, at dispatch acceptance, to `NOW() + timeout_seconds`, and is
+**never extended**. It has to be a durable ownership instant rather than a timer in the
+dispatching scheduler's memory: an execution can outlive the instance that started it, and a
+successor that inherited only a progress-extended silence deadline would have no way to know
+how much of the original cap had already elapsed — it would grant a fresh one, or none.
+`started_at` cannot serve, because it is a business-clock column and ownership logic never
+compares those against `NOW()`.
+
+`deadline_at` is an **ownership** column for the same reason, because it answers an ownership
 question — has this attempt gone silent long enough to be treated as lost? Writing it from a
 business clock that a test environment can shift would make a healthy execution appear stale
 the moment someone fast-forwarded the clock. The wire carries a *duration*
@@ -698,8 +752,13 @@ problem than a bug; it is a bug with a delay.
 | `job_executor`, `job_executor_handler` | rows whose heartbeat is older than the liveness bound |
 | `job_audit` | the approved audit window; never truncated silently |
 
-Cleanup runs as an ordinary job of this scheduler, with a batch size, a per-run row cap and
-a business-time cutoff, so it is visible, bounded and interruptible like any other job.
+Cleanup is an **internal scheduler task**, not a job: it holds a named control lease
+(`protocol.md` §9), runs inside the scheduler, and needs no executor. It could not be an
+ordinary job — a job requires a handler, and no executor has access to the scheduler's own
+tables, by design.
+
+It is bounded like one, though: a batch size, a per-run row cap and a business-time cutoff,
+with its runs visible in the UI alongside real jobs.
 
 ---
 

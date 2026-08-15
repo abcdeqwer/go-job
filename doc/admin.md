@@ -135,7 +135,9 @@ resolve it differently — or worse, consistently but not as the operator expect
 ```text
 GET    /api/tenants                                    registry, admission state, last_error
 POST   /api/tenants                                    add a site; body includes DSNs
-PATCH  /api/tenants/{tenant}                           enable/disable, re-point DSN
+PATCH  /api/tenants/{tenant}                           enable/disable
+PUT    /api/tenants/{tenant}/dsn                       re-point; 409 until quiesced
+GET    /api/tenants/{tenant}/quiescence                per-instance observed generation
 GET    /api/tenants/{tenant}/handlers                  handler_keys live executors declare
 
 GET    /api/tenants/{tenant}/jobs                      list with effective state
@@ -144,7 +146,7 @@ GET    /api/tenants/{tenant}/jobs/{name}               detail, configuration, co
 PATCH  /api/tenants/{tenant}/jobs/{name}               edit; requires If-Match: <version>
 POST   /api/tenants/{tenant}/jobs/{name}/pause         body: {reason}
 POST   /api/tenants/{tenant}/jobs/{name}/resume        body: {reason}
-POST   /api/tenants/{tenant}/jobs/{name}/trigger       body: {reason, params?}
+POST   /api/tenants/{tenant}/jobs/{name}/trigger       body: {reason, params?, request_id}
 POST   /api/tenants/{tenant}/jobs/{name}/retire        body: {reason}
 
 GET    /api/tenants/{tenant}/executions                filter: job, status, from, to
@@ -179,6 +181,10 @@ Attempt history at `GET /executions/{key}` is served from `job_execution_attempt
 
 Conventions:
 
+- **`trigger` requires a `request_id`** and is idempotent on it: a retried request — a
+  double-clicked button, a client that resent after a timeout — returns the execution the
+  first one created rather than queueing a second run. Without it the one operation an
+  operator is most likely to repeat under stress is the one that duplicates work;
 - every mutating call requires a `reason`, and rejects an empty one. A reason recorded at
   the moment of action is worth more than a reconstruction attempted later;
 - edits use `If-Match` against `job_definition.version`; a stale version is a `409`, never

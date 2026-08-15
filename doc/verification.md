@@ -291,7 +291,29 @@ cannot regress silently.
 90. a job naming a required `executor_group` is dispatched only to that group, even when
     another group declares the same `handler_key`;
 91. recovery holds no database lock while calling `GetExecution`, and a wedged executor that
-    never answers does not block completion, cancellation or another recovery for that job.
+    never answers does not block completion, cancellation or another recovery for that job;
+92. a result arriving while the execution is still `dispatching` — a handler faster than the
+    acceptance write — is accepted, and applies the acceptance effects and the outcome
+    together;
+93. an executor reporting `DISPOSITION_STOPPED` moves the execution to `cancelled` with
+    `terminal_reason = 'handler_confirmed'`, and is never treated as a retryable failure that
+    restarts the work an operator cancelled;
+94. materializing a fixed-delay pass clears `next_poll_at` in the same transaction, so a
+    second scanner cannot create a second pass; a retryable pass failure leaves it clear, so
+    the retry is the next pass rather than a second one;
+95. `timeout_at` is durable and survives failover: an execution adopted by another scheduler
+    instance is still capped at the original instant, neither granted a fresh cap nor left
+    uncapped;
+96. a DSN change is refused until every live scheduler instance reports the disable
+    generation quiesced, and the refusal names which instance is blocking;
+97. the attempt-history row is written in the same transaction as the terminal or retry
+    transition, so a result redelivery is always answerable;
+98. a job bound to an executor group is reported unrunnable when the only executors declaring
+    its handler are in another group — not reported runnable and then never dispatched;
+99. a repeated manual trigger carrying the same `request_id` returns the first execution and
+    creates no second run;
+100. a `Register` from an identity with no `executor_identity` row for the claimed tenant and
+    group is refused.
 
 ---
 

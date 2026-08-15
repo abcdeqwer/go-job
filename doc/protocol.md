@@ -204,7 +204,10 @@ rather than collapsed into one boolean:
 
 1. `job_definition.enabled = 1` and the job is not retired;
 2. `job_state.ops_paused = 0`;
-3. **at least one live executor declares this job's `handler_key`** for this tenant;
+3. **at least one live executor declares this job's `handler_key`** for this tenant **and, if
+   the job names an `executor_group`, is in that group**. A handler-only check would report a
+   group-bound job as runnable while the only executors declaring its handler are in the
+   wrong group — runnable in the UI, undispatchable in practice;
 4. the schema version matches what this scheduler requires.
 
 Condition 3 replaces what an earlier revision called "resolves in this binary's registry" —
@@ -278,7 +281,7 @@ WHERE id = ?
   AND lease_until >= NOW();
 ```
 
-`status IN ('running', 'cancel_requested')` is deliberate: a cancelled-but-not-yet-stopped
+The status set is deliberate. `cancel_requested` is there because a cancelled-but-not-yet-stopped
 handler must keep renewing, because releasing its slot before it has actually stopped is
 exactly the overlap this protocol exists to prevent.
 
@@ -368,7 +371,8 @@ WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?;
 ```sql
 UPDATE job_execution
 SET status = 'success', finished_at = ?, lease_until = NULL, updated_at = ?
-WHERE id = ? AND status = 'running' AND run_token = ? AND fence_epoch = ?;
+WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
+  AND run_token = ? AND fence_epoch = ?;
 ```
 
 ### Retry
@@ -382,7 +386,8 @@ SET status = IF(attempt_no >= max_attempts, 'dead', 'ready'),
                       available_at, TIMESTAMPADD(SECOND, ?, ?)),
     owner_instance = NULL, dispatched_to = NULL, run_token = NULL, lease_until = NULL,
     failure_kind = ?, error_message = ?, updated_at = ?
-WHERE id = ? AND status = 'running' AND run_token = ? AND fence_epoch = ?;
+WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
+  AND run_token = ? AND fence_epoch = ?;
 ```
 
 Backoff is bounded, configurable and deterministic; jitter is applied after computing the
@@ -502,7 +507,9 @@ cancel_requested --stale lease, fenced------> cancelled   (never back to ready)
 
 ready --FORBID contention--> skipped
 dead  --authorized retry--> ready (attempt_no reset, audited)
-any non-terminal --job retired--> cancelled (audited)
+dispatching --result arrives before acceptance recorded--> success | dead | ready
+dispatching --cancel or retire--> cancel_requested   (the executor may already have it)
+ready       --cancel or retire--> cancelled          (nothing is running)
 ```
 
 ### A cancel that loses the race does not rewrite history

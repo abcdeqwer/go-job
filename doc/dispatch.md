@@ -147,8 +147,8 @@ tenant reach the other's execution.
 
 | Held token | Meaning | Scheduler does |
 | --- | --- | --- |
-| same as the one just sent | a re-send of this attempt landed | treat as acceptance |
-| a **different** token | an older attempt the scheduler already fenced is still running there | **not** acceptance — this attempt never started. Leave it `ready`, and let the old attempt's own reconciliation resolve it |
+| same as the one just sent | a re-send of this attempt landed | **treat as acceptance** — `dispatching` → `running`, `attempt_no` +1, exactly as an OK reply |
+| a **different** token | an older attempt the scheduler already fenced is still running there | **not** acceptance — `dispatching` → `ready` with a backoff, `attempt_no` unchanged, `dispatched_to` cleared. The old attempt is resolved by its own recovery; dispatching this one elsewhere now would put two handlers on the same work |
 
 Without the token, the second case is indistinguishable from the first, and the scheduler
 would mark an attempt `running` that no handler ever started — then adopt the *old* attempt's

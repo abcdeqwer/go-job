@@ -131,13 +131,28 @@ There is no long-lived loop inside an executor. The scheduler drives each pass:
 
 ```text
 next_poll_at <= now
-  -> take the job_state lock
+  -> lock the job_state row (FOR UPDATE SKIP LOCKED)
   -> create an ordinary execution row (trigger_type = 'poll')
-  -> dispatch it, exactly like a cron execution
+  -> SET next_poll_at = NULL          <- reserves the loop, same transaction
+  -> commit, then dispatch like any other execution
   -> executor runs one pass, reports {did_work, summary}
-  -> release the lock, set next_poll_at = result time + delay
-  -> if did_work = false and the pass succeeded, DELETE the execution row
+  -> on result: release the lock, SET next_poll_at = result time + delay
 ```
+
+**Clearing `next_poll_at` in the materializing transaction is what makes the loop a loop.**
+A poll key is fresh each pass rather than derived from an instant, so the unique key that
+stops two schedulers materializing the same cron fire does not stop them materializing two
+passes. Leaving the column due until the result arrives would let a second scanner lock the
+row a moment later and create a second pass; both are `ready`, so the second runs the instant
+the first finishes — no delay, and repeated scans build a backlog of passes over one queue.
+
+`NULL` means "a pass is outstanding". Only a **terminal** result — or recovery, which
+restores it — sets it again.
+
+A *retryable* failure therefore does not set it either: the pass returns to `ready` with a
+backoff and `next_poll_at` stays `NULL`, so the retry is the next pass rather than a second
+one racing a newly materialized pass. A poller's queue is the durable work; running two
+passes over it because one failed is the pile-up a fixed delay exists to prevent.
 
 Because `next_poll_at` is computed from the **result**, the delay is measured from
 completion, which is what makes a fixed-delay job a poller rather than a cron job: a pass
