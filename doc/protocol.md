@@ -4,8 +4,32 @@ This document specifies how exactly one owner is established, kept, proved and r
 It is the part of the system that must be right; everything else is a convenience on top of
 it.
 
-MySQL is the only mechanism. There is no coordination service, no consensus protocol and no
-lock server. Four ingredients do the whole job:
+## 0. Two layers of ownership
+
+Since the scheduler runs as a cluster and executors are separate processes, "who owns this
+work" has two answers at once, and keeping them distinct is what keeps the design tractable.
+
+| Layer | Question | Mechanism | Specified in |
+| --- | --- | --- | --- |
+| **1 — internal** | which *scheduler instance* owns materializing, dispatching and tracking this execution? | MySQL: row lock, guarded CAS, lease, fence epoch | this document |
+| **2 — external** | which *executor instance* is running it, and is it still alive? | HTTP: dispatch, registration heartbeat, per-execution progress | `dispatch.md` |
+
+Layer 1 is what the rest of this document specifies. Every scheduler instance is
+**identical and equal** — there is no leader, no designated node and no configured control
+plane. Instances coordinate entirely through the tables, so the cluster can be scaled,
+rolled and lost a node at a time without any of them being special.
+
+The two layers fail independently, and section 10 covers the interesting case: a scheduler
+instance dying while an executor is happily running the work it dispatched.
+
+Throughout this document, "owner" means the **scheduler instance** that holds an execution.
+The process actually running business code is the **executor**, and it owns nothing — it is
+told what to run and reports what happened.
+
+---
+
+MySQL is the only mechanism for layer 1. There is no coordination service, no consensus
+protocol and no lock server. Four ingredients do the whole job:
 
 | Ingredient | Prevents |
 | --- | --- |
@@ -99,10 +123,13 @@ WHERE id = ?
 ```
 
 Every statement's affected-row count is asserted; any mismatch rolls the transaction back.
-Business execution begins only after commit, and **no row lock is held while a handler
-runs** — leases, not locks, carry ownership across the handler's lifetime.
 
-`attempt_no` is incremented here and nowhere else. Recovery does not touch it (section 6).
+**Dispatch happens only after commit**, and `dispatched_to` is written in the same
+transaction so a takeover can reconcile with the right executor (section 10). No row lock is
+held while an executor runs the work — leases, not locks, carry ownership across an
+execution's lifetime, which may be hours.
+
+`attempt_no` is incremented here and nowhere else. Recovery does not touch it (section 7).
 
 ---
 
@@ -399,7 +426,93 @@ It is a statement about scheduler ownership, and the UI must present it as one:
 
 ---
 
-## 9. Fairness and quotas
+## 9. Scheduler clustering
+
+Every scheduler instance runs the same loops: materialize due jobs, dispatch claimed
+executions, track them, recover stale ones, serve the API. None of them is a leader.
+
+### What makes that safe
+
+- **materialization** takes the state row `FOR UPDATE SKIP LOCKED`, so exactly one instance
+  creates a given fire instant's execution and advances `next_fire_at`; the others skip that
+  job on that pass (`scheduling.md` §1);
+- **dispatch** requires the claim of section 2, so exactly one instance holds an execution
+  and is responsible for handing it to an executor;
+- **result callbacks are instance-agnostic.** An executor posts to whichever scheduler the
+  load balancer picks, and that instance writes the result to MySQL guarded by `run_token`.
+  There is no session affinity to preserve and no requirement that the result return to the
+  instance that dispatched;
+- **the executor registry lives in MySQL, not in scheduler memory.** This is not an
+  optimization — an in-memory registry would give each instance a different view of which
+  executors exist, and routing decisions would depend on which instance happened to make
+  them;
+- **the admin API is stateless.** Any instance can serve any request; all state is in the
+  tables.
+
+### Periodic singleton work
+
+A few background activities should run once per interval across the cluster rather than
+once per instance: retention sweeps, orphan scanning, expired-registration cleanup. They
+are not correctness-critical — running them twice is harmless — but running them on every
+instance every minute is waste.
+
+These take a **named lease** in a small table, acquired with the same guarded CAS used
+everywhere else. A lease, not an election: whoever holds it does the work this interval,
+and if that instance dies the lease expires and another picks it up. No instance is
+promoted, and nothing waits for consensus.
+
+### What clustering does not change
+
+Nothing about correctness depends on the number of scheduler instances, exactly as nothing
+depends on the number of executors. One instance and five instances run the same code paths;
+five is simply five times as likely to skip a locked row. There is no single-instance mode
+and no cluster mode to configure.
+
+---
+
+## 10. Scheduler failover while an execution is running
+
+This is the case the two-layer split creates, and it has a specific answer because the naive
+one is a duplicate run.
+
+```text
+scheduler A claims execution E, dispatches to executor X, holds the lease
+scheduler A dies
+E's lease expires
+scheduler B's recovery loop picks up E
+```
+
+**B must not re-dispatch.** Executor X may still be running E perfectly well; A's death says
+nothing about X. Re-dispatching on the assumption that a dead scheduler means dead work is
+how a fifteen-minute settlement job gets run twice.
+
+So recovery of an execution in `running` **reconciles before it decides**:
+
+1. read `dispatched_to` from the execution row — the executor instance A handed it to;
+2. call `GET {address}/jobs/{execution_key}` (`dispatch.md` §4.3);
+3. act on the answer:
+
+| Executor says | B does |
+| --- | --- |
+| `running` | adopt tracking: take the lease with a **new** fence epoch, keep the same `run_token`, and continue waiting. The work was never interrupted. |
+| `finished` | adopt the reported result and complete the execution normally |
+| `404`, or unreachable | the attempt is genuinely lost: fence the `run_token` and retry per policy |
+
+Keeping the same `run_token` in the adopt case matters: the executor is still holding it and
+will present it with its progress and result calls. Rotating it would fence a healthy
+running execution — the mistake of invalidating the current generation while it is still
+working.
+
+The fence epoch does advance, because scheduler-side ownership genuinely moved and any write
+attempted by a resurrected A must still be refused.
+
+`dispatched_to` therefore has to be durable, written in the same transaction as the claim.
+An execution whose dispatch target is not recorded cannot be reconciled, and would leave
+recovery guessing.
+
+---
+
+## 11. Fairness and quotas
 
 Polling is round-robin across admitted tenants; a tenant cannot monopolise workers merely by
 having the oldest rows.
@@ -415,7 +528,7 @@ documentation says so rather than implying a guarantee that does not hold.
 
 ---
 
-## 10. Worker registration
+## 12. Executor registration
 
 Registration is an `INSERT` and a heartbeat, not a protocol. There is no service registry,
 no broadcast and no inbound endpoint on workers.
@@ -445,7 +558,7 @@ deleted by retention.
 
 ---
 
-## 11. Observability contract
+## 13. Observability contract
 
 Structured fields on every execution event:
 
