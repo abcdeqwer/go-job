@@ -54,7 +54,7 @@ timer:
   what removes the lost-update hazard a separately-owned timer heap would create.
 
 The timer heap then does what it is good at: for a job due in the next few seconds, wake
-the worker at the instant rather than at the next scan boundary. Losing it degrades
+the scheduler at the instant rather than at the next scan boundary. Losing it degrades
 dispatch latency to the scan interval. It cannot lose a run.
 
 ### Cron dialect
@@ -90,86 +90,73 @@ it could exist.
 
 ## 2. Fixed-delay pollers
 
-A poller waits a configured delay after each pass completes. It is a long-lived loop, not a
-sequence of scheduled instants.
+A poller waits a configured delay after each pass **completes**. It is a repeating pass, not
+a sequence of scheduled instants, and the difference matters: a cron job that fires every
+three seconds will pile up when a run takes four, while a fixed-delay job cannot.
 
 - the durable unit of work stays the poller's own source table, with its own claim
-  contract;
-- a scheduler execution row is written only when real work is accepted, a manual trigger
-  runs, or a failure needs durable evidence;
-- loop liveness, empty-poll rate, source backlog and last successful poll are metrics, so
-  an idle poller is still visibly alive;
+  contract. The scheduler tracks passes; the source table tracks work;
+- an execution row is written only when a pass actually did something, or failed;
+- empty-pass rate, source backlog and last successful pass are metrics, so an idle poller is
+  still visibly alive;
 - a poller is never reshaped into cron just to fit the row model.
 
-The reason for not writing a row per tick is arithmetic: a three-second poller produces
+The reason for not writing a row per pass is arithmetic: a three-second poller produces
 28,800 executions a day, per tenant, almost all recording that there was nothing to do.
 That is not history, it is noise with a storage bill.
 
-### One loop per job, held by a lease
+### The loop lives in the scheduler, one pass at a time
 
-Every fixed-delay job runs as a **singleton loop**. The loop holds a lease on the job's
-`job_state` row with `active_kind = 'LOOP'`, renewed by heartbeat exactly like an execution
-lease, so only one loop per tenant and job is active anywhere in the fleet.
+There is no long-lived loop inside an executor. The scheduler drives each pass:
 
-Acquire:
-
-```sql
-UPDATE job_state
-SET active_kind      = 'LOOP',
-    active_worker_id = ?,
-    active_run_token = ?,
-    fence_epoch      = fence_epoch + 1,
-    lease_until      = TIMESTAMPADD(SECOND, ?, NOW()),
-    heartbeat_at     = NOW(),
-    updated_at       = ?
-WHERE job_name = ? AND ops_paused = 0 AND active_kind IS NULL;
+```text
+next_poll_at <= now
+  -> take the job_state lock with active_kind = 'POLL'
+  -> dispatch one pass to an executor
+  -> executor runs one pass, reports {did_work, summary}
+  -> release the lock, set next_poll_at = result time + delay
 ```
 
-Renew is the state-row heartbeat of `protocol.md` §5. Release on clean exit:
+Because `next_poll_at` is computed from the **result**, the delay is measured from
+completion, which is what makes a fixed-delay job a poller rather than a cron job: a pass
+that takes longer than the delay never overlaps its successor.
 
-```sql
-UPDATE job_state
-SET active_kind = NULL, active_worker_id = NULL, active_run_token = NULL,
-    lease_until = NULL, updated_at = ?
-WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?;
-```
+Two properties fall out of using the same `job_state` lock as everything else:
 
-A loop that loses its renewal stops immediately, exactly like an execution that loses its
-fence. A loop whose process dies leaves an expired lease that recovery clears
-(`protocol.md` §7).
+- **exactly one pass at a time**, across the whole scheduler cluster and every executor, for
+  free. No separate mechanism, no separate policy;
+- **a manual trigger cannot overlap a pass**, because it competes for the same lock. And it
+  cannot starve either, because a pass holds the lock only for its own duration — unlike a
+  long-lived loop lease, which would hold it forever and make the trigger button silently
+  useless.
 
-This is also why a poller does not need a separate concurrency policy: the same single
-holder that excludes two executions excludes two loops, and excludes a loop from racing a
-manual run.
+That second point is worth dwelling on: an earlier design had the executor hold a loop lease
+indefinitely, which preserved mutual exclusion perfectly while making manual triggers
+unreachable for every polling job. Dispatching one pass at a time removes the possibility
+rather than working around it.
 
-### Manual trigger: the loop consumes it
+### Empty passes leave no trace
 
-A manual trigger for a fixed-delay job **must not go through the normal claim path.**
+Only a pass that reports `did_work = true` persists an execution row.
 
-This is the trap worth naming, because the natural design is wrong in a way that looks
-right: if the manual execution had to claim the job like any other, it would need
-`active_kind IS NULL` — and a healthy loop holds `active_kind = 'LOOP'` indefinitely. Under
-`QUEUE` the manual run is deferred forever; under `FORBID` it is marked `skipped`
-immediately. Mutual exclusion would be perfectly preserved and the trigger button would
-silently do nothing, forever, for every polling job.
+The scheduler holds the pass as `active_kind = 'POLL'` on the state row while it is in
+flight, without an execution row. When the result arrives:
 
-The fix is that **the lock holder does the work**, rather than a second actor competing for
-a lock it can never win:
+| `did_work` | Result |
+| --- | --- |
+| `true` | materialize the execution row with its outcome — this is history worth keeping |
+| `false` | release the lock, advance `next_poll_at`, count it in metrics only |
 
-- the control plane creates the manual execution row exactly as for a cron job,
-  `trigger_type = 'manual'`, status `ready`;
-- the running loop checks for one at the top of each pass and, if present, claims it
-  **under the lease it already holds** — same token, same fence epoch, no new acquisition —
-  runs the handler once, and completes the execution normally;
-- if no loop is running (paused, crashed, disabled), the row stays `ready` and is picked up
-  by the next loop that acquires the lease, so a trigger issued during a restart is delayed
-  rather than lost;
-- the execution row records the run like any other, so history, retry and audit are
-  unchanged.
+A failure always persists, whatever `did_work` says: a pass that errored is evidence
+regardless of whether it found work.
 
-The bound is therefore one poll interval, not indefinite. `verification.md` asserts this as
-a **liveness** property, because an assertion that merely proves the manual run does not
-overlap the loop would pass against the broken design.
+This is what keeps a three-second poller from writing 28,800 rows a day per tenant to record
+that there was nothing to do. The cost is one boolean in the result and one intermediate
+state on the state row, which is a good trade for two orders of magnitude of rows.
+
+Liveness for an idle poller comes from metrics — last successful pass, empty-poll rate,
+source backlog — not from execution rows. `admin.md` shows these on the job page so an idle
+poller is still visibly alive rather than looking abandoned.
 
 ---
 

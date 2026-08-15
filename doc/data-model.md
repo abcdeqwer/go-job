@@ -198,8 +198,8 @@ every coordination query one forgotten predicate away from crossing a tenant bou
 
 There is no discovery protocol, and this is the point: workers do not broadcast, do not
 register with a service registry, and do not expose an endpoint for a controller to call.
-A worker that is configured with a coordination DSN **is** discovered, because it writes
-itself into `job_worker` in that schema and the admin UI reads the same table.
+An executor configured with a scheduler endpoint **is** discovered, because it registers
+itself into `job_executor` in that tenant's schema and the admin UI reads the same table.
 
 Registration therefore requires no shared business database, no network path from the
 control plane to workers, and no configuration listing which workers exist. Two processes
@@ -240,6 +240,7 @@ CREATE TABLE job_definition (
     max_recoveries     INT          NOT NULL,
     lease_seconds      INT          NOT NULL,
     timeout_seconds    INT          NOT NULL,
+    params_json        JSON         NULL,      -- default parameters
     description        VARCHAR(512) NULL,
     version            BIGINT       NOT NULL DEFAULT 1,
     updated_by         VARCHAR(64)  NULL,
@@ -360,11 +361,14 @@ CREATE TABLE job_execution (
     recovery_count INT          NOT NULL DEFAULT 0,
     max_attempts   INT          NOT NULL,
     max_recoveries INT          NOT NULL,
-    worker_id      VARCHAR(128) NULL,
+    params_json    JSON         NULL,       -- snapshot; see below
+    owner_instance VARCHAR(128) NULL,       -- scheduler instance holding it
+    dispatched_to  VARCHAR(128) NULL,       -- executor_id it was handed to
     run_token      CHAR(36)     NULL,
     fence_epoch    BIGINT       NOT NULL DEFAULT 0,
     lease_until    DATETIME     NULL,
     heartbeat_at   DATETIME     NULL,
+    deadline_at    DATETIME     NULL,       -- extended by executor progress
     started_at     DATETIME     NULL,
     finished_at    DATETIME     NULL,
     failure_kind   VARCHAR(48)  NULL,
@@ -425,12 +429,28 @@ without a filesort.
 `recovery_count` bounds crash-and-reclaim cycles.
 
 They are separate because they answer different questions. A job that fails cleanly three
-times and a job that kills its worker three times both stop, but an operator needs to tell
+times and a job that kills its executor three times both stop, but an operator needs to tell
 them apart, and only the second is a reason to look at memory limits.
 
 `attempt_no` is deliberately *not* incremented by recovery: the re-claim that follows a
 crash increments it, so incrementing in both places would exhaust a budget of three in two
 real starts.
+
+### `params_json` is a snapshot, not a reference
+
+The definition's `params_json` holds the job's configured defaults. The execution's holds
+the **merged, resolved** value — defaults plus any per-trigger override — frozen when the
+execution was created.
+
+It is copied rather than joined on purpose. History has to answer "what did last Tuesday's
+run actually use", and a join would answer "what would it use if it ran now" — a different
+question, and the wrong one whenever someone has since edited the configuration.
+
+### `dispatched_to` must be durable
+
+Written in the same transaction as the claim. Without it, a scheduler instance taking over
+after another died has no way to ask the right executor what happened, and would have to
+choose between re-dispatching blindly and giving up. Both are wrong; see `protocol.md` §10.
 
 ### Truncation
 
@@ -440,38 +460,66 @@ the tail that explains the failure.
 
 ---
 
-## 5. `job_worker` and `job_worker_handler` — registration
+## 5. `job_executor` and `job_executor_handler` — registration
+
+Written by `JobScheduler.Register` and `Heartbeat` (`dispatch.md` §6). One row per executor
+**process per tenant**: a process serving several tenants registers once in each tenant's
+schema, so one tenant's routing is never decided on another tenant's evidence.
 
 ```sql
-CREATE TABLE job_worker (
-    worker_id      VARCHAR(128) NOT NULL,
-    role           VARCHAR(16)  NOT NULL,   -- WORKER | CONTROL_PLANE | BOTH
-    build_revision VARCHAR(64)  NOT NULL,
-    handler_count  INT          NOT NULL,
-    started_at     DATETIME     NOT NULL,
-    heartbeat_at   DATETIME     NOT NULL,
-    PRIMARY KEY (worker_id),
-    KEY idx_job_worker_alive (heartbeat_at)
+CREATE TABLE job_executor (
+    executor_id      VARCHAR(128) NOT NULL,
+    executor_group   VARCHAR(64)  NOT NULL,   -- jobs route to a group
+    address          VARCHAR(255) NOT NULL,   -- where the scheduler calls
+    contract_version VARCHAR(16)  NOT NULL,
+    revision         VARCHAR(64)  NOT NULL,
+    capacity         INT          NOT NULL,
+    running          INT          NOT NULL DEFAULT 0,
+    capabilities     VARCHAR(255) NULL,       -- declared optional features
+    started_at       DATETIME     NOT NULL,
+    heartbeat_at     DATETIME     NOT NULL,
+    PRIMARY KEY (executor_id),
+    KEY idx_job_executor_alive (heartbeat_at),
+    KEY idx_job_executor_group (executor_group, heartbeat_at)
 );
 
-CREATE TABLE job_worker_handler (
-    worker_id VARCHAR(128) NOT NULL,
-    job_name  VARCHAR(128) NOT NULL,
-    PRIMARY KEY (worker_id, job_name),
-    KEY idx_job_worker_handler_job (job_name)
+CREATE TABLE job_executor_handler (
+    executor_id VARCHAR(128) NOT NULL,
+    handler_key VARCHAR(128) NOT NULL,
+    PRIMARY KEY (executor_id, handler_key),
+    KEY idx_job_executor_handler_key (handler_key)
 );
 ```
 
-`worker_id` is `<hostname>:<pid>:<boot-nonce>`, unique per process, so a restarted process
-never inherits its predecessor's row and never has to clean one up.
+`executor_id` is unique per process. A restart produces a new one, so a restarted executor
+never inherits its predecessor's row and never has to clean one up — the old row simply ages
+out.
 
 The handler set is normalized rather than stored as a delimited string, because the query
-that matters — "is any live worker serving this job?" — must be an indexed join. That
-query drives the orphan alert, which is the difference between noticing within a minute
-that a job has no executor and noticing next week that it stopped running.
+that matters is an indexed join:
 
-Rows whose heartbeat has aged past the retention bound are deleted; liveness is a fresh
-heartbeat evaluated in database time.
+```sql
+-- Orphans: enabled jobs no live executor can run.
+SELECT d.job_name
+FROM job_definition d
+LEFT JOIN job_executor_handler h ON h.handler_key = d.handler_key
+LEFT JOIN job_executor e ON e.executor_id = h.executor_id
+                        AND e.heartbeat_at > ?        -- liveness bound
+WHERE d.enabled = 1
+GROUP BY d.job_name
+HAVING COUNT(e.executor_id) = 0;
+```
+
+That query is the difference between noticing within a minute that a job has no executor
+and noticing next week that it stopped running. It is also a cutover precondition and a
+dispatch-time check, not just an alert.
+
+**The registry lives in the database, not in scheduler memory.** With a scheduler cluster,
+an in-memory registry would give each instance a different view of which executors exist,
+and routing would depend on which instance happened to decide.
+
+Rows whose heartbeat has aged past the bound are deleted by the retention sweep. Liveness is
+a fresh heartbeat evaluated in database time — never against a scheduler's host clock.
 
 ---
 
@@ -541,7 +589,7 @@ problem than a bug; it is a bug with a delay.
 | Table | Policy |
 | --- | --- |
 | `job_execution` | terminal rows only. `success` and `skipped` on a short window; `dead`, `cancelled` and manual runs kept for the longer audit window. **Non-terminal rows are never deleted.** |
-| `job_worker`, `job_worker_handler` | rows whose heartbeat is older than the liveness bound |
+| `job_executor`, `job_executor_handler` | rows whose heartbeat is older than the liveness bound |
 | `job_audit` | the approved audit window; never truncated silently |
 
 Cleanup runs as an ordinary job of this scheduler, with a batch size, a per-run row cap and

@@ -33,14 +33,14 @@ protocol and no lock server. Four ingredients do the whole job:
 
 | Ingredient | Prevents |
 | --- | --- |
-| a row lock on `job_state` | two workers deciding simultaneously |
+| a row lock on `job_state` | two scheduler instances deciding simultaneously |
 | a guarded CAS (`active_kind IS NULL`) | a decision based on a stale read |
 | a lease with heartbeats | a crashed owner holding the job forever |
 | a fence epoch on every ownership write | a revived owner overwriting its successor |
 
 Remove any one and the protocol is unsound. Together they are sufficient, and the number of
-worker processes is irrelevant to that — exclusion comes from the single state row, not
-from knowing how many workers exist.
+scheduler instances is irrelevant to that — exclusion comes from the single state row,
+not from knowing how many instances exist.
 
 ---
 
@@ -70,7 +70,7 @@ whose result the claim transaction re-verifies:
 SELECT id, job_name
 FROM job_execution
 WHERE status = 'ready'
-  AND available_at <= ?          -- business time, supplied by the worker
+  AND available_at <= ?          -- business time, supplied by the scheduler
 ORDER BY available_at, id
 LIMIT ?;
 ```
@@ -82,7 +82,7 @@ LIMIT ?;
 Per candidate, one short transaction:
 
 1. `SELECT ... FROM job_state WHERE job_name = ? FOR UPDATE SKIP LOCKED`.
-   A skip means another worker is already deciding about this job; abandon this candidate
+   A skip means another scheduler instance is already deciding about this job; abandon this candidate
    and move on without blocking.
 2. Read `job_definition` and evaluate runnability (section 3). A failure here is a logged
    rejection, not contention.
@@ -95,7 +95,7 @@ Per candidate, one short transaction:
 UPDATE job_state
 SET active_kind      = 'EXECUTION',
     active_execution = ?,
-    active_worker_id = ?,
+    active_owner = ?,
     active_run_token = ?,
     fence_epoch      = fence_epoch + 1,
     lease_until      = TIMESTAMPADD(SECOND, ?, NOW()),
@@ -109,7 +109,8 @@ WHERE job_name   = ?
 ```sql
 UPDATE job_execution
 SET status       = 'running',
-    worker_id    = ?,
+    owner_instance = ?,
+    dispatched_to  = ?,
     run_token    = ?,
     fence_epoch  = ?,
     lease_until  = TIMESTAMPADD(SECOND, ?, NOW()),
@@ -176,7 +177,7 @@ displaced run stopped, which section 8 explicitly declines to promise.
 
 ## 5. Lease, heartbeat and fencing
 
-Ownership decisions use **database time only**. A worker never compares a lease against its
+Ownership decisions use **database time only**. A scheduler never compares a lease against its
 own host clock, because that would make ownership depend on clock skew between machines.
 
 ```text
@@ -192,7 +193,7 @@ UPDATE job_execution
 SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
 WHERE id = ?
   AND status IN ('running', 'cancel_requested')
-  AND worker_id = ? AND run_token = ? AND fence_epoch = ?
+  AND owner_instance = ? AND run_token = ? AND fence_epoch = ?
   AND lease_until >= NOW();
 ```
 
@@ -207,7 +208,7 @@ WHERE job_name = ?
 handler must keep renewing, because releasing its slot before it has actually stopped is
 exactly the overlap this protocol exists to prevent.
 
-If either guarded update affects zero rows, ownership is lost. The worker cancels the
+If either guarded update affects zero rows, ownership is lost. The scheduler abandons the
 handler context, emits `fence_lost`, and **prohibits all further scheduler and business
 writes from that execution**.
 
@@ -230,7 +231,7 @@ worth naming precisely, because two of them look like health:
 
 **Connection-pool starvation.** A handler that consumes the entire pool leaves the
 heartbeat unable to acquire a connection. Renewal fails, the lease expires, recovery hands
-the job to another worker — while the original process is alive and still working. This is
+the job to another executor — while the original process is alive and still working. This is
 the most realistic way to lose a long job, and the mitigation is structural: **the
 heartbeat uses a dedicated reserved connection**, never one shared with handler work.
 
@@ -284,7 +285,7 @@ row.
 ```sql
 UPDATE job_state
 SET active_kind = NULL, active_execution = NULL,
-    active_worker_id = NULL, active_run_token = NULL,
+    active_owner = NULL, active_run_token = NULL,
     lease_until = NULL, last_success_at = ?, updated_at = ?
 WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?;
 ```
@@ -304,7 +305,7 @@ UPDATE job_execution
 SET status = IF(attempt_no >= max_attempts, 'dead', 'ready'),
     available_at = IF(attempt_no >= max_attempts,
                       available_at, TIMESTAMPADD(SECOND, ?, ?)),
-    worker_id = NULL, run_token = NULL, lease_until = NULL,
+    owner_instance = NULL, dispatched_to = NULL, run_token = NULL, lease_until = NULL,
     failure_kind = ?, error_message = ?, updated_at = ?
 WHERE id = ? AND status = 'running' AND run_token = ? AND fence_epoch = ?;
 ```
@@ -357,7 +358,7 @@ the executor:**
    - `running` → `ready` with bounded recovery backoff, or `dead` when
      `attempt_no >= max_attempts` or `recovery_count >= max_recoveries`;
    - `cancel_requested` → **`cancelled`**, never `ready`. Someone asked this run to stop;
-     its worker dying is not a reason to start it again;
+     its executor dying is not a reason to start it again;
    - `active_kind = 'LOOP'` → nothing to resolve; step 3 is the whole recovery.
 
 The normal claim path then assigns capacity and a new owner, so a recovery scan can never
@@ -366,14 +367,14 @@ end up owning more work than a tenant's quota permits.
 **Recovery does not touch `attempt_no`.** It was incremented at claim, and the re-claim that
 follows recovery increments it again — which is exactly the budget a crash should cost.
 Incrementing in both places would exhaust a budget of three in two real handler starts. A
-handler that reliably kills its worker still terminates: claim, crash, recover, claim,
+handler that reliably kills its executor still terminates: claim, crash, recover, claim,
 crash, recover, claim → the limit is reached and the row goes `dead`.
 
 ### Graceful shutdown
 
 Stop claiming and drop readiness first, then let in-flight work finish. If a handler has not
 proved it stopped, **let its lease expire rather than releasing it**. Lease expiry is not
-proof a handler stopped — but releasing early is a guarantee that a second worker may start
+proof a handler stopped — but releasing early is a guarantee that a second executor may start
 while the first is still writing.
 
 ---
@@ -417,7 +418,7 @@ It is a statement about scheduler ownership, and the UI must present it as one:
 - it means the scheduler will accept no further results from that execution, and the job's
   concurrency slot is free;
 - it does **not** mean an in-flight request was withdrawn or a partial write was rolled
-  back. Reaching `cancelled` through lease expiry proves only that the old worker lost
+  back. Reaching `cancelled` through lease expiry proves only that the old executor lost
   ownership;
 - the two paths are labelled differently — "cancelled (handler confirmed stopped)" versus
   "cancelled (fenced; side effects unverified)". Showing both as a plain "cancelled" invites
@@ -514,7 +515,7 @@ recovery guessing.
 
 ## 11. Fairness and quotas
 
-Polling is round-robin across admitted tenants; a tenant cannot monopolise workers merely by
+Polling is round-robin across admitted tenants; a tenant cannot monopolise dispatch capacity merely by
 having the oldest rows.
 
 Within a process, per-tenant concurrency is bounded by a pool and a queue, with a
@@ -530,28 +531,34 @@ documentation says so rather than implying a guarantee that does not hold.
 
 ## 12. Executor registration
 
-Registration is an `INSERT` and a heartbeat, not a protocol. There is no service registry,
-no broadcast and no inbound endpoint on workers.
+Executors call `Register` and `Heartbeat` (`dispatch.md` §6); the scheduler stores the
+result in `job_executor` and `job_executor_handler`.
 
 ```text
-start:  INSERT job_worker(worker_id, role, build_revision, started_at, heartbeat_at)
-        INSERT job_worker_handler(worker_id, job_name) x N
-run:    UPDATE job_worker SET heartbeat_at = NOW() every interval
-stop:   DELETE own rows on graceful exit; otherwise heartbeat ages out
+Register   -> probe (Describe, plus a GetExecution for a key it cannot hold)
+           -> INSERT job_executor, job_executor_handler x N
+           -> adopt or fence the declared in_flight set
+Heartbeat  -> UPDATE heartbeat_at, running
+lapse      -> the row ages out; the executor re-registers on known=false
 ```
 
-`worker_id` is `<hostname>:<pid>:<boot-nonce>` — unique per process, so a restarted worker
-never inherits its predecessor's row and never has to clean one up.
+`executor_id` is unique per process, so a restarted executor never inherits its
+predecessor's row and never has to clean one up.
 
-Registration is **not** part of the exclusion mechanism, and nothing in the claim protocol
-consults it. It exists for three operational purposes:
+Registration is **not** part of the exclusion mechanism — nothing in the claim protocol
+consults it, and ownership is decided entirely by `job_state`. It serves four purposes:
 
-- the admin UI can show which processes are live, what they are running and at which build;
-- **orphan detection** — a job that is enabled but whose handler no live worker registers
-  will never be claimed by anyone. That is a condition to alert on, not a mystery to
-  investigate a week later;
-- routing evidence when a workload is split across deployments: the registered handler set
-  is already the fact that says which deployment serves what.
+- **routing**: dispatch goes to a live instance of a group declaring the job's
+  `handler_key` and below capacity (`dispatch.md` §7);
+- **orphan detection**: an enabled job whose handler no live executor declares will never
+  run. That is a condition to alert on, not a mystery to investigate a week later;
+- **reconciliation**: the `in_flight` set declared at registration is how a scheduler learns
+  what survived a restart on either side, without having to ask;
+- **operations**: the admin UI shows which processes are live, at which build, running what.
+
+**The registry is in the database, not in scheduler memory.** With a scheduler cluster, an
+in-memory registry would give each instance a different view of which executors exist, and
+routing would depend on which instance happened to decide.
 
 Liveness is a fresh heartbeat evaluated in database time. Rows aged past the bound are
 deleted by retention.
@@ -564,7 +571,7 @@ Structured fields on every execution event:
 
 ```text
 tenant, job_name, execution_id, execution_key, trigger_type,
-worker_id, run_token_hash, attempt_no, recovery_count,
+owner_instance, executor_id, run_token_hash, attempt_no, recovery_count,
 scheduled_at, claimed_at, duration_ms, status, failure_kind
 ```
 
@@ -580,9 +587,9 @@ Metrics:
 - loop liveness, empty-poll rate and last successful poll for fixed-delay jobs;
 - **time since last success per job**, which is the metric that catches a job that silently
   stopped — the failure mode nobody notices, because nothing is erroring;
-- live workers by role and build revision, and **enabled jobs whose handler no live worker
-  serves**;
-- expired `running` executions whose handler has no live worker, reported separately from
+- live executors by group and build revision, and **enabled jobs whose handler no live
+  executor serves**;
+- expired `running` executions whose handler has no live executor, reported separately from
   the ready backlog, because nothing will recover them;
 - connection pool usage and waits.
 

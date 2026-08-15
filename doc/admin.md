@@ -17,7 +17,7 @@ people actually have at 3am:
 1. **Is this job going to run?** — and if not, *why* not.
 2. **Did it run, and what happened?**
 3. **Is anything running right now, and who owns it?**
-4. **Is there a worker alive that can run this at all?**
+4. **Is there an executor alive that can run this at all?**
 5. **What changed, and who changed it?**
 
 Everything below exists to answer one of those.
@@ -36,7 +36,7 @@ failed condition rather than showing one boolean:
 nightly-rollup          will not run
   ✗ ops_paused = 1              (paused by alice, 2h ago, "waiting on upstream fix")
   ✓ enabled
-  ✓ handler registered by 2 live workers
+  ✓ handler declared by 2 live executors
   ✓ schema version matches
 ```
 
@@ -49,7 +49,7 @@ that was never the problem. The conditions, in evaluation order, are those in
 - current configuration, with the values that came from code defaults distinguished from
   values an operator has since edited;
 - recent executions;
-- which live workers register this handler;
+- which live executors declare this handler;
 - the audit trail for this job.
 
 ---
@@ -61,7 +61,7 @@ Filterable by job, status and time. Every non-terminal state is visible, not jus
 | Column | Why it is there |
 | --- | --- |
 | status | including `ready`, `retry`-delayed, `cancel_requested` and `skipped` |
-| owner | `worker_id` holding it |
+| owner | the scheduler instance holding it, and the executor it was dispatched to |
 | attempt / recovery | the two budgets, separately — see `data-model.md` §4 |
 | lease age, heartbeat age | a running job whose heartbeat is aging is the shape of a hung handler |
 | failure kind | stable enum, so failures group instead of being unique strings |
@@ -73,17 +73,17 @@ otherwise.
 
 ---
 
-## 4. Workers
+## 4. Executors
 
-Live processes: `worker_id`, role, build revision, uptime, heartbeat age, and the handler
-set each one registers.
+Live executors: `executor_id`, group, address, build revision, contract version, uptime,
+heartbeat age, capacity and current load, and the handler set each one declares.
 
 Two derived views matter more than the list:
 
-- **orphaned jobs** — enabled, but no live worker registers the handler. Nothing will ever
+- **orphaned jobs** — enabled, but no live executor declares the handler. Nothing will ever
   claim them. This is the single most valuable screen in the UI, because it catches the
   failure mode that produces no errors at all;
-- **stuck executions** — expired `running` rows whose handler has no live worker. Nothing
+- **stuck executions** — expired `running` rows whose handler has no live executor. Nothing
   will recover them either, and that is a different problem from a backlog.
 
 ---
@@ -94,7 +94,7 @@ Each is audited with actor, target and reason. Each requires the `OPERATOR` role
 
 | Action | Effect | Guard |
 | --- | --- | --- |
-| **Trigger** | creates a manual execution | for a fixed-delay job, consumed by the running loop (`scheduling.md` §2) |
+| **Trigger** | creates a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one |
 | **Pause / resume** | sets `ops_paused` | takes the state-row lock, so it cannot race a claim into one extra run |
 | **Edit** | schedule, concurrency, retry budget, timeouts | optimistic `version` CAS; rejected if the row changed underneath |
 | **Retry** | `dead` → `ready`, attempt budget reset | audited with a reason; never automatic |
@@ -137,7 +137,7 @@ GET    /api/executions/{key}           detail including attempt history
 POST   /api/executions/{key}/retry     dead -> ready; body: {reason}
 POST   /api/executions/{key}/cancel    running -> cancel_requested; body: {reason}
 
-GET    /api/workers                    live workers and handler sets
+GET    /api/executors                  live executors and handler sets
 GET    /api/orphans                    enabled jobs with no live handler
 GET    /api/audit                      filter: job, actor, from, to
 

@@ -1,13 +1,26 @@
 # go-job
 
-A multi-tenant, database-durable job scheduler for Go applications.
+A multi-tenant, database-durable **job scheduling platform**.
 
-Embed it as a library, write handlers as ordinary Go functions, and get durable
-scheduling, exactly-one-owner execution, retries, execution history and a built-in
-admin UI — with MySQL as the only infrastructure dependency.
+`go-job` decides what runs, when, for which tenant, and exactly once. Your applications
+run the work: they register as **executors** over a gRPC contract, in any language, and
+receive dispatches with parameters. MySQL is the only infrastructure dependency, and the
+admin UI ships with the scheduler.
 
-> **Status: design.** This repository currently contains the design and the schema.
-> No engine code is written yet. `doc/` is the specification that implementation follows.
+```text
+        ┌──────────────────────┐        registers, reports
+        │      go-job          │◄───────────────────────────┐
+        │  scheduler cluster   │                            │
+        │  + admin UI + API    │──────dispatch + params────►│
+        └──────────┬───────────┘                    ┌───────┴────────┐
+                   │                                │   executors    │
+        control DB │ per-tenant coordination DBs    │  (any language)│
+                   ▼                                └────────────────┘
+```
+
+> **Status: design.** This repository contains the design, the schema and the gRPC
+> contract. No engine code is written yet. `doc/` is the specification implementation
+> follows.
 
 ---
 
@@ -23,19 +36,24 @@ heartbeats, and a fence epoch on every ownership-bearing write, so a process tha
 paused, partitioned or resurrected cannot overwrite the state of the owner that replaced
 it. There is exactly one code path that reclaims an expired holder.
 
-**Multi-tenant by physical isolation.** One database or schema per tenant. No `tenant_id`
+**Multi-tenant by physical isolation.** One coordination schema per tenant. No `tenant_id`
 column threaded through every table, no default tenant, no cross-tenant fallback. A
-tenant's jobs, configuration, history and failures are its own.
+tenant's jobs, configuration, history and failures are its own. Adding a site is a row in
+the registry — not a redeploy.
+
+**Executors are dumb on purpose.** They accept work, run it and report. Ownership, leases,
+fencing, recovery, retry budgets and misfire policy all live in the scheduler, so a new
+executor in a new language cannot get any of it subtly wrong.
 
 **Operable by people who did not write it.** Schedule, enablement, concurrency policy,
 retry budget and timeout are data you can edit and audit at runtime, not constants
 recompiled into a binary. A job that silently stopped running is a detectable condition,
 not something you notice a week later.
 
-**Honest about its guarantees.** Owning a job prevents two workers from running it
-concurrently. It does not make an outbound HTTP call idempotent, and it does not prove
-that a cancelled handler's in-flight request was withdrawn. This library states which
-guarantee it provides and refuses to imply the other.
+**Honest about its guarantees.** Owning a job prevents two executors from running it
+concurrently. It does not make an outbound HTTP call idempotent, and it does not prove that
+a cancelled handler's in-flight request was withdrawn. This platform states which guarantee
+it provides and refuses to imply the other.
 
 **One dependency.** MySQL. No Redis, no message broker, no ZooKeeper, no etcd, no
 sidecar, no separate scheduler service to operate.
@@ -49,9 +67,12 @@ sidecar, no separate scheduler service to operate.
 - **Cron jobs** — six-field expressions with seconds, steps, ranges, lists and named
   weekdays and months. Each fire instant becomes one durable execution with a
   deterministic key, so duplicate creation is rejected by the database, not by luck.
-- **Fixed-delay pollers** — a single leased loop per tenant and job, waiting a configured
-  delay after each pass. A poller writes an execution row only when it accepts real work,
-  so an idle three-second loop does not produce 28,800 rows a day saying nothing happened.
+- **Fixed-delay pollers** — one pass at a time per tenant and job, the next dispatched a
+  configured delay after the previous **completes**. A pass that finds nothing writes no
+  execution row, so an idle three-second poller does not produce 28,800 rows a day saying
+  nothing happened.
+- **Parameters** — every job carries configured defaults, overridable per manual trigger,
+  snapshotted onto each execution so history shows what a run actually used.
 - **Misfire policies** — after an outage, either skip to the next future fire or run one
   catch-up. Unbounded replay is not offered: an hour of downtime must not become an hour
   of catch-up executions.
@@ -73,15 +94,16 @@ sidecar, no separate scheduler service to operate.
 
 ### Operations
 
-- **built-in admin UI** — job list with effective state, execution history, live workers,
-  manual trigger, pause and resume, schedule and policy editing, retry and cancel;
-- **worker registration** — every process registers its handler set and heartbeats, so
-  "no live worker serves this job" is an alert rather than a mystery;
+- **built-in admin UI** — tenants, job list with effective state, execution history, live
+  executors, manual trigger with parameter overrides, pause and resume, schedule and policy
+  editing, retry and cancel;
+- **executor registration** — every executor registers its handler set and heartbeats, so
+  "no live executor serves this job" is an alert rather than a mystery;
 - **audit trail** — every operator action recorded with actor, target and reason;
 - **Prometheus metrics** — backlog, dispatch lag, durations, terminal-state counters,
   fence losses, stale recoveries, pool usage;
-- **bounded retention** — every table this library owns has a cleanup policy that ships
-  with it, so history does not grow without limit.
+- **bounded retention** — every table go-job owns has a cleanup policy that ships with it,
+  so history does not grow without limit.
 
 ### Not included, deliberately
 
@@ -104,8 +126,8 @@ into a distributed-systems project:
 | Component | Requirement | Why |
 | --- | --- | --- |
 | **MySQL** | 8.0 or later, one coordination schema per tenant | durability and coordination authority; `SELECT ... FOR UPDATE SKIP LOCKED` is required |
-| **Go** | 1.26 or later | the library and your handlers compile into one binary |
-| A migration tool | any — Flyway, golang-migrate, `psql`-style scripts, your own | this library exports versioned DDL and never executes it |
+| **Go** | 1.26 or later — for the scheduler only | executors may be written in any language with gRPC support |
+| A migration tool | any — Flyway, golang-migrate, plain scripts, your own | go-job exports versioned DDL and never executes it |
 
 That is the complete list. There is no broker, no coordination service and no separate
 scheduler daemon.
@@ -120,70 +142,70 @@ Optional:
 
 ## 4. How to use it
 
-### Register handlers and run
+Three things happen once, in this order: run the scheduler, add a tenant, connect an
+executor.
 
-A job is declared in exactly one place. The configuration row, the admin listing and the
-routing decision are all derived from that declaration, so there is no second registry to
-keep in sync.
+### Run the scheduler
 
-```go
-sched, err := gojob.New(gojob.Config{
-    Tenants: map[string]gojob.Tenant{
-        // Coordination holds the scheduler's own tables.
-        // Business is what handlers receive; it defaults to Coordination.
-        "acme": {Coordination: acmeSchedDSN, Business: acmeDSN},
-        "beta": {Coordination: betaDSN},     // one schema for both
-    },
-    Location: time.UTC,              // business time zone
-    Listen:   ":8090",               // admin UI, health, metrics
-})
-
-sched.Register(gojob.Job{
-    Name:       "nightly-rollup",
-    HandlerKey: "reports.rollup",
-    Handler:    reports.Rollup,
-    Defaults: gojob.Defaults{
-        Schedule:      gojob.Cron("0 30 1 * * *"),
-        Concurrency:   gojob.Queue,
-        Misfire:       gojob.Skip,
-        MaxAttempts:   3,
-        Lease:         10 * time.Minute,
-        Timeout:       8 * time.Minute,
-    },
-    Writes:      []string{"report_daily"},
-    Description: "Rebuilds yesterday's rollup.",
-})
-
-log.Fatal(sched.Run(ctx))
+```sh
+go-job \
+  --control-dsn  "user:pass@tcp(mysql:3306)/gojob_control" \
+  --location     "Asia/Manila" \
+  --listen       ":8090"          # admin UI, gRPC, health, metrics
 ```
 
-`Defaults` seed the job's configuration the first time it is seen and are never written
-over a later operator edit — changing a default in code affects new tenants and new jobs,
-not deployed ones.
+Everything else — which tenants exist, which jobs they run, on what schedule — is data.
+The binary takes no job list and no tenant list.
 
-`Writes` declares which tables the job may write. It is not documentation: it is a
-reviewable statement of blast radius, and a write outside the set is a defect rather than
-a surprise.
+### Add a tenant
 
-### Write a handler
+One audited row in the control database, through the UI or the API:
+
+```text
+tenant   coordination_dsn                business_dsn
+np       …/np_scheduler                  …/np
+np2      …/np2                           (null: one schema for both)
+```
+
+Schedulers pick it up within one poll — **no restart**. Adding another site later is the
+same one row. DSNs are encrypted at rest and never read back in plaintext.
+
+### Connect an executor
+
+An executor implements the four `JobExecutor` RPCs from
+`proto/gojob/v1/executor.proto`, registers, and starts receiving work. In Go, with the
+generated stubs and **without** embedding the `Unimplemented` struct, a missing method is a
+compile error:
 
 ```go
-func Rollup(ctx gojob.Context) (string, error) {
-    day := ctx.Now().AddDate(0, 0, -1)      // business time, not wall time
-    n, err := rebuild(ctx, ctx.DB(), day)
-    if err != nil {
-        return "", err
+func (e *MyExecutor) Run(ctx context.Context, r *gojobv1.RunRequest) (*gojobv1.RunResponse, error) {
+    if !e.claim(r.ExecutionKey) {
+        return nil, status.Error(codes.AlreadyExists, "already running")
     }
-    return fmt.Sprintf("rows=%d", n), nil
+    go e.run(r)                       // returns immediately; reports later
+    return &gojobv1.RunResponse{ExecutionKey: r.ExecutionKey}, nil
 }
 ```
 
-A handler receives its tenant's database handle, business time, a logger tagged with the
-run's identity, and a fence check. Long handlers work in bounded chunks and call
-`ctx.Fence()` before each one; a non-nil result means ownership was lost and the handler
-must stop without further writes.
+The handler reads its parameters from `RunRequest.Params` and its business date from
+`RunRequest.ScheduledAt` — business time, not the executor's wall clock:
 
-The returned string is the run summary shown in history.
+```go
+func (e *MyExecutor) run(r *gojobv1.RunRequest) {
+    day := parseDay(r.ScheduledAt).AddDate(0, 0, -1)
+    size := int(r.Params.Values.Fields["batch_size"].GetNumberValue())
+
+    n, err := rebuild(day, size)
+    e.report(r, ok(err), fmt.Sprintf("rows=%d", n), n > 0)   // last arg: did_work
+}
+```
+
+While it runs, the executor's framework calls `ReportProgress` on a timer — the handler
+does not have to remember to. A `proceed=false` response means ownership was lost or the
+run was cancelled, and the handler must stop without further writes.
+
+Executors in other languages implement the same four methods from the same `.proto`.
+`doc/dispatch.md` §9 is the complete list of what any of them must guarantee — six items.
 
 ### Apply the schema
 
@@ -225,7 +247,7 @@ this section is trivial; the separation matters only when a workload is later sp
 
 | Role | Responsibility |
 | --- | --- |
-| `WORKER` | claims and executes work for the handlers in its assignment |
+| `WORKER` | claims executions and dispatches them to executors |
 | `CONTROL_PLANE` | reconciles job configuration, recomputes schedules after a clock change, serves the admin UI and API |
 
 The `CONTROL_PLANE` role is **assigned by configuration, not elected.** A designated
@@ -282,7 +304,7 @@ all-or-none acquisition across tenants.
 
 Graceful shutdown stops claiming and drops readiness first, then lets in-flight work
 finish. A lease whose handler has not proved it stopped is allowed to expire rather than be
-released early — releasing early is how two workers end up overlapping.
+released early — releasing early is how two executors end up overlapping.
 
 ---
 

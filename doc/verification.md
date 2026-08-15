@@ -17,14 +17,14 @@ static analysis for everything else.
 
 ## 1. Claim, lease and fencing
 
-1. two workers racing one execution produce exactly one owner;
+1. two scheduler instances racing one execution produce exactly one owner;
 2. a claimant skips a state row locked by another and does not block;
 3. concurrent claim, completion and recovery under sustained contention produce no
    deadlock, and every transaction locks state before execution;
 4. a crashed owner's expired lease returns the execution to `ready` with `fence_epoch` and
    `recovery_count` incremented and `attempt_no` **unchanged**, and the next claim
    increments `attempt_no` exactly once;
-5. a handler that kills its worker on every attempt consumes one `attempt_no` per real
+5. a handler that kills its executor on every attempt consumes one `attempt_no` per real
    handler start, so `max_attempts = 3` yields three starts — not two;
 6. an old token or fence epoch cannot heartbeat, checkpoint, succeed, fail or release the
    job lock;
@@ -68,23 +68,26 @@ static analysis for everything else.
 
 ---
 
-## 3. Fixed-delay loops
+## 3. Fixed-delay passes
 
-22. a singleton loop runs exactly one instance across two worker processes;
-23. **liveness, not just safety**: with a healthy loop running continuously and never
-    releasing its lease, a manual trigger for that job **executes within a bounded time**
-    and its execution row reaches a terminal state.
+22. exactly one pass of a job is in flight at any moment, across two scheduler instances and
+    two executors;
+23. the next pass is dispatched `delay` after the previous **result**, not after its
+    dispatch — verified with a pass that runs longer than the delay, which must not overlap
+    its successor;
+24. **liveness, not just safety**: with a poller running continuously, a manual trigger for
+    that job **executes within a bounded time** and reaches a terminal state.
 
-    An assertion that merely proves the manual run does not overlap the loop passes against
-    a design in which it never runs at all. That is the specific defect this test exists to
-    catch;
-24. a manual trigger issued while no loop holds the lease stays `ready` and is executed by
-    the next loop that acquires it — never skipped, never lost;
-25. a loop whose process dies leaves an expired state-row lease that recovery clears, after
-    which a new loop can acquire it;
-26. an empty poll produces metrics but no execution or history row;
-27. pausing a job stops loop-lease renewal, so the loop exits within one pass and its
-    absence is readable from the state row.
+    An assertion that merely proves the manual run does not overlap the poll would pass
+    against a design in which it never runs at all. That is the specific defect this test
+    exists to catch;
+25. a pass reporting `did_work=false` leaves no execution row and is visible only in
+    metrics; one reporting `did_work=true` persists a row; a **failed** pass persists a row
+    regardless of `did_work`;
+26. an executor that dies mid-pass leaves an expired `POLL` holder on the state row that
+    recovery clears, after which the next pass can be dispatched;
+27. pausing a job stops further passes being dispatched, and the in-flight one is allowed to
+    finish rather than being abandoned.
 
 ---
 
@@ -111,12 +114,19 @@ static analysis for everything else.
 33. two tenant schemas hold identical job names and identical row ids without interference;
 34. one tenant's database failure cannot route work to another tenant, and does not prevent
     other tenants' runtimes from serving;
-35. admission is all-or-nothing per tenant and fail-closed: a missing table, an unreachable
-    database, an unresolved credential, an invalid duration or an unsupported schema version
-    prevents readiness;
-36. no query issued by the library omits the tenant boundary, because no query carries a
-    tenant predicate to omit — verified by inspecting that every statement runs on a
-    tenant-bound connection.
+35. admission is fail-closed **per tenant**: a missing table, an unreachable database, an
+    unresolved credential, an invalid duration or an unsupported schema version prevents
+    that tenant from being admitted, records `last_error`, and is retried on a backoff;
+36. **a broken tenant does not take down healthy ones.** Add a tenant with a malformed DSN
+    to a scheduler already serving several; every existing tenant keeps running while the
+    new one is visibly failed. This is the specific regression hot add would otherwise
+    introduce;
+37. a tenant added to `tenant_registry` is admitted within one registry-poll interval with
+    no restart; disabling it drains in-flight work and releases the pool;
+38. DSNs are stored encrypted and never returned in plaintext by the API — reads are masked;
+39. no query issued against a tenant omits the tenant boundary, because no query carries a
+    tenant predicate to omit — verified by asserting every statement runs on a tenant-bound
+    connection.
 
 ---
 
@@ -125,17 +135,17 @@ static analysis for everything else.
 37. a job whose handler is outside this deployment's assignment is not claimed by it and is
     **not** an admission failure; a handler inside the assignment but absent from the build
     registry **is**;
-38. an orphaned job — no live worker anywhere serves its handler — raises an alert and is
-    visible in the UI, but never prevents a worker from starting. Refusing to start because
-    another deployment is down turns one missing lane into two;
+38. an orphaned job — no live executor anywhere declares its handler — raises an alert and
+    is visible in the UI, but never prevents a scheduler from starting. Refusing to start
+    because another deployment is down turns one missing lane into two;
 39. registry reconciliation inserts missing jobs with declared defaults and **never**
     overwrites an operator edit;
 40. reconciliation is idempotent under concurrency: running it twice, or from two processes,
     inserts no duplicates and loses no edit;
 41. a control-plane deployment with an empty execution assignment reconciles and serves the
     API while claiming no work;
-42. a worker restart produces a new `worker_id` and never inherits or has to clean up its
-    predecessor's registration row.
+42. an executor restart produces a new `executor_id` and never inherits or has to clean up
+    its predecessor's registration row.
 
 ---
 
@@ -157,7 +167,7 @@ static analysis for everything else.
 
 49. terminal-row retention is bounded, indexed, batched and interruptible, and **never
     deletes a non-terminal row**;
-50. worker registration rows age out on heartbeat expiry;
+50. executor registration rows age out on heartbeat expiry;
 51. audit rows are retained for the configured window and are never silently truncated;
 52. a scheduler running continuously for the retention window does not grow without bound in
     any table it owns — asserted by row counts, not by inspection.
@@ -169,20 +179,20 @@ static analysis for everything else.
 The properties above are asserted under normal operation. These are asserted while things
 are breaking:
 
-53. `SIGKILL` of a worker mid-handler: the execution is recovered, budgets are consumed
-    correctly, and no second worker starts before recovery completes;
+53. `SIGKILL` of an executor mid-handler: the execution is recovered, budgets are consumed
+    correctly, and no second executor starts before recovery completes;
 54. database connection loss during a handler: ownership is lost cleanly, the fence prevents
     further writes, and the execution is later recovered;
 55. a handler that ignores context cancellation and runs past its lease: its writes are
     rejected by the fence, and the fact that it cannot be stopped is visible rather than
     silently tolerated;
-56. clock skew between worker hosts does not affect ownership, because ownership never reads
-    a host clock;
+56. clock skew between hosts does not affect ownership, because ownership never reads a host
+    clock;
 57. a slow database making heartbeats late: ownership loss is detected and the handler
     stops, rather than two owners proceeding;
 58. **a handler running far longer than its lease keeps its job**: with a handler held
     running for many multiples of `lease_seconds` and the heartbeat healthy, the lease never
-    expires, recovery never fires, and no second worker claims it. The lease bounds heartbeat
+    expires, recovery never fires, and no second executor claims it. The lease bounds heartbeat
     absence, not execution time, and this test is what pins that down;
 59. a handler that exhausts the connection pool does **not** starve the heartbeat: renewal
     uses a reserved connection and continues to succeed while every handler connection is
@@ -193,7 +203,36 @@ are breaking:
 
 ---
 
-## 10. What this list does not cover
+## 10. Dispatch contract
+
+Asserted against a real executor process, not a mock, because the properties under test are
+what a real executor gets wrong. These duplicate the conformance suite of `dispatch.md` §10
+deliberately: that suite proves an *executor* conforms, these prove the *scheduler* behaves
+correctly when one does not.
+
+61. a dispatch that times out is re-sent with the same `execution_key`, the executor answers
+    `ALREADY_EXISTS`, and the work runs **once**;
+62. an executor answering `RESOURCE_EXHAUSTED` or `UNAVAILABLE` causes failover to the next
+    instance; when no instance accepts, the execution stays `ready` with backoff and is
+    **never** marked failed — nothing was attempted;
+63. an accepted execution that goes silent past its deadline triggers `GetExecution`, and
+    each of `RUNNING`, `FINISHED` and `NOT_FOUND` produces the documented outcome;
+64. `NOT_FOUND` is treated as **unknown**, not as "did not run": the attempt is fenced and
+    retried under the stated idempotency assumption, and the log says so;
+65. a fenced attempt's `ReportProgress` receives `proceed=false` and its `ReportResult`
+    receives `ABORTED`; neither mutates scheduler state;
+66. an executor re-registering with `in_flight` has its still-recognised executions adopted
+    and its unrecognised ones returned in `fenced`;
+67. parameters reach the executor exactly as configured, merged with any trigger override,
+    and the execution row records the merged value — a later edit to the job's defaults does
+    not change what history says that run used;
+68. a scheduler instance killed while an execution is running does **not** cause a
+    re-dispatch: the instance that takes over reconciles with the executor first, adopts the
+    run with the same `run_token` and a new fence epoch, and lets it finish.
+
+---
+
+## 11. What this list does not cover
 
 Verification of **handler logic** is the host's responsibility, not this library's. This
 list proves the scheduler runs a handler exactly once per accepted execution and reports
