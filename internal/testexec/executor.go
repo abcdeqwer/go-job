@@ -44,9 +44,12 @@ type Executor struct {
 
 	handlers map[string]Handler
 
-	mu      sync.Mutex
-	running map[string]*execution // by execution_key
-	done    map[string]*finished  // remembered outcomes, by (execution_key, run_token)
+	mu sync.Mutex
+	// Keyed by TENANT and execution key, always. Keys are unique only within a tenant, so a
+	// map keyed by the key alone lets tenant B's run collide with tenant A's — B receives
+	// ALREADY_EXISTS for work it has never seen, and B's Cancel stops A's handler.
+	running map[string]*execution // by (tenant, execution_key)
+	done    map[string]*finished  // by (tenant, execution_key, run_token)
 
 	sched gojobv1.JobSchedulerClient
 	// Sent is a hook the test uses to observe reported results.
@@ -66,12 +69,16 @@ func (e *Executor) LastReportError() error {
 }
 
 type execution struct {
+	tenant    string
+	key       string
 	runToken  string
 	cancel    context.CancelFunc
 	startedAt time.Time
 }
 
 type finished struct {
+	tenant   string
+	key      string
 	runToken string
 	outcome  *gojobv1.ExecutionOutcome
 	at       time.Time
@@ -136,13 +143,13 @@ func (e *Executor) Run(ctx context.Context, req *gojobv1.RunRequest) (*gojobv1.R
 	//
 	// A DIFFERENT token for the same key is the opposite situation — a retry the scheduler
 	// deliberately created after the first attempt failed — and must run.
-	if fin, finished := e.done[attemptKey(req.GetExecutionKey(), req.GetRunToken())]; finished {
+	if fin, finished := e.done[attemptKey(req.GetTenant(), req.GetExecutionKey(), req.GetRunToken())]; finished {
 		e.mu.Unlock()
 		st, _ := status.New(codes.AlreadyExists, "this attempt already finished here").
 			WithDetails(&gojobv1.ExecutionHeld{HeldRunToken: fin.runToken})
 		return nil, st.Err()
 	}
-	if cur, held := e.running[req.GetExecutionKey()]; held {
+	if cur, held := e.running[runKey(req.GetTenant(), req.GetExecutionKey())]; held {
 		e.mu.Unlock()
 		// ALREADY_EXISTS carries the token actually held, because "already held" is two
 		// different situations: a re-send of THIS attempt after a lost reply, which the
@@ -166,8 +173,9 @@ func (e *Executor) Run(ctx context.Context, req *gojobv1.RunRequest) (*gojobv1.R
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
-	e.running[req.GetExecutionKey()] = &execution{
+	e.running[runKey(req.GetTenant(), req.GetExecutionKey())] = &execution{
 		runToken: req.GetRunToken(), cancel: cancel, startedAt: time.Now(),
+		tenant: req.GetTenant(), key: req.GetExecutionKey(),
 	}
 	e.mu.Unlock()
 
@@ -233,8 +241,9 @@ func (e *Executor) execute(ctx context.Context, req *gojobv1.RunRequest, h Handl
 	}
 
 	e.mu.Lock()
-	delete(e.running, req.GetExecutionKey())
-	e.done[attemptKey(req.GetExecutionKey(), req.GetRunToken())] = &finished{
+	delete(e.running, runKey(req.GetTenant(), req.GetExecutionKey()))
+	e.done[attemptKey(req.GetTenant(), req.GetExecutionKey(), req.GetRunToken())] = &finished{
+		tenant: req.GetTenant(), key: req.GetExecutionKey(),
 		runToken: req.GetRunToken(), outcome: oc, at: time.Now(),
 	}
 	e.forgetOldLocked()
@@ -252,7 +261,11 @@ func errText(err error, fallback string) string {
 
 // attemptKey identifies one attempt. The pair, not the execution: a retry is a different
 // attempt of the same execution and must be allowed to run.
-func attemptKey(executionKey, runToken string) string { return executionKey + "\x00" + runToken }
+func runKey(tenant, executionKey string) string { return tenant + "\x00" + executionKey }
+
+func attemptKey(tenant, executionKey, runToken string) string {
+	return tenant + "\x00" + executionKey + "\x00" + runToken
+}
 
 // forgetOldLocked bounds the remembered outcomes.
 //
@@ -340,7 +353,7 @@ func (e *Executor) reportProgress(ctx context.Context, req *gojobv1.RunRequest, 
 // ceased — the result still arrives when the handler actually ends.
 func (e *Executor) Cancel(ctx context.Context, req *gojobv1.CancelRequest) (*gojobv1.CancelResponse, error) {
 	e.mu.Lock()
-	cur, ok := e.running[req.GetExecutionKey()]
+	cur, ok := e.running[runKey(req.GetTenant(), req.GetExecutionKey())]
 	e.mu.Unlock()
 	if !ok {
 		return nil, status.Error(codes.NotFound, "not running here")
@@ -363,7 +376,7 @@ func (e *Executor) GetExecution(ctx context.Context, req *gojobv1.GetExecutionRe
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if cur, ok := e.running[req.GetExecutionKey()]; ok {
+	if cur, ok := e.running[runKey(req.GetTenant(), req.GetExecutionKey())]; ok {
 		return &gojobv1.GetExecutionResponse{
 			State:     gojobv1.ExecutionState_EXECUTION_STATE_RUNNING,
 			RunToken:  cur.runToken,
@@ -374,8 +387,8 @@ func (e *Executor) GetExecution(ctx context.Context, req *gojobv1.GetExecutionRe
 	// the scheduler discards an answer whose token is not the one it asked about — so
 	// answering with the most recent is correct, and answering with an arbitrary one is not.
 	var newest *finished
-	for k, f := range e.done {
-		if k[:len(k)-len(f.runToken)-1] != req.GetExecutionKey() {
+	for _, f := range e.done {
+		if f.tenant != req.GetTenant() || f.key != req.GetExecutionKey() {
 			continue
 		}
 		if newest == nil || f.at.After(newest.at) {
@@ -420,9 +433,10 @@ func (e *Executor) Connect(ctx context.Context, schedulerAddr string, dial func(
 	// resolved those, and a late result would be refused anyway.
 	for _, key := range resp.GetFenced() {
 		e.mu.Lock()
-		if cur, ok := e.running[key]; ok {
+		k := runKey(e.Tenant, key)
+		if cur, ok := e.running[k]; ok {
 			cur.cancel()
-			delete(e.running, key)
+			delete(e.running, k)
 		}
 		e.mu.Unlock()
 	}
@@ -439,8 +453,11 @@ func (e *Executor) inFlight() []*gojobv1.InFlight {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]*gojobv1.InFlight, 0, len(e.running))
-	for key, cur := range e.running {
-		out = append(out, &gojobv1.InFlight{ExecutionKey: key, RunToken: cur.runToken})
+	for _, cur := range e.running {
+		if cur.tenant != e.Tenant {
+			continue
+		}
+		out = append(out, &gojobv1.InFlight{ExecutionKey: cur.key, RunToken: cur.runToken})
 	}
 	return out
 }

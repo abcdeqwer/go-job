@@ -152,7 +152,7 @@ func (b jobBody) toDefinition() (gojob.Definition, error) {
 	if len(d.Params) > 0 {
 		// A cap, because these are copied onto every execution row and sent on every dispatch.
 		// A megabyte of parameters is a megabyte per run, for ever.
-		if len(d.Params) > 64<<10 {
+		if len(d.Params) > store.MaxParamsBytes {
 			return d, badRequest("params must be at most 64 KiB; they are copied onto every " +
 				"execution and sent on every dispatch")
 		}
@@ -179,7 +179,11 @@ func checkIdentifier(field, value string, max int) error {
 	for _, r := range value {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '.', r == '-', r == '_', r == ':':
+		// ':' is EXCLUDED, because it separates the fields of an execution key. Allowing it
+		// makes the key ambiguous: job `a:b` with request `c` and job `a` with request `b:c`
+		// both render `m:a:b:c`, and the second insert is then read as an ordinary idempotency
+		// duplicate — so the API reports acceptance while creating nothing.
+		case r == '.', r == '-', r == '_':
 		default:
 			return badRequest("%s may contain only letters, digits and . - _ :  (found %q)",
 				field, string(r))
@@ -412,9 +416,15 @@ func (a *API) triggerJob(w http.ResponseWriter, r *http.Request) error {
 		return badRequest("request_id is required so a repeated click cannot run the job twice")
 	}
 	if len(body.Params) > 0 {
+		if len(body.Params) > store.MaxParamsBytes {
+			return badRequest("params must be at most %d bytes", store.MaxParamsBytes)
+		}
 		var probe map[string]any
 		if err := json.Unmarshal(body.Params, &probe); err != nil {
 			return badRequest("params must be a JSON object")
+		}
+		if probe == nil {
+			return badRequest("params is JSON null; omit it to use the job's defaults")
 		}
 	}
 

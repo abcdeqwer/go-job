@@ -119,8 +119,8 @@ CREATE TABLE job_state (
     fence_epoch      BIGINT       NOT NULL DEFAULT 0,
 
     -- Ownership clock: written and compared with UTC_TIMESTAMP(), never against business
-    -- time and never against NOW() — see internal/store/store.go for why the session clock is
-    -- not good enough.
+    -- time and never against NOW() — see internal/store/store.go for why the session clock
+    -- is not good enough.
     lease_until      DATETIME     NULL,
     heartbeat_at     DATETIME     NULL,
 

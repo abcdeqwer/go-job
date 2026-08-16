@@ -97,9 +97,14 @@ static analysis for everything else.
 28. ownership decisions use database time only and are unaffected by a shifted business
     clock;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
-    compared against `NOW()`;
-30. admission fails when the database session time zone differs from the configured
-    `Location`;
+    compared against the database clock — including when it is wrapped, so
+    `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;
+30. admission fails when the driver would parse timestamps in a location other than the
+    configured `Location`, or when this host's UTC clock and the database's disagree by more
+    than a minute. It does NOT constrain the session time zone: ownership is written and
+    compared with `UTC_TIMESTAMP()`, business columns are values this process computes, and
+    no column carries a `CURRENT_TIMESTAMP` default, so the session clock participates in
+    nothing;
 31. a schedule edit to a job whose `next_fire_at` is far in the future takes effect within
     one drift-scan interval — tested on a weekly job re-pointed to fire within the hour —
     rather than when the stale fire instant eventually arrives;

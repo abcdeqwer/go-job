@@ -12,9 +12,13 @@ import (
 // and they are never interchangeable:
 //
 //   - business time — this interface — decides fire instants, availability and cutoffs.
-//   - ownership time — always the database's NOW() — decides lease expiry, silence
+//   - ownership time — always the database's UTC_TIMESTAMP() — decides lease expiry, silence
 //     deadlines and the runtime cap. No Go code supplies it, which is the point: it cannot
 //     be affected by a host clock, by skew between machines, or by a test shifting time.
+//     UTC_TIMESTAMP() rather than NOW(): NOW() is the SESSION's wall clock, so two instances
+//     whose sessions resolved a zone to different offsets — one pool opened before a DST
+//     transition, one after — read it an hour apart, and one sees the other's live lease as
+//     expired. UTC_TIMESTAMP() is the same instant in every session, always.
 //
 // Mixing them is the failure this separation exists to prevent. Availability written in a
 // shifted business clock and compared against database time makes every execution either
@@ -28,8 +32,9 @@ type Clock interface {
 	Now() time.Time
 
 	// Location is the business time zone. Cron expressions are evaluated in it, and every
-	// tenant's database session must agree with it — admission checks that rather than
-	// letting it surface as an eight-hour scheduling error.
+	// tenant's DSN must parse timestamps in it — admission checks that rather than letting it
+	// surface as an eight-hour scheduling error. The database SESSION zone is not constrained
+	// and does not need to be; nothing in the protocol reads the session clock.
 	Location() *time.Location
 }
 

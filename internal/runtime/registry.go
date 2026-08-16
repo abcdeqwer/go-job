@@ -433,44 +433,50 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 	r.log.Info("retiring tenant", "tenant", t.name, "reason", why,
 		"still_tracking", t.engine.Tracking())
 
-	// Stop() drops the loops, so nothing new is claimed from here on.
+	// The bound covers the WHOLE retirement, and is created first.
+	//
+	// Bounding only the wait leaves everything before it unbounded: a store call on the
+	// tenant's own context can hang, and the tenant then stays `draining` for ever with its
+	// callbacks routed and its re-admission blocked.
+	drainCtx, cancelDrain := context.WithTimeout(ctx, r.opts.DrainTimeout)
+	defer cancelDrain()
+
+	// Stop ACQUIRING work. The heartbeat keeps running, which is the point: leases of what is
+	// already in flight have to stay live through the drain, or the owner loses the right to
+	// release its own work and — with every engine for this tenant stopping — nothing is left
+	// to recover it.
+	t.engine.StopClaiming()
+
+	for t.engine.Tracking() > 0 && drainCtx.Err() == nil {
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-drainCtx.Done():
+		}
+	}
+
+	if releaseHeld {
+		// Still holding the leases, so this can act as the owner. From the DATABASE, because
+		// an exhausted unknown dispatch is held and untracked.
+		t.engine.ReleaseOwnedWork(drainCtx)
+	} else if left := t.engine.Tracking(); left > 0 {
+		r.log.Warn("shutting down with work still in flight; those leases will expire and "+
+			"another instance will recover them", "tenant", t.name, "in_flight", left)
+	}
+
+	// Only NOW does the heartbeat stop, and only now is routing removed and the pool closed.
+	// Everything above needed the store to resolve, because callbacks were the point of the
+	// drain, and needed the leases live, because the release depends on still owning them.
 	t.engine.Stop()
 
-	if t.engine.Tracking() > 0 {
-		deadline := time.Now().Add(r.opts.DrainTimeout)
-		for time.Now().Before(deadline) && t.engine.Tracking() > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-	}
-
-	// Owned rows in the DATABASE, not just tracked ones — an exhausted unknown dispatch is
-	// held and untracked, and is exactly what would otherwise be left behind.
-	left := t.engine.Tracking()
-	if releaseHeld {
-		if owned, err := t.store.OwnedByInstance(ctx, r.opts.InstanceID, 1); err == nil && len(owned) > 0 {
-			left = len(owned)
-		}
-	}
-	if left > 0 {
-		if releaseHeld {
-			// The tenant is going away from EVERY instance, so nothing will be left to recover
-			// what this one holds. Leaving it would hold the rows for ever and make the
-			// tenant's quiescence permanently false — and quiescence is exactly what a DSN
-			// cutover waits on.
-			r.log.Warn("releasing work still in flight; no scheduler will remain to recover it",
-				"tenant", t.name, "in_flight", left)
-			t.engine.ReleaseOwnedWork(ctx)
-		} else {
-			r.log.Warn("shutting down with work still in flight; those leases will expire and "+
-				"another instance will recover them", "tenant", t.name, "in_flight", left)
-		}
-	}
-
-	// Only now is routing removed and the pool closed. Everything above needed the store to
-	// still resolve, because callbacks were the point of the drain.
 	r.mu.Lock()
 	if cur, ok := r.tenants[t.name]; ok && cur == t {
 		delete(r.tenants, t.name)
+	}
+	if releaseHeld {
+		// Terminally retired: no longer "admission in progress". Leaving it in `seen` makes
+		// Lookup answer Pending, which an executor reads as UNAVAILABLE and retries for ever
+		// against a tenant that will never come back unless an operator re-enables it.
+		delete(r.seen, t.name)
 	}
 	r.mu.Unlock()
 

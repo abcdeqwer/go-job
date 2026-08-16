@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -200,7 +201,7 @@ func TestTenantRegistryRoundTrip(t *testing.T) {
 	}
 
 	const secretDSN = "gojob:hunter2@tcp(db:3306)/np_scheduler"
-	if err := ctl.AddTenant(ctx, "np", secretDSN, "uuid-1", "test"); err != nil {
+	if err := ctl.AddTenant(ctx, "np", secretDSN, "uuid-1", "test", "adding a site"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -251,19 +252,19 @@ func TestDSNChangeRequiresDisableFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.AddTenant(ctx, "np", "u:p@tcp(a:3306)/x", "uuid-1", "test"); err != nil {
+	if err := ctl.AddTenant(ctx, "np", "u:p@tcp(a:3306)/x", "uuid-1", "test", "adding a site"); err != nil {
 		t.Fatal(err)
 	}
 
-	err = ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", true)
+	err = ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", true)
 	if err == nil {
 		t.Fatal("re-pointed an ENABLED tenant; a cutover must be disable, prove, then change")
 	}
 
-	if err := ctl.SetTenantEnabled(ctx, "np", false, "test"); err != nil {
+	if err := ctl.SetTenantEnabled(ctx, "np", false, "test", "preparing a cutover"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", true); err != nil {
+	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", true); err != nil {
 		t.Fatalf("re-pointing a disabled, quiescent tenant failed: %v", err)
 	}
 
@@ -291,14 +292,14 @@ func TestSetTenantDSNRefusesWhenNotQuiescent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.AddTenant(ctx, "np", "u:p@tcp(a:3306)/x", "uuid-1", "test"); err != nil {
+	if err := ctl.AddTenant(ctx, "np", "u:p@tcp(a:3306)/x", "uuid-1", "test", "adding a site"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.SetTenantEnabled(ctx, "np", false, "test"); err != nil {
+	if err := ctl.SetTenantEnabled(ctx, "np", false, "test", "preparing a cutover"); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", false); err == nil {
+	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", false); err == nil {
 		t.Fatal("re-pointed a tenant that was not proven quiescent")
 	}
 }
@@ -324,4 +325,40 @@ func indexBytes(b []byte, s string) int {
 		}
 	}
 	return -1
+}
+
+// Admission's clock contract has to catch the two things the clock model rests on: that the
+// driver parses DATETIMEs in the business location, and that the two hosts' clocks agree.
+//
+// The check it replaced asserted the session time zone, which — once ownership moved to
+// UTC_TIMESTAMP() — constrained nothing any statement reads. This test exists so the
+// replacement is not the same shape of reassurance: it admits a correct pool and refuses a
+// pool whose driver would store business columns in a different wall clock.
+func TestAdmissionChecksTheClockContract(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	var uuid string
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT schema_uuid FROM schema_identity WHERE lock_row = 1`).Scan(&uuid); err != nil {
+		t.Fatal(err)
+	}
+
+	// The harness opens its pool with loc=UTC and runs a UTC business clock: admitted.
+	if err := control.Admit(ctx, h.db, tenantName, uuid, time.UTC); err != nil {
+		t.Fatalf("a correctly configured pool was refused: %v", err)
+	}
+
+	// Same pool, business location eight hours away. Every business column this process
+	// wrote would be a UTC wall clock while the design, the UI and every operator reading
+	// the table expect Manila — and not one round trip would fail.
+	manila := time.FixedZone("Asia/Manila", 8*60*60)
+	err := control.Admit(ctx, h.db, tenantName, uuid, manila)
+	if err == nil {
+		t.Fatal("a pool parsing timestamps in UTC was admitted for a business location eight " +
+			"hours away; business columns would silently hold the wrong wall clock")
+	}
+	if !errors.Is(err, gojob.ErrTimeZone) {
+		t.Fatalf("refusal was not reported as a time-zone error: %v", err)
+	}
 }

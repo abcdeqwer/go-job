@@ -116,9 +116,10 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 	var owned, exempt int
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
-		if !strings.HasPrefix(strings.ToUpper(norm), "UPDATE ") {
+		if verb(norm) != "UPDATE" {
 			continue
 		}
+		norm = statementBody(norm)
 		// Scoped to the two tables that carry the ownership protocol. job_executor is a
 		// registration table: it has no owner, no token and no epoch, and an executor's
 		// heartbeat is authenticated by the id it presents rather than fenced.
@@ -193,9 +194,10 @@ func TestEveryUpdateBumpsWriteSeq(t *testing.T) {
 	var checked int
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
-		if !strings.HasPrefix(strings.ToUpper(norm), "UPDATE ") {
+		if verb(norm) != "UPDATE" {
 			continue
 		}
+		norm = statementBody(norm)
 		checked++
 		// job_definition carries `version` instead, which serves the identical purpose: it is
 		// the optimistic-concurrency counter, it always changes, and an edit is refused on a
@@ -228,10 +230,11 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 	var assignments int
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
-		if !strings.HasPrefix(strings.ToUpper(norm), "UPDATE ") {
-			continue
-		}
-		for _, a := range setAssignments(norm) {
+		// Every syntax that writes a column, not just SET. An ownership clock set from a Go
+		// time in an INSERT is the same defect as one set in an UPDATE, and job_executor's
+		// registration — which writes heartbeat_at, the column that decides whether an
+		// address stays routable — is an INSERT.
+		for _, a := range assignmentsIn(norm) {
 			if !ownership[unqualified(a.column)] {
 				continue
 			}
@@ -247,9 +250,9 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 	}
 
 	// And the comparisons, by the same rule as the assignments: whatever an ownership column
-	// is measured against must derive from NOW() and nothing else. `heartbeat_at >=
-	// TIMESTAMPADD(SECOND, ?, NOW())` is how every liveness window is expressed, so the check
-	// has to understand expressions rather than match a single token.
+	// is measured against must derive from UTC_TIMESTAMP() and nothing else. `heartbeat_at >=
+	// TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` is how every liveness window is expressed, so
+	// the check has to understand expressions rather than match a single token.
 	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(lease_until|heartbeat_at|deadline_at|timeout_at)\s*(<=|>=|<|>|=)\s*`)
 	var comparisons int
 	for _, s := range sqlStatementsInPackage(t) {
@@ -308,19 +311,34 @@ func balancedExpr(s string) string {
 // Business columns must never be compared against the database clock — the mirror of the rule
 // above, and the one that fires an hour early after a zone change.
 func TestBusinessColumnsDoNotCompareAgainstNow(t *testing.T) {
-	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(available_at|scheduled_at|next_fire_at|next_poll_at|started_at|finished_at)\s*(<=|>=|<|>|=)\s*([A-Za-z0-9_?]+\(?\)?)`)
+	// The RIGHT-HAND SIDE, whole. Matching one token past the operator caught only the bare
+	// form: `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` is the same defect
+	// wearing a wrapper, and it passed.
+	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(available_at|scheduled_at|next_fire_at|next_poll_at|started_at|finished_at)\s*(?:<=|>=|<|>|=)\s*`)
+	var comparisons int
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
 		i := strings.Index(strings.ToUpper(norm), " WHERE ")
 		if i < 0 {
 			continue
 		}
-		for _, m := range cmp.FindAllStringSubmatch(norm[i:], -1) {
-			if strings.EqualFold(m[3], "NOW()") || strings.EqualFold(m[3], "UTC_TIMESTAMP()") {
-				t.Errorf("business column %s compared against the database clock; it must take "+
-					"the business clock:\n  %s", m[1], norm)
+		where := norm[i:]
+		for _, loc := range cmp.FindAllStringSubmatchIndex(where, -1) {
+			comparisons++
+			col, rhs := where[loc[2]:loc[3]], balancedExpr(where[loc[1]:])
+			u := strings.ToUpper(rhs)
+			for _, fn := range []string{"NOW()", "UTC_TIMESTAMP()", "CURRENT_TIMESTAMP", "SYSDATE()", "CURDATE()"} {
+				if strings.Contains(u, fn) {
+					t.Errorf("business column %s compared against the database clock in %q; it "+
+						"must take the business clock:\n  %s", col, rhs, norm)
+					break
+				}
 			}
 		}
+	}
+	if comparisons < 3 {
+		t.Fatalf("checked only %d business-column comparisons; the extractor is probably broken",
+			comparisons)
 	}
 }
 
@@ -362,6 +380,15 @@ func ownershipValueIsSafe(col, value string) bool {
 		// other's live lease as expired.
 		return false
 	case unqualified(v) == col: // preserved unchanged
+		return true
+	}
+
+	// `heartbeat_at = VALUES(heartbeat_at)` in an ON DUPLICATE KEY UPDATE clause is whatever
+	// the INSERT would have written, and insertAssignments audits that separately — so this
+	// defers rather than duplicating the judgement. It defers only for the SAME column;
+	// VALUES(some_other_column) is not a value this rule has inspected.
+	if args, ok := callArgs(upper, "VALUES"); ok && len(args) == 1 &&
+		unqualified(strings.TrimSpace(args[0])) == col {
 		return true
 	}
 
@@ -454,6 +481,163 @@ func setAssignments(norm string) []assignment {
 	}
 	flush(clause[last:])
 	return out
+}
+
+// statementBody strips a leading common-table-expression prefix and returns the statement the
+// CTEs feed, so `WITH stale AS (...) UPDATE job_execution ...` is audited as the UPDATE it is.
+//
+// Without this the audits below discarded any statement not beginning with the verb itself,
+// which made `WITH` the one-word bypass for the fence, write_seq and clock rules — and the
+// extractor already recognises `WITH`, so such a statement looked covered.
+func statementBody(norm string) string {
+	s := strings.TrimSpace(norm)
+	if !strings.HasPrefix(strings.ToUpper(s), "WITH ") {
+		return s
+	}
+	i, depth := len("WITH "), 0
+	for ; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				rest := strings.TrimSpace(s[i+1:])
+				if strings.HasPrefix(rest, ",") {
+					s, i = strings.TrimSpace(rest[1:]), -1
+					continue
+				}
+				return rest
+			}
+		}
+	}
+	return s
+}
+
+// verb reports the statement's effective leading keyword, after any CTE prefix.
+func verb(norm string) string {
+	body := statementBody(norm)
+	if sp := strings.IndexByte(body, ' '); sp >= 0 {
+		return strings.ToUpper(body[:sp])
+	}
+	return strings.ToUpper(body)
+}
+
+// insertAssignments pairs an INSERT's column list with the values it writes, so a column
+// assigned a Go time in a VALUES list is inspected exactly like one assigned in a SET clause.
+//
+// job_executor's registration is an INSERT, and heartbeat_at is an ownership column: an audit
+// that reads only UPDATE text would let that row's liveness clock be moved to a Go time
+// without a single check firing.
+func insertAssignments(norm string) []assignment {
+	body := statementBody(norm)
+	if !strings.HasPrefix(strings.ToUpper(body), "INSERT ") {
+		return nil
+	}
+	open := strings.IndexByte(body, '(')
+	if open < 0 {
+		return nil
+	}
+	cols := splitTopLevel(balancedList(body[open+1:]))
+
+	rest := body[open:]
+	restUpper := strings.ToUpper(rest)
+	var vals []string
+	if at := indexTopLevel(restUpper, " VALUES "); at >= 0 {
+		tail := strings.TrimSpace(rest[at+len(" VALUES "):])
+		if !strings.HasPrefix(tail, "(") {
+			return nil
+		}
+		vals = splitTopLevel(balancedList(tail[1:]))
+	} else if at := indexTopLevel(restUpper, " SELECT "); at >= 0 {
+		list := rest[at+len(" SELECT "):]
+		if from := indexTopLevel(strings.ToUpper(list), " FROM "); from >= 0 {
+			list = list[:from]
+		}
+		vals = splitTopLevel(list)
+	} else {
+		return nil
+	}
+	if len(cols) != len(vals) {
+		// Not pairable, so not auditable. Report it as an assignment that fails every rule
+		// rather than skipping it silently: an ownership write nothing can inspect is the
+		// exact thing these checks exist to prevent.
+		return []assignment{{column: "(unpairable insert)", value: "(unpairable insert)"}}
+	}
+	out := make([]assignment, 0, len(cols))
+	for i := range cols {
+		out = append(out, assignment{
+			column: strings.TrimSpace(cols[i]),
+			value:  strings.TrimSpace(vals[i]),
+		})
+	}
+	return out
+}
+
+// upsertAssignments reads an ON DUPLICATE KEY UPDATE clause.
+func upsertAssignments(norm string) []assignment {
+	body := statementBody(norm)
+	at := indexTopLevel(strings.ToUpper(body), " ON DUPLICATE KEY UPDATE ")
+	if at < 0 {
+		return nil
+	}
+	var out []assignment
+	for _, part := range splitTopLevel(body[at+len(" ON DUPLICATE KEY UPDATE "):]) {
+		if eq := strings.Index(part, "="); eq >= 0 {
+			out = append(out, assignment{
+				column: strings.TrimSpace(part[:eq]),
+				value:  strings.TrimSpace(part[eq+1:]),
+			})
+		}
+	}
+	return out
+}
+
+// assignmentsIn returns every column a statement writes, whatever syntax writes it.
+func assignmentsIn(norm string) []assignment {
+	switch verb(norm) {
+	case "UPDATE":
+		return setAssignments(norm)
+	case "INSERT", "REPLACE":
+		return append(insertAssignments(norm), upsertAssignments(norm)...)
+	}
+	return nil
+}
+
+// balancedList returns the contents of a parenthesised list whose opening paren has already
+// been consumed.
+func balancedList(s string) string {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				return s[:i]
+			}
+			depth--
+		}
+	}
+	return s
+}
+
+// indexTopLevel finds needle outside any parentheses, so a keyword inside a subquery does not
+// terminate the enclosing clause.
+func indexTopLevel(hay, needle string) int {
+	depth := 0
+	for i := 0; i < len(hay); i++ {
+		switch hay[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth == 0 && strings.HasPrefix(hay[i:], needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 // The canonical lock order is job_state then job_execution. A transaction that took them the
@@ -570,7 +754,7 @@ func packageFunctions(t *testing.T) map[string]packageFunc {
 							pf.events = append(pf.events, tableEvents(strings.Trim(q.Value, "`\""))...)
 						}
 					case *ast.Ident:
-						if sql, ok := consts[q.Name]; ok {
+						if sql, ok := constIn(consts, fd.Name.Name, q.Name); ok {
 							pf.events = append(pf.events, tableEvents(sql)...)
 						}
 					}
@@ -727,7 +911,7 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 					// variable that happens to share a name with some other function's string
 					// parameter is accepted, which is a hole shaped exactly like the one this
 					// rule exists to close.
-					_, isConst := consts[q.Name]
+					_, isConst := constIn(consts, enclosing, q.Name)
 					if !isConst && !params[enclosing+"."+q.Name] {
 						t.Errorf("%s: SQL comes from %q, which this file cannot resolve to a "+
 							"statement — the fence, clock and write_seq checks cannot see it",
@@ -747,39 +931,62 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 	}
 }
 
-// stringConsts collects every string constant, package level or function local. The extractor
-// resolves the same set, so a statement held in one is still inspected.
+// stringConsts collects every string constant, package level or function local, KEYED BY
+// SCOPE: a package-level `q` is ".q", one local to Claim is "Claim.q".
+//
+// A flat map keyed by the bare name was wrong in a way that hid itself. Nearly every local
+// statement in this package is held in a `const q`, so a flat map kept exactly one of them —
+// whichever file parsed last — and handed that statement to every function declaring one. The
+// lock-order walker then read another function's SQL and reported a clean order for a function
+// whose statements it had never seen.
 func stringConsts(pkgs map[string]*ast.Package) map[string]string {
 	out := map[string]string{}
-	collect := func(gd *ast.GenDecl) {
-		if gd.Tok != token.CONST {
-			return
-		}
-		for _, spec := range gd.Specs {
-			vs, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
+	collect := func(scope string, n ast.Node) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			gd, ok := n.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				return true
 			}
-			for i, n := range vs.Names {
-				if i < len(vs.Values) {
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vs.Names {
+					if i >= len(vs.Values) {
+						continue
+					}
 					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						out[n.Name] = strings.Trim(lit.Value, "`\"")
+						out[scope+"."+name.Name] = strings.Trim(lit.Value, "`\"")
 					}
 				}
 			}
-		}
+			return true
+		})
 	}
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				if gd, ok := n.(*ast.GenDecl); ok {
-					collect(gd)
+			for _, decl := range file.Decls {
+				if fd, ok := decl.(*ast.FuncDecl); ok {
+					if fd.Body != nil {
+						collect(fd.Name.Name, fd.Body)
+					}
+					continue
 				}
-				return true
-			})
+				collect("", decl)
+			}
 		}
 	}
 	return out
+}
+
+// constIn resolves a name the way Go does: the enclosing function first, then package scope.
+func constIn(consts map[string]string, scope, name string) (string, bool) {
+	if v, ok := consts[scope+"."+name]; ok {
+		return v, true
+	}
+	v, ok := consts["."+name]
+	return v, ok
 }
 
 // sqlParameterNames collects the names of `string` parameters, so a helper that runs a
@@ -865,39 +1072,48 @@ func TestHelperCallSitesPassLiterals(t *testing.T) {
 	var checked int
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
+			// Per function, so a name resolves in the scope it was written in.
+			for _, decl := range file.Decls {
+				fd, isFunc := decl.(*ast.FuncDecl)
+				if !isFunc || fd.Body == nil {
+					continue
 				}
-				name := ""
-				switch fn := call.Fun.(type) {
-				case *ast.Ident:
-					name = fn.Name
-				case *ast.SelectorExpr:
-					name = fn.Sel.Name
-				}
-				idx, isHelper := sqlArg[name]
-				if !isHelper || idx >= len(call.Args) {
-					return true
-				}
-				checked++
-				switch q := call.Args[idx].(type) {
-				case *ast.BasicLit:
-					if q.Kind != token.STRING {
-						t.Errorf("%s: a SQL helper was handed a non-string literal", fset.Position(q.Pos()))
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
 					}
-				case *ast.Ident:
-					if _, known := consts[q.Name]; !known {
-						t.Errorf("%s: a SQL helper was handed %q, which this file cannot resolve "+
-							"to a statement", fset.Position(q.Pos()), q.Name)
+					name := ""
+					switch fn := call.Fun.(type) {
+					case *ast.Ident:
+						name = fn.Name
+					case *ast.SelectorExpr:
+						name = fn.Sel.Name
 					}
-				default:
-					t.Errorf("%s: a SQL helper was handed a built statement; it would vanish "+
-						"from every static check in this file", fset.Position(call.Args[idx].Pos()))
-				}
-				return true
-			})
+					idx, isHelper := sqlArg[name]
+					if !isHelper || idx >= len(call.Args) {
+						return true
+					}
+					checked++
+					switch q := call.Args[idx].(type) {
+					case *ast.BasicLit:
+						if q.Kind != token.STRING {
+							t.Errorf("%s: a SQL helper was handed a non-string literal",
+								fset.Position(q.Pos()))
+						}
+					case *ast.Ident:
+						if _, known := constIn(consts, fd.Name.Name, q.Name); !known {
+							t.Errorf("%s: a SQL helper was handed %q, which this file cannot "+
+								"resolve to a statement", fset.Position(q.Pos()), q.Name)
+						}
+					default:
+						t.Errorf("%s: a SQL helper was handed a built statement; it would vanish "+
+							"from every static check in this file",
+							fset.Position(call.Args[idx].Pos()))
+					}
+					return true
+				})
+			}
 		}
 	}
 	if checked == 0 {
@@ -998,4 +1214,46 @@ func sqlStatementsInPackage(t *testing.T) []string {
 		}
 	}
 	return out
+}
+
+// The CTE stripper is the guard against a one-word bypass of the fence, write_seq and clock
+// rules. The package contains no `WITH` statement today, so nothing else exercises it — which
+// is exactly how a broken guard stays broken until the statement that needed it is written.
+func TestStatementBodySeesPastCTEs(t *testing.T) {
+	for _, c := range []struct{ in, wantVerb, wantPrefix string }{
+		{"SELECT 1 FROM job_state", "SELECT", "SELECT 1"},
+		{"WITH s AS (SELECT id FROM job_execution) UPDATE job_execution SET x = 1", "UPDATE", "UPDATE job_execution"},
+		{"WITH a AS (SELECT 1), b AS (SELECT (2)) UPDATE job_state SET y = 2", "UPDATE", "UPDATE job_state"},
+		{"WITH a AS (SELECT 1) DELETE FROM job_execution", "DELETE", "DELETE FROM"},
+	} {
+		if got := verb(c.in); got != c.wantVerb {
+			t.Errorf("verb(%q) = %q, want %q", c.in, got, c.wantVerb)
+		}
+		if got := statementBody(c.in); !strings.HasPrefix(got, c.wantPrefix) {
+			t.Errorf("statementBody(%q) = %q, want it to start %q", c.in, got, c.wantPrefix)
+		}
+	}
+}
+
+// An INSERT's VALUES list is audited as assignments, including through ON DUPLICATE KEY UPDATE.
+func TestInsertAssignmentsPairColumnsWithValues(t *testing.T) {
+	got := assignmentsIn("INSERT INTO t (a, b, c) VALUES (?, UTC_TIMESTAMP(), IF(?, 1, 2)) " +
+		"ON DUPLICATE KEY UPDATE b = VALUES(b), c = c + 1")
+	want := []assignment{
+		{"a", "?"}, {"b", "UTC_TIMESTAMP()"}, {"c", "IF(?, 1, 2)"},
+		{"b", "VALUES(b)"}, {"c", "c + 1"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d assignments, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("assignment %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	// A column list the values cannot be paired with must fail loudly rather than vanish.
+	if a := insertAssignments("INSERT INTO t (a, b) VALUES (?)"); len(a) != 1 ||
+		ownershipValueIsSafe("a", a[0].value) {
+		t.Error("an unpairable INSERT was treated as auditable")
+	}
 }

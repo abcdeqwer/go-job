@@ -902,10 +902,10 @@ Two clocks, and every column belongs to exactly one of them.
 | Clock | Columns | Source |
 | --- | --- | --- |
 | **business** | `next_fire_at`, `next_poll_at`, `scheduled_at`, `available_at`, `started_at`, `finished_at`, `created_at`, `updated_at` | the configured `Location` |
-| **ownership** | `lease_until`, `heartbeat_at`, `deadline_at`, `timeout_at` | the database's `NOW()` |
+| **ownership** | `lease_until`, `heartbeat_at`, `deadline_at`, `timeout_at` | the database's `UTC_TIMESTAMP()` |
 
 `timeout_at` is set **in the claim transaction** — alongside `dispatched_to`, before the `Run`
-call — to `NOW() + timeout_seconds`, and is **never extended within an attempt**.
+call — to `UTC_TIMESTAMP() + timeout_seconds`, and is **never extended within an attempt**.
 
 It is a **per-attempt** budget, not a per-execution one. `timeout_seconds` reads as "one run
 of this handler should not take longer than this", and that is what it means: each attempt
@@ -913,7 +913,7 @@ gets the whole of it. Sharing one cap across a job's attempts sounds tidier and 
 three attempts and a sixty-second cap, a first attempt that burns fifty-five seconds leaves
 the third with five, so the retry is a guaranteed timeout dressed up as a second chance.
 
-The claim therefore writes `COALESCE(timeout_at, NOW() + timeout_seconds)`, and exactly two
+The claim therefore writes `COALESCE(timeout_at, UTC_TIMESTAMP() + timeout_seconds)`, and exactly two
 transitions clear it: a **retry** back to `ready`, and a **recovery** back to `ready`. Both are
 new attempts. A **refusal** deliberately does not clear it — no handler started, so no new
 budget was earned, and clearing it there is how a row that keeps being refused near its cap
@@ -934,7 +934,7 @@ dispatching scheduler's memory: an execution can outlive the instance that start
 successor that inherited only a progress-extended silence deadline would have no way to know
 how much of the original cap had already elapsed — it would grant a fresh one, or none.
 `started_at` cannot serve, because it is a business-clock column and ownership logic never
-compares those against `NOW()`.
+compares those against the database clock.
 
 `deadline_at` is an **ownership** column for the same reason, because it answers an ownership
 question — has this attempt gone silent long enough to be treated as lost? Writing it from a
@@ -943,14 +943,45 @@ the moment someone fast-forwarded the clock. The wire carries a *duration*
 (`silence_deadline_seconds`), never an instant, so an executor never has to share a clock
 with anything.
 
-Ownership columns are the only ones ever compared against `NOW()`. This is not stylistic:
-if availability were written in business time and compared against database time, any
-divergence between the two — a mismatched session time zone, a deliberately shifted test
-clock — would make every execution either permanently invisible or immediately due.
+Ownership columns are the only ones ever compared against the database clock. This is not
+stylistic: if availability were written in business time and compared against database time,
+any divergence between the two — a shifted test clock, a host whose NTP has wandered — would
+make every execution either permanently invisible or immediately due.
 
-**The database session time zone must equal the configured `Location`.** Admission asserts
-this and fails closed on a mismatch, rather than discovering it as an eight-hour scheduling
-error at 2am.
+### Why `UTC_TIMESTAMP()` and not `NOW()`
+
+`NOW()` returns the **session's** wall clock. Two schedulers can therefore read it an hour
+apart while sharing one database: a pool opened before a DST transition resolved the business
+zone to one offset, a pool opened after resolved it to another, and neither reconnects. One
+instance then reads the other's live lease as already expired, recovers work that is still
+running, and the overlap this protocol exists to prevent happens — on the two nights a year
+when nobody is looking for it.
+
+`UTC_TIMESTAMP()` is the same instant in every session, under every session zone, on both
+sides of a transition. The failure mode is not mitigated, it is removed.
+
+### What admission actually checks
+
+An earlier version of this document mandated that **the database session time zone equal the
+configured `Location`**, and admission asserted it. That requirement is obsolete, and stating
+it was worse than saying nothing: it named a setting that, since ownership moved to
+`UTC_TIMESTAMP()`, no statement in the protocol reads. Ownership columns are written and
+compared with a session-independent function, business columns are written and compared as
+values this process computes and the driver renders, and no column in the schema carries a
+`CURRENT_TIMESTAMP` default. **Set the session zone to whatever you like.**
+
+What admission does check, because these are what the model rests on:
+
+1. **The DSN must parse timestamps in the business `Location`** (`parseTime=true&loc=…`).
+   Business columns are naked `DATETIME`s written as Go times and read back as Go times, so
+   the driver's `loc` *is* the wall clock they hold. A wrong `loc` corrupts no single round
+   trip — which is exactly why it survives testing — but the stored wall clock is then not
+   the one this document, the admin UI, and any operator reading the table assume.
+
+2. **This host's UTC clock and the database's must agree within a minute.** Ownership
+   instants come from the database and business instants from this process; a badly skewed
+   host materializes executions at instants bearing no relation to the leases guarding them.
+   The tolerance is deliberately loose — it is looking for a broken clock, not NTP wander.
 
 All business timestamps are truncated to whole seconds. Execution keys derive from them, so
 sub-second precision would let two callers produce two keys for one logical fire.

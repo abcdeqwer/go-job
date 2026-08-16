@@ -128,8 +128,8 @@ SET active_kind      = 'EXECUTION',
     active_owner = ?,
     active_run_token = ?,
     fence_epoch      = fence_epoch + 1,
-    lease_until      = TIMESTAMPADD(SECOND, ?, NOW()),
-    heartbeat_at     = NOW(),
+    lease_until      = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
+    heartbeat_at     = UTC_TIMESTAMP(),
     updated_at       = ?
 WHERE job_name   = ?
   AND ops_paused = 0
@@ -143,8 +143,8 @@ SET status         = 'dispatching',
     dispatched_to  = ?,        -- chosen BEFORE the send; see below
     run_token      = ?,
     fence_epoch    = ?,
-    lease_until    = TIMESTAMPADD(SECOND, ?, NOW()),
-    heartbeat_at   = NOW(),
+    lease_until    = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
+    heartbeat_at   = UTC_TIMESTAMP(),
     updated_at     = ?
 WHERE id = ?
   AND status = 'ready'
@@ -203,7 +203,7 @@ UPDATE job_execution
 SET status        = 'running',
     attempt_no    = attempt_no + 1,
     started_at    = COALESCE(started_at, ?),
-    deadline_at   = TIMESTAMPADD(SECOND, ?, NOW()),
+    deadline_at   = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
     updated_at    = ?
 WHERE id = ? AND status = 'dispatching'
   AND run_token = ? AND fence_epoch = ?;
@@ -347,17 +347,17 @@ other expired, with no rule saying which is authoritative.
 ```sql
 -- 1. state row first
 UPDATE job_state
-SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+SET lease_until = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 WHERE job_name = ?
   AND active_run_token = ? AND fence_epoch = ?;
 
 -- 2. then the execution row, same transaction
 UPDATE job_execution
-SET lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+SET lease_until = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 WHERE id = ?
   AND status IN ('dispatching', 'running', 'cancel_requested')
   AND owner_instance = ? AND run_token = ? AND fence_epoch = ?
-  AND lease_until >= NOW();
+  AND lease_until >= UTC_TIMESTAMP();
 ```
 
 The status set is deliberate. `cancel_requested` is there because a cancelled-but-not-yet-stopped
@@ -594,7 +594,7 @@ ready       --cancel or retire--> cancelled          (nothing is running)
 
 ### The runtime cap wins against a late result
 
-Every terminal and retry transition additionally guards `timeout_at >= NOW()`. Once the cap
+Every terminal and retry transition additionally guards `timeout_at >= UTC_TIMESTAMP()`. Once the cap
 has passed, the attempt is over as far as the scheduler is concerned, and a result arriving
 afterwards is refused with `ABORTED` like any other fenced write.
 

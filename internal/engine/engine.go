@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
@@ -90,15 +91,24 @@ type Engine struct {
 	healthMu  sync.Mutex
 	unhealthy map[string]time.Time
 
+	// rotation breaks ties between equally loaded executors, so a stable sort does not send
+	// every job to whichever one happened to sort first.
+	rotation atomic.Uint64
+
 	// schedules caches compiled cron expressions by expression text. Compilation is cheap but
 	// happens inside a transaction holding the job's lock, and the cache keeps that window
 	// from including a parse.
 	schedMu   sync.RWMutex
 	schedules map[string]*cron.Expression
 
-	wg   sync.WaitGroup
-	stop chan struct{}
-	once sync.Once
+	wg sync.WaitGroup
+
+	// Two signals, because retiring a tenant has to stop acquiring work before it stops
+	// holding it. See StopClaiming.
+	stopClaim chan struct{}
+	stop      chan struct{}
+	onceClaim sync.Once
+	once      sync.Once
 }
 
 // New builds an engine. It does not start any loops.
@@ -113,13 +123,18 @@ func New(cfg Config, st *store.Store, disp *dispatch.Client, clock gojob.Clock, 
 		tracked:   make(map[int64]store.Holder),
 		unhealthy: make(map[string]time.Time),
 		schedules: make(map[string]*cron.Expression),
+		stopClaim: make(chan struct{}),
 		stop:      make(chan struct{}),
 	}
 }
 
 // Start launches every loop.
+//
+// The loops are split into two groups because retirement needs them stopped at different
+// times. Everything that ACQUIRES work stops first; the heartbeat keeps running, because
+// something has to hold the leases of what is already in flight while it drains.
 func (e *Engine) Start(ctx context.Context) {
-	loops := []struct {
+	acquiring := []struct {
 		name     string
 		interval time.Duration
 		fn       func(context.Context)
@@ -127,26 +142,49 @@ func (e *Engine) Start(ctx context.Context) {
 		{"materialize", e.cfg.ScanInterval, e.materializePass},
 		{"drift", e.cfg.ScanInterval * 2, e.driftPass},
 		{"dispatch", e.cfg.ScanInterval, e.dispatchPass},
-		{"heartbeat", e.heartbeatInterval(), e.heartbeatPass},
 		{"recover", e.cfg.RecoverInterval, e.recoverPass},
+		{"reap", e.cfg.ReapInterval, e.reapPass},
+	}
+	holding := []struct {
+		name     string
+		interval time.Duration
+		fn       func(context.Context)
+	}{
+		{"heartbeat", e.heartbeatInterval(), e.heartbeatPass},
 		{"timeout", e.cfg.RecoverInterval, e.timeoutPass},
 		{"silence", e.cfg.RecoverInterval, e.silencePass},
 		{"cancel", e.cfg.RecoverInterval, e.cancelPass},
-		{"reap", e.cfg.ReapInterval, e.reapPass},
 	}
-	for _, l := range loops {
+	for _, l := range acquiring {
 		e.wg.Add(1)
-		go e.runLoop(ctx, l.name, l.interval, l.fn)
+		go e.runLoop(ctx, l.name, l.interval, e.stopClaim, l.fn)
+	}
+	for _, l := range holding {
+		e.wg.Add(1)
+		go e.runLoop(ctx, l.name, l.interval, e.stop, l.fn)
 	}
 }
 
-// Stop stops claiming and waits for the loops to finish.
+// StopClaiming stops everything that ACQUIRES work, and leaves the heartbeat running.
+//
+// This is the first step of retiring a tenant, and the ordering is what makes a drain
+// possible at all. Stopping the heartbeat first — which is what Stop() does — lets the leases
+// of in-flight work expire during the wait, and a lease with the schema's ten-second minimum
+// expires well inside any useful drain. The owner then cannot release its own work, because
+// an expired holder belongs to recovery; and every engine for that tenant is stopping, so no
+// recovery will ever come. The rows stay held for ever and quiescence never becomes true.
+func (e *Engine) StopClaiming() {
+	e.onceClaim.Do(func() { close(e.stopClaim) })
+}
+
+// Stop stops every loop, including the heartbeat, and waits for them to finish.
 //
 // It does NOT release the leases of work still in flight. If a handler has not proved it
 // stopped, its lease is left to expire rather than released: expiry is not proof a handler
 // stopped, but releasing early is a guarantee that a second executor may start while the
 // first is still writing.
 func (e *Engine) Stop() {
+	e.StopClaiming()
 	e.once.Do(func() { close(e.stop) })
 	e.wg.Wait()
 }
@@ -159,17 +197,18 @@ func (e *Engine) heartbeatInterval() time.Duration {
 
 // runLoop ticks fn, with jitter so a fleet restarted together does not synchronise into a
 // thundering herd against one state row.
-func (e *Engine) runLoop(ctx context.Context, name string, interval time.Duration, fn func(context.Context)) {
+func (e *Engine) runLoop(ctx context.Context, name string, interval time.Duration,
+	until <-chan struct{}, fn func(context.Context)) {
 	defer e.wg.Done()
 	if interval <= 0 {
 		interval = time.Second
 	}
 
-	// Stagger the first tick across the interval so seven loops in fifty instances do not all
+	// Stagger the first tick across the interval so nine loops in fifty instances do not all
 	// fire at the same millisecond.
 	select {
 	case <-time.After(jitter(interval)):
-	case <-e.stop:
+	case <-until:
 		return
 	case <-ctx.Done():
 		return
@@ -181,7 +220,7 @@ func (e *Engine) runLoop(ctx context.Context, name string, interval time.Duratio
 		select {
 		case <-ctx.Done():
 			return
-		case <-e.stop:
+		case <-until:
 			return
 		case <-t.C:
 			if err := e.fence.Check(); err != nil {
@@ -234,7 +273,7 @@ func (e *Engine) dispatchQuarantine() time.Duration {
 // lost the right to act. The fence exists precisely so an invisible owner stops writing.
 func (e *Engine) stopping() bool {
 	select {
-	case <-e.stop:
+	case <-e.stopClaim:
 		return true
 	default:
 	}
@@ -363,11 +402,27 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 	// its re-send bound deliberately stops being tracked so recovery can take it — leaving a
 	// held, `dispatching` row that no in-memory scan can see. If the tenant is then disabled,
 	// the pool closes with that row still held and nothing left to recover it.
-	owned, err := e.store.OwnedByInstance(ctx, e.cfg.InstanceID, 1000)
-	if err != nil {
-		e.log.Error("listing owned work on retirement failed", "error", err)
-		return
+	for page := 0; page < 100; page++ {
+		owned, err := e.store.OwnedByInstance(ctx, e.cfg.InstanceID, 200)
+		if err != nil {
+			e.log.Error("listing owned work on retirement failed", "error", err)
+			return
+		}
+		if len(owned) == 0 {
+			return
+		}
+		if !e.releasePage(ctx, owned) {
+			// Nothing in the page could be released — every row was contended or failing.
+			// Looping again would spin on the same rows.
+			return
+		}
 	}
+	e.log.Error("gave up releasing owned work after a hundred pages; some rows remain held")
+}
+
+// releasePage releases one page, reporting whether it made any progress.
+func (e *Engine) releasePage(ctx context.Context, owned []store.Stale) bool {
+	progress := false
 	for _, v := range owned {
 		e.requestStop(ctx, v, "the tenant was disabled")
 
@@ -383,10 +438,12 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 			}
 			continue
 		}
+		progress = true
 		e.untrack(h.ExecutionID, h.FenceEpoch)
 		e.log.Warn("ended an in-flight execution because the tenant was disabled",
 			"execution", h.ExecutionKey, "job", h.JobName, "landed", landed)
 	}
+	return progress
 }
 
 // Tracking reports how many executions this instance owns. Graceful shutdown and the

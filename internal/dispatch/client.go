@@ -402,7 +402,7 @@ var ErrContractProbe = errors.New("gojob: executor failed the contract probe")
 //
 // Registering an executor that fails this probe would put a process in the routing pool that
 // cannot be reconciled with, which is precisely the state recovery has no answer for.
-func (c *Client) Describe(ctx context.Context, address string) (*gojobv1.DescribeResponse, error) {
+func (c *Client) Describe(ctx context.Context, address, tenant string) (*gojobv1.DescribeResponse, error) {
 	cc, err := c.conn(address)
 	if err != nil {
 		return nil, err
@@ -441,8 +441,13 @@ func (c *Client) Describe(ctx context.Context, address string) (*gojobv1.Describ
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("%w: generating a probe key: %v", ErrContractProbe, err)
 	}
+	// The tenant is carried, because execution identity is tenant-scoped everywhere else and a
+	// conforming multi-tenant executor is entitled to require it. Omitting it would have such
+	// an executor answer INVALID_ARGUMENT and be refused for implementing the contract
+	// correctly.
 	_, err = gojobv1.NewJobExecutorClient(cc).GetExecution(probeCtx, &gojobv1.GetExecutionRequest{
-		ExecutionKey: "probe:" + hex.EncodeToString(nonce),
+		Tenant:       tenant,
+		ExecutionKey: "probe-" + hex.EncodeToString(nonce),
 	})
 	switch status.Code(err) {
 	case codes.NotFound:

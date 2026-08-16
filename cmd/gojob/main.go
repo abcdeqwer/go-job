@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -374,10 +375,17 @@ func defaultInstanceID() string {
 // parseTime returns DATETIME as time.Time rather than []byte, which every scan in the store
 // layer assumes.
 func withDefaults(dsn string, loc *time.Location) string {
+	// parseTime and loc, and deliberately NOT time_zone.
+	//
+	// The session zone participates in nothing: ownership columns are written and compared
+	// with UTC_TIMESTAMP(), business columns are written and compared as values this process
+	// computes, and no column carries a CURRENT_TIMESTAMP default. Pinning it was worse than
+	// pointless — the numeric offset is resolved once, at process start, so a pool that
+	// outlives a DST transition holds a session zone that no longer matches the location it
+	// was derived from.
 	add := map[string]string{
 		"parseTime": "true",
-		"loc":       loc.String(),
-		"time_zone": "'" + offsetOf(loc) + "'",
+		"loc":       url.QueryEscape(loc.String()),
 	}
 	sep := "?"
 	if strings.Contains(dsn, "?") {
@@ -396,17 +404,6 @@ func withDefaults(dsn string, loc *time.Location) string {
 		sep = "&"
 	}
 	return b.String()
-}
-
-// offsetOf renders a location as the numeric offset MySQL's time_zone accepts without the
-// timezone tables loaded — which most installations do not have.
-func offsetOf(loc *time.Location) string {
-	_, off := time.Now().In(loc).Zone()
-	sign := "+"
-	if off < 0 {
-		sign, off = "-", -off
-	}
-	return fmt.Sprintf("%s%02d:%02d", sign, off/3600, (off%3600)/60)
 }
 
 // inboundCredentials builds the executor-facing TLS configuration.

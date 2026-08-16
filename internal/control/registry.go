@@ -144,7 +144,10 @@ func (s *Store) Tenants(ctx context.Context) ([]Tenant, error) {
 }
 
 // AddTenant registers a new site.
-func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor string) error {
+func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("%w: adding a tenant needs a reason", gojob.ErrProtocol)
+	}
 	if name == "" || dsn == "" || schemaUUID == "" {
 		return fmt.Errorf("%w: a tenant needs a name, a DSN and the schema uuid it expects",
 			gojob.ErrProtocol)
@@ -163,8 +166,12 @@ func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor stri
 			name, sealed, schemaUUID, now, now); err != nil {
 			return fmt.Errorf("add tenant %q: %w", name, err)
 		}
+		// One transaction with the action. The reason is REQUIRED, so committing the action
+		// and then failing to record it leaves an audit trail that is missing exactly the
+		// entry the requirement exists for — and returns a 500 that invites a retry of an
+		// action that already happened.
 		return audit(ctx, tx, now, actor, "tenant_added", name,
-			"expects schema "+schemaUUID+"; DSN stored encrypted")
+			reason+" (expects schema "+schemaUUID+"; DSN stored encrypted)")
 	})
 }
 
@@ -173,7 +180,10 @@ func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor stri
 // The generation is what makes a DSN cutover safe: every enable and disable moves it, and
 // each instance records the generation it has applied, so "has everybody seen the disable"
 // becomes a query rather than a guess about how long to wait.
-func (s *Store) SetTenantEnabled(ctx context.Context, name string, enabled bool, actor string) error {
+func (s *Store) SetTenantEnabled(ctx context.Context, name string, enabled bool, actor, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("%w: enabling or disabling a tenant needs a reason", gojob.ErrProtocol)
+	}
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
@@ -195,7 +205,7 @@ func (s *Store) SetTenantEnabled(ctx context.Context, name string, enabled bool,
 		if enabled {
 			action = "tenant_enabled"
 		}
-		return audit(ctx, tx, now, actor, action, name, "")
+		return audit(ctx, tx, now, actor, action, name, reason)
 	})
 }
 
@@ -214,7 +224,10 @@ var ErrNotQuiesced = errors.New("gojob: tenant is not quiesced; a DSN change wou
 // instance that is partitioned from THIS database and still perfectly able to reach the
 // tenant's — which is why the caller must additionally prove quiescence by looking at the old
 // coordination schema itself, and why an instance that cannot read this registry self-fences.
-func (s *Store) SetTenantDSN(ctx context.Context, name, dsn, schemaUUID, actor string, quiescedElsewhere bool) error {
+func (s *Store) SetTenantDSN(ctx context.Context, name, dsn, schemaUUID, actor, reason string, quiescedElsewhere bool) error {
+	if reason == "" {
+		return fmt.Errorf("%w: re-pointing a tenant needs a reason", gojob.ErrProtocol)
+	}
 	if !quiescedElsewhere {
 		return fmt.Errorf("%w: %s", ErrNotQuiesced, name)
 	}
@@ -243,7 +256,7 @@ func (s *Store) SetTenantDSN(ctx context.Context, name, dsn, schemaUUID, actor s
 				ErrNotQuiesced, name)
 		}
 		return audit(ctx, tx, now, actor, "tenant_dsn_changed", name,
-			"now expects schema "+schemaUUID)
+			reason+" (now expects schema "+schemaUUID+")")
 	})
 }
 
@@ -275,6 +288,12 @@ func (s *Store) RecordAdmission(ctx context.Context, name, schemaVersion string,
 
 // Observe records what this instance has applied for a tenant.
 //
+// observed_at is written and compared with UTC_TIMESTAMP(), because this is an OWNERSHIP
+// clock: "is that instance still live" decides whether a DSN cutover may proceed. Writing it
+// from a Go clock and comparing it against the database's would make a live instance look
+// stale under host skew or across a DST offset change — and an instance wrongly judged dead is
+// omitted from the blockers, after which a cutover proceeds while it is still claiming.
+//
 // quiesced means it holds nothing for that tenant. The pair (generation, quiesced) is what a
 // DSN change is gated on, and observed_at is what makes "live" answerable — an instance that
 // stops reporting drops out of the live set, which is safe only because such an instance also
@@ -282,12 +301,12 @@ func (s *Store) RecordAdmission(ctx context.Context, name, schemaVersion string,
 func (s *Store) Observe(ctx context.Context, tenant, instanceID string, generation int64, quiesced bool) error {
 	if _, err := s.db.ExecContext(ctx, `
 		INSERT INTO tenant_observation (tenant, instance_id, generation, quiesced, observed_at)
-		VALUES (?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, UTC_TIMESTAMP())
 		ON DUPLICATE KEY UPDATE
 		    generation  = VALUES(generation),
 		    quiesced    = VALUES(quiesced),
-		    observed_at = VALUES(observed_at)`,
-		tenant, instanceID, generation, quiesced, s.clock.Now()); err != nil {
+		    observed_at = UTC_TIMESTAMP()`,
+		tenant, instanceID, generation, quiesced); err != nil {
 		return fmt.Errorf("record observation of %q by %q: %w", tenant, instanceID, err)
 	}
 	return nil
@@ -309,7 +328,7 @@ func (s *Store) Blockers(ctx context.Context, tenant string, generation int64, l
 		SELECT instance_id, generation, quiesced, observed_at
 		FROM tenant_observation
 		WHERE tenant = ?
-		  AND observed_at >= TIMESTAMPADD(SECOND, ?, NOW())
+		  AND observed_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
 		  AND NOT (generation >= ? AND quiesced = 1)
 		ORDER BY instance_id`
 
@@ -334,7 +353,7 @@ func (s *Store) Blockers(ctx context.Context, tenant string, generation int64, l
 // deployment does not accumulate a blocker list of processes that no longer exist.
 func (s *Store) ReapObservations(ctx context.Context, retention time.Duration) error {
 	if _, err := s.db.ExecContext(ctx,
-		`DELETE FROM tenant_observation WHERE observed_at < TIMESTAMPADD(SECOND, ?, NOW())`,
+		`DELETE FROM tenant_observation WHERE observed_at < TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())`,
 		-roundUpSeconds(retention)); err != nil {
 		return fmt.Errorf("reap observations: %w", err)
 	}

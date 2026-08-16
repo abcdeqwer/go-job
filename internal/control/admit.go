@@ -56,41 +56,63 @@ func Admit(ctx context.Context, db *sql.DB, tenant, expectUUID string, loc *time
 			gojob.ErrSchemaVersion, tenant, gotVersion, SchemaVersion)
 	}
 
-	return assertSessionZone(ctx, db, tenant, loc)
+	return assertClockContract(ctx, db, tenant, loc)
 }
 
-// assertSessionZone refuses a connection whose session time zone is not the business one.
+// assertClockContract checks the two things the clock model actually depends on.
 //
-// Every business column in the coordination schema is a naked DATETIME, and the protocol
-// compares those against values this process computes in `loc`. If the session zone differs,
-// the two disagree by the offset between them — and the symptom is a job firing eight hours
-// early, at 2am, months after the mistake was made. Catching it at admission costs one query.
-func assertSessionZone(ctx context.Context, db *sql.DB, tenant string, loc *time.Location) error {
-	// Compare the OFFSET, not the zone name: MySQL may be configured with a named zone, a
-	// numeric offset, or SYSTEM, and only the offset is comparable across all three.
-	var dbNow time.Time
-	if err := db.QueryRowContext(ctx, `SELECT NOW()`).Scan(&dbNow); err != nil {
-		return fmt.Errorf("%w: reading NOW() for %s: %v", gojob.ErrTimeZone, tenant, err)
+// It replaces an earlier session-time-zone assertion that no longer proves anything. Once
+// ownership moved to UTC_TIMESTAMP(), the session zone stopped participating: ownership
+// columns are written and compared with a function that returns the same instant in every
+// session, business columns are written and compared as values this process computes, and no
+// column in the schema carries a CURRENT_TIMESTAMP default. A check that constrains something
+// nothing reads is worse than no check — it reads as protection, and it fails deployments
+// over a setting that cannot cause the error it names.
+//
+// What DOES matter:
+//
+//  1. The driver must parse DATETIME columns in the business Location. Business columns are
+//     naked DATETIMEs written as Go times and read back as Go times, so the driver's `loc`
+//     IS the wall clock they hold. A DSN missing parseTime, or carrying a different loc, does
+//     not corrupt a single round trip — which is why it survives testing — but it means the
+//     stored wall clock is not the one the design, the admin UI and any operator reading the
+//     table assume.
+//
+//  2. This host's UTC clock and the database's must agree. Ownership instants come from the
+//     database and business instants from this process, so a badly skewed host materializes
+//     executions at instants that bear no relation to the leases guarding them.
+func assertClockContract(ctx context.Context, db *sql.DB, tenant string, loc *time.Location) error {
+	var dbUTC time.Time
+	if err := db.QueryRowContext(ctx, `SELECT UTC_TIMESTAMP()`).Scan(&dbUTC); err != nil {
+		// Scanning a DATETIME into time.Time is exactly what parseTime=true enables, so a
+		// scan failure here is the missing-parseTime case as much as a connection failure.
+		return fmt.Errorf("%w: reading the database clock for %s (does the DSN set parseTime=true?): %v",
+			gojob.ErrTimeZone, tenant, err)
 	}
 
-	// The driver parses a DATETIME with whatever location the connection was configured with.
-	// What matters is that the WALL CLOCK the database reports matches the wall clock this
-	// process would compute for the same instant, so compare the rendered wall time.
-	local := time.Now().In(loc)
-	skew := local.Sub(time.Date(
-		dbNow.Year(), dbNow.Month(), dbNow.Day(),
-		dbNow.Hour(), dbNow.Minute(), dbNow.Second(), 0, loc))
+	// The driver tags every parsed DATETIME with the DSN's `loc`, so the value carries the
+	// answer — no arithmetic, no tolerance, no guessing.
+	if got := dbUTC.Location().String(); got != loc.String() {
+		return fmt.Errorf("%w: %s parses timestamps in %s but the business location is %s; "+
+			"set loc=%s on this DSN",
+			gojob.ErrTimeZone, tenant, got, loc, loc)
+	}
 
+	// dbUTC was read as UTC wall clock and tagged with loc, so recover the instant by reading
+	// its wall-clock fields back as UTC rather than trusting the tag.
+	asUTC := time.Date(dbUTC.Year(), dbUTC.Month(), dbUTC.Day(),
+		dbUTC.Hour(), dbUTC.Minute(), dbUTC.Second(), 0, time.UTC)
+	skew := time.Now().UTC().Sub(asUTC)
 	if skew < 0 {
 		skew = -skew
 	}
-	// A minute of tolerance. This check is looking for a WHOLE-HOUR class of error — a session
-	// in UTC while the business runs in Asia/Manila — not for ordinary clock drift, and a tight
-	// bound here would make the scheduler refuse to start over a few seconds of NTP wander.
+	// A minute of tolerance: this looks for a broken host clock, not for NTP wander, and a
+	// tight bound would refuse to start a scheduler over a few seconds of drift.
 	if skew > time.Minute {
-		return fmt.Errorf("%w: %s reports %s but the business location %s says %s (%s apart); "+
-			"set the session time zone on this DSN",
-			gojob.ErrTimeZone, tenant, dbNow.Format("15:04:05"), loc, local.Format("15:04:05"), skew)
+		return fmt.Errorf("%w: %s's clock and this host's are %s apart (database UTC %s, host UTC %s); "+
+			"ownership instants come from the database and business instants from here",
+			gojob.ErrTimeZone, tenant, skew.Round(time.Second),
+			asUTC.Format("15:04:05"), time.Now().UTC().Format("15:04:05"))
 	}
 	return nil
 }

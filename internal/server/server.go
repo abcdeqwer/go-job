@@ -31,7 +31,7 @@ import (
 // does not import the outbound half of the contract just to call one method — and so a test
 // can register an executor without one listening.
 type Prober interface {
-	Describe(ctx context.Context, address string) (*gojobv1.DescribeResponse, error)
+	Describe(ctx context.Context, address, tenant string) (*gojobv1.DescribeResponse, error)
 }
 
 // Tenants resolves a tenant name to its coordination store.
@@ -164,7 +164,7 @@ func (s *Server) Register(ctx context.Context, req *gojobv1.RegisterRequest) (*g
 		e.Group = "default"
 	}
 
-	desc, err := s.prober.Describe(ctx, req.GetAddress())
+	desc, err := s.prober.Describe(ctx, req.GetAddress(), req.GetTenant())
 	if err != nil {
 		// A registration that cannot be probed is refused rather than accepted with a
 		// question mark. An executor in the routing pool that cannot be reconciled with is
@@ -178,13 +178,21 @@ func (s *Server) Register(ctx context.Context, req *gojobv1.RegisterRequest) (*g
 	e.Revision = desc.Revision
 	e.ContractVersion = desc.ContractVersion
 
-	if err := st.Register(ctx, e); err != nil {
-		return nil, status.Errorf(codes.Internal, "record registration: %v", err)
-	}
-
+	// Reconcile BEFORE the row exists.
+	//
+	// Registering first makes the executor routable the instant it commits, so another
+	// scheduler can dispatch to it while this call is still deciding what it may keep — and if
+	// reconciliation then fails, the executor is told its registration failed, may never start
+	// its heartbeat loop, and is nonetheless in the routing pool of every other instance.
+	//
+	// Reconciliation only reads, so doing it first costs nothing and cannot leave a half-state.
 	fenced, err := s.reconcileInFlight(ctx, st, req.GetInFlight())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "reconcile in-flight work: %v", err)
+	}
+
+	if err := st.Register(ctx, e); err != nil {
+		return nil, status.Errorf(codes.Internal, "record registration: %v", err)
 	}
 
 	s.log.Info("executor registered", "tenant", req.GetTenant(), "executor", e.ExecutorID,

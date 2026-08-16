@@ -410,6 +410,11 @@ func mergeParams(defaults, override []byte) ([]byte, error) {
 	if err := json.Unmarshal(override, &top); err != nil {
 		return nil, fmt.Errorf("%w: the override is not a JSON object", gojob.ErrProtocol)
 	}
+	// A top-level `null` unmarshals into a nil map without error, and would silently mean "no
+	// override" — which is a different request from the one that was made.
+	if top == nil {
+		return nil, fmt.Errorf("%w: the override is JSON null, not an object", gojob.ErrProtocol)
+	}
 	if base == nil {
 		base = map[string]json.RawMessage{}
 	}
@@ -420,8 +425,19 @@ func mergeParams(defaults, override []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode merged parameters: %w", err)
 	}
+	// The MERGED size is what is bounded, not each half. Two disjoint forty-kilobyte objects
+	// each pass a per-object cap and produce eighty kilobytes, copied onto the execution row
+	// and sent on every dispatch.
+	if len(out) > MaxParamsBytes {
+		return nil, fmt.Errorf("%w: the merged parameters are %d bytes; the limit is %d",
+			gojob.ErrProtocol, len(out), MaxParamsBytes)
+	}
 	return out, nil
 }
+
+// MaxParamsBytes bounds a parameter object. They are copied onto every execution row and sent
+// on every dispatch, so a megabyte here is a megabyte per run, for ever.
+const MaxParamsBytes = 64 << 10
 
 func (s *Store) executionByRequest(ctx context.Context, requestID string) (string, bool, error) {
 	var key string

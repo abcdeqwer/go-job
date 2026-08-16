@@ -277,6 +277,24 @@ func (e *Engine) pickExecutors(ctx context.Context, def gojob.Definition) ([]sto
 		}
 		return headroom(live[i]) > headroom(live[j])
 	})
+
+	// Rotate among the leaders, so equally loaded executors take turns.
+	//
+	// Sorting alone is stable, and a stable sort over equal keys preserves the previous order —
+	// which for two idle executors means the same one is chosen every single time. `running` is
+	// advisory and lags a heartbeat, so it does not break the tie on its own; nothing else
+	// would.
+	lead := 0
+	for lead < len(live) &&
+		e.dispatchHealthy(live[lead].ExecutorID) == e.dispatchHealthy(live[0].ExecutorID) &&
+		headroom(live[lead]) == headroom(live[0]) {
+		lead++
+	}
+	if lead > 1 {
+		n := int(e.rotation.Add(1)) % lead
+		rotated := append(append([]store.Executor{}, live[n:lead]...), live[:n]...)
+		live = append(rotated, live[lead:]...)
+	}
 	return live, nil
 }
 
@@ -331,6 +349,27 @@ func (e *Engine) dispatch(ctx context.Context, h store.Holder, def gojob.Definit
 	deadline := time.Now().Add(e.cfg.DispatchResendWindow)
 
 	for i, target := range targets {
+		if i > 0 {
+			// Re-read between targets, not only between re-sends. A refusal that takes nine
+			// seconds to arrive with five seconds of cap left would otherwise hand the next
+			// executor the stale five — which it starts on, while the timeout scan fences and
+			// releases the row underneath it.
+			cur, err := e.store.ExecutionByKey(ctx, h.ExecutionKey)
+			if err != nil {
+				e.log.Error("re-reading the runtime budget between targets failed",
+					"execution", h.ExecutionKey, "error", err)
+				e.releaseUndispatchable(ctx, p, h.FenceEpoch, "could not re-read the runtime budget")
+				return
+			}
+			if cur.RemainingTimeout <= 0 {
+				e.log.Warn("runtime cap elapsed while trying executors",
+					"execution", h.ExecutionKey)
+				e.releaseUndispatchable(ctx, p, h.FenceEpoch, "runtime cap elapsed")
+				return
+			}
+			remaining = cur.RemainingTimeout
+		}
+
 		spec := dispatch.RunSpec{
 			Address:      target.Address,
 			Tenant:       e.cfg.Tenant,
@@ -429,7 +468,16 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 			spec.RemainingTimeout = cur.RemainingTimeout
 		}
 
-		res := e.disp.Run(ctx, spec)
+		// The call itself is capped by the re-send deadline. A pre-send check bounds when the
+		// LAST attempt starts, not when it ends — a send beginning at 59.9s with a ten-second
+		// RPC timeout finishes near 70s, and the window said sixty.
+		callCtx := ctx
+		if until := time.Until(deadline); until > 0 {
+			var cancel context.CancelFunc
+			callCtx, cancel = context.WithTimeout(ctx, until)
+			defer cancel()
+		}
+		res := e.disp.Run(callCtx, spec)
 
 		switch res.Answer {
 		case dispatch.Accepted:
