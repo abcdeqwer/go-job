@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>go-job</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e8ee;
+    --dim: #939bab; --accent: #6ea8fe; --ok: #4ec9a5; --warn: #e0b341; --bad: #e0685f;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --line: #e2e5ea; --text: #1a1d23;
+      --dim: #5f6673; --accent: #2563eb; --ok: #157f5f; --warn: #96690a; --bad: #b3352c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { display: flex; gap: 16px; align-items: center; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  header b { letter-spacing: .5px; }
+  nav button { background: none; border: none; color: var(--dim); cursor: pointer;
+               padding: 6px 10px; font: inherit; border-radius: 6px; }
+  nav button[aria-current="true"] { color: var(--text); background: var(--bg); }
+  main { padding: 16px; }
+  select, input, textarea, button { font: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+           white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  tr:last-child td { border-bottom: none; }
+  td.wrap { white-space: normal; max-width: 420px; }
+  .tag { padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); font-size: 12px; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .dim { color: var(--dim); }
+  .err { color: var(--bad); margin: 8px 0; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+           border-radius: 10px; padding: 16px; min-width: min(560px, 92vw); }
+  dialog::backdrop { background: rgba(0,0,0,.5); }
+  label { display: block; margin: 8px 0 2px; color: var(--dim); }
+  input, textarea, select { width: 100%; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+  code { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <b>go-job</b>
+  <select id="tenant" title="tenant"></select>
+  <nav>
+    <button data-view="jobs" aria-current="true">jobs</button>
+    <button data-view="executions">executions</button>
+    <button data-view="executors">executors</button>
+    <button data-view="audit">audit</button>
+  </nav>
+  <span style="flex:1"></span>
+  <span id="who" class="dim"></span>
+  <button id="signout">sign out</button>
+</header>
+
+<main>
+  <div id="error" class="err" hidden></div>
+  <div id="controls" class="row"></div>
+  <div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
+</main>
+
+<dialog id="login">
+  <form method="dialog" id="loginForm">
+    <h3 style="margin-top:0">Sign in</h3>
+    <label>username</label><input name="username" autocomplete="username" required>
+    <label>password</label><input name="password" type="password" autocomplete="current-password" required>
+    <div class="err" id="loginErr" hidden></div>
+    <div class="row" style="margin-top:12px;justify-content:flex-end">
+      <button class="primary" value="go">sign in</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="prompt">
+  <form method="dialog" id="promptForm">
+    <h3 id="promptTitle" style="margin-top:0"></h3>
+    <p id="promptNote" class="dim"></p>
+    <label>reason (recorded in the audit log)</label>
+    <input name="reason" required>
+    <div class="row" style="margin-top:12px;justify-content:flex-end">
+      <button value="cancel">cancel</button>
+      <button class="primary" value="ok">confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="jobDlg">
+  <form method="dialog" id="jobForm">
+    <h3 id="jobTitle" style="margin-top:0">New job</h3>
+    <div class="grid2">
+      <div><label>job_name</label><input name="job_name" required></div>
+      <div><label>handler_key</label><input name="handler_key" list="handlers" required></div>
+      <div><label>schedule_kind</label>
+        <select name="schedule_kind"><option>CRON</option><option>FIXED_DELAY</option></select></div>
+      <div><label>schedule_expr</label><input name="schedule_expr" placeholder="0 0 2 * * *" required></div>
+      <div><label>executor_group</label><input name="executor_group" placeholder="any"></div>
+      <div><label>concurrency_policy</label>
+        <select name="concurrency_policy"><option>QUEUE</option><option>FORBID</option></select></div>
+      <div><label>misfire_policy</label>
+        <select name="misfire_policy"><option>FIRE_ONCE</option><option>SKIP</option></select></div>
+      <div><label>enabled</label>
+        <select name="enabled"><option value="true">true</option><option value="false">false</option></select></div>
+      <div><label>max_attempts</label><input name="max_attempts" type="number" value="3"></div>
+      <div><label>max_recoveries</label><input name="max_recoveries" type="number" value="3"></div>
+      <div><label>lease_seconds</label><input name="lease_seconds" type="number" value="60"></div>
+      <div><label>timeout_seconds</label><input name="timeout_seconds" type="number" value="900"></div>
+    </div>
+    <label>params (JSON object)</label><textarea name="params" rows="3">{}</textarea>
+    <label>description</label><input name="description">
+    <label>reason (recorded in the audit log)</label><input name="reason" required>
+    <div class="err" id="jobErr" hidden></div>
+    <div class="row" style="margin-top:12px;justify-content:flex-end">
+      <button value="cancel">cancel</button>
+      <button class="primary" value="ok">save</button>
+    </div>
+  </form>
+</dialog>
+
+<datalist id="handlers"></datalist>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = { view: "jobs", tenant: null, role: "VIEWER", detail: null };
+
+// Every mutating call carries a reason and, for triggers, a request id. The id is generated
+// per CONFIRMATION rather than per attempt, so a retry after a timeout — the case that
+// actually duplicates work — reuses it.
+async function api(method, path, body, headers) {
+  const r = await fetch(path, {
+    method,
+    headers: Object.assign({ "Content-Type": "application/json" }, headers || {}),
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (r.status === 401) { openLogin(); throw new Error("not signed in"); }
+  const text = await r.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!r.ok) throw new Error((data && data.error) || r.statusText);
+  return data;
+}
+
+function showError(e) {
+  const el = $("#error");
+  if (!e) { el.hidden = true; return; }
+  el.textContent = String(e.message || e);
+  el.hidden = false;
+}
+
+function esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function table(cols, rows) {
+  $("#head").innerHTML = "<tr>" + cols.map(c => `<th>${esc(c)}</th>`).join("") + "</tr>";
+  $("#body").innerHTML = rows.length
+    ? rows.map(r => "<tr>" + r.map(c => `<td>${c}</td>`).join("") + "</tr>").join("")
+    : `<tr><td class="dim" colspan="${cols.length}">nothing here</td></tr>`;
+}
+
+const when = s => s ? esc(s).replace("T", " ").replace(/(\+|-)\d\d:\d\d$|Z$/, "") : "<span class=dim>—</span>";
+
+function statusClass(s) {
+  if (s === "success") return "ok";
+  if (s === "dead" || s === "cancelled") return "bad";
+  if (s === "running" || s === "dispatching" || s === "cancel_requested") return "warn";
+  return "dim";
+}
+
+function ask(title, note) {
+  return new Promise(resolve => {
+    $("#promptTitle").textContent = title;
+    $("#promptNote").textContent = note || "";
+    const f = $("#promptForm");
+    f.reset();
+    const dlg = $("#prompt");
+    dlg.onclose = () => resolve(dlg.returnValue === "ok" ? f.reason.value : null);
+    dlg.showModal();
+  });
+}
+
+const operator = () => state.role === "OPERATOR";
+
+async function loadTenants() {
+  const ts = await api("GET", "/api/tenants");
+  const sel = $("#tenant");
+  sel.innerHTML = ts.map(t =>
+    `<option value="${esc(t.tenant)}" ${t.admitted ? "" : "disabled"}>${esc(t.tenant)}${t.admitted ? "" : " (not admitted)"}</option>`
+  ).join("");
+  const first = ts.find(t => t.admitted);
+  state.tenant = state.tenant || (first && first.tenant) || null;
+  if (state.tenant) sel.value = state.tenant;
+}
+
+async function render() {
+  showError(null);
+  if (!state.tenant) { table(["tenant"], []); return; }
+  const t = encodeURIComponent(state.tenant);
+  try {
+    if (state.view === "jobs") return await renderJobs(t);
+    if (state.view === "executions") return await renderExecutions(t);
+    if (state.view === "executors") return await renderExecutors(t);
+    if (state.view === "audit") return await renderAudit(t);
+  } catch (e) { showError(e); }
+}
+
+async function renderJobs(t) {
+  const [jobs, orphans, handlers] = await Promise.all([
+    api("GET", `/api/tenants/${t}/jobs`),
+    api("GET", `/api/tenants/${t}/orphans`),
+    api("GET", `/api/tenants/${t}/handlers`),
+  ]);
+  $("#handlers").innerHTML = handlers.map(h => `<option value="${esc(h)}">`).join("");
+  const orphaned = new Set(orphans.map(o => o.job_name));
+
+  $("#controls").innerHTML = operator()
+    ? `<button class="primary" id="newJob">new job</button>
+       <span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`
+    : `<span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`;
+  const nj = $("#newJob");
+  if (nj) nj.onclick = () => openJob(null);
+
+  table(
+    ["job", "handler", "schedule", "state", "next", "last ok", "actions"],
+    jobs.map(j => {
+      // An orphan is never dispatched and never marked failed — nothing was attempted — so
+      // the list is the only place it becomes visible.
+      const flags = [];
+      if (j.retired) flags.push('<span class="tag dim">retired</span>');
+      else if (!j.enabled) flags.push('<span class="tag dim">disabled</span>');
+      if (j.paused) flags.push('<span class="tag warn">paused</span>');
+      if (orphaned.has(j.job_name)) flags.push('<span class="tag bad">no executor</span>');
+      if (j.active_execution) flags.push('<span class="tag warn">running</span>');
+      if (!flags.length) flags.push('<span class="tag ok">idle</span>');
+
+      const acts = operator() ? [
+        `<button data-act="trigger" data-job="${esc(j.job_name)}">run</button>`,
+        j.paused
+          ? `<button data-act="resume" data-job="${esc(j.job_name)}">resume</button>`
+          : `<button data-act="pause" data-job="${esc(j.job_name)}">pause</button>`,
+        `<button data-act="edit" data-job="${esc(j.job_name)}">edit</button>`,
+      ].join(" ") : '<span class="dim">—</span>';
+
+      return [
+        esc(j.job_name),
+        esc(j.handler_key) + (j.executor_group ? ` <span class="dim">@${esc(j.executor_group)}</span>` : ""),
+        `<code>${esc(j.schedule_expr)}</code>`,
+        flags.join(" "),
+        when(j.next_fire_at || j.next_poll_at),
+        when(j.last_success_at),
+        acts,
+      ];
+    })
+  );
+
+  $("#body").onclick = async ev => {
+    const b = ev.target.closest("button[data-act]");
+    if (!b) return;
+    const job = b.dataset.job, act = b.dataset.act;
+    try {
+      if (act === "edit") return openJob(job);
+      if (act === "trigger") {
+        const reason = await ask(`Run ${job} now?`,
+          "A manual run is queued immediately and suspends this job's scheduled materialization until it finishes.");
+        if (!reason) return;
+        // One request id per confirmation: a resend after a timeout must not become a
+        // second run, and that is exactly the case a per-attempt id would miss.
+        const rid = crypto.randomUUID();
+        const res = await api("POST", `/api/tenants/${t}/jobs/${encodeURIComponent(job)}/trigger`,
+          { reason, request_id: rid });
+        showError(null);
+        state.view = "executions";
+        setView("executions");
+        return;
+      }
+      const reason = await ask(`${act === "pause" ? "Pause" : "Resume"} ${job}?`);
+      if (!reason) return;
+      await api("POST", `/api/tenants/${t}/jobs/${encodeURIComponent(job)}/${act}`, { reason });
+      render();
+    } catch (e) { showError(e); }
+  };
+}
+
+async function renderExecutions(t) {
+  const q = new URLSearchParams();
+  const job = $("#fJob") ? $("#fJob").value : "";
+  const st = $("#fStatus") ? $("#fStatus").value : "";
+  if (job) q.set("job", job);
+  if (st) q.set("status", st);
+  q.set("limit", "200");
+
+  const data = await api("GET", `/api/tenants/${t}/executions?` + q);
+  if (!$("#fJob")) {
+    $("#controls").innerHTML = `
+      <input id="fJob" placeholder="job name" style="width:200px" value="${esc(job)}">
+      <select id="fStatus" style="width:180px">
+        ${["", "ready", "dispatching", "running", "cancel_requested", "success", "dead", "cancelled", "skipped"]
+          .map(s => `<option value="${s}" ${s === st ? "selected" : ""}>${s || "any status"}</option>`).join("")}
+      </select>
+      <span class="dim" id="count"></span>`;
+    $("#fJob").onchange = render;
+    $("#fStatus").onchange = render;
+  }
+  $("#count").textContent = `${data.items.length} of ${data.total}`;
+
+  table(
+    ["execution", "job", "trigger", "status", "attempt", "scheduled", "finished", "detail", "actions"],
+    data.items.map(e => {
+      const acts = operator()
+        ? (e.status === "dead"
+            ? `<button data-act="retry" data-key="${esc(e.execution_key)}">retry</button>`
+            : (["running", "dispatching"].includes(e.status)
+                ? `<button data-act="cancel" data-key="${esc(e.execution_key)}">cancel</button>`
+                : '<span class="dim">—</span>'))
+        : '<span class="dim">—</span>';
+      return [
+        `<span class="dim">${esc(e.execution_key)}</span>`,
+        esc(e.job_name),
+        esc(e.trigger_type),
+        // The label, not the bare status: `cancelled` alone cannot say whether side effects
+        // were verified, which is the question that matters for jobs that move money.
+        `<span class="${statusClass(e.status)}">${esc(e.status_label)}</span>`,
+        `${e.attempt_no}/${e.max_attempts}${e.recovery_count ? ` <span class="dim">+${e.recovery_count}r</span>` : ""}`,
+        when(e.scheduled_at),
+        when(e.finished_at),
+        `<span class="dim">${esc(e.result_summary || e.error_message || "")}</span>`,
+        acts,
+      ];
+    })
+  );
+
+  $("#body").onclick = async ev => {
+    const b = ev.target.closest("button[data-act]");
+    if (!b) return;
+    const key = b.dataset.key, act = b.dataset.act;
+    try {
+      if (act === "retry") {
+        const reason = await ask("Retry this execution?",
+          "It returns to ready with one more attempt allowed.");
+        if (!reason) return;
+        await api("POST", `/api/tenants/${t}/executions/${encodeURIComponent(key)}/retry`, { reason });
+      } else {
+        const reason = await ask("Cancel this execution?",
+          "The handler is asked to stop. It keeps its slot until it confirms it stopped or its lease is fenced — cancelling does not undo work already done.");
+        if (!reason) return;
+        await api("POST", `/api/tenants/${t}/executions/${encodeURIComponent(key)}/cancel`, { reason });
+      }
+      render();
+    } catch (e) { showError(e); }
+  };
+}
+
+async function renderExecutors(t) {
+  const xs = await api("GET", `/api/tenants/${t}/executors`);
+  $("#controls").innerHTML = `<span class="dim">${xs.filter(x => x.live).length} live of ${xs.length}</span>`;
+  table(
+    ["executor", "group", "address", "state", "load", "handlers", "last heartbeat"],
+    xs.map(x => [
+      esc(x.executor_id),
+      esc(x.group),
+      `<span class="dim">${esc(x.address)}</span>`,
+      x.live ? '<span class="tag ok">live</span>' : '<span class="tag bad">stale</span>',
+      `${x.running}/${x.capacity || "?"}`,
+      `<span class="dim">${esc((x.handlers || []).join(", "))}</span>`,
+      when(x.heartbeat_at),
+    ])
+  );
+  $("#body").onclick = null;
+}
+
+async function renderAudit(t) {
+  const rows = await api("GET", `/api/tenants/${t}/audit?limit=200`);
+  $("#controls").innerHTML = `<span class="dim">most recent first</span>`;
+  table(
+    ["when", "actor", "action", "job", "execution", "reason"],
+    rows.map(a => [
+      when(a.created_at), esc(a.actor), esc(a.action),
+      esc(a.job_name), `<span class="dim">${esc(a.execution)}</span>`,
+      `<span class="dim">${esc(a.detail)}</span>`,
+    ])
+  );
+  $("#body").onclick = null;
+}
+
+function openJob(name) {
+  const f = $("#jobForm");
+  f.reset();
+  $("#jobErr").hidden = true;
+  $("#jobTitle").textContent = name ? `Edit ${name}` : "New job";
+  f.dataset.editing = name || "";
+  f.dataset.version = "";
+
+  const show = () => $("#jobDlg").showModal();
+  if (!name) { f.job_name.disabled = false; return show(); }
+
+  const t = encodeURIComponent(state.tenant);
+  api("GET", `/api/tenants/${t}/jobs/${encodeURIComponent(name)}`).then(j => {
+    for (const k of ["job_name", "handler_key", "executor_group", "schedule_kind",
+                     "schedule_expr", "concurrency_policy", "misfire_policy",
+                     "max_attempts", "max_recoveries", "lease_seconds", "timeout_seconds",
+                     "description"]) {
+      if (f[k]) f[k].value = j[k] ?? "";
+    }
+    f.enabled.value = String(!!j.enabled);
+    f.params.value = JSON.stringify(j.params ?? {}, null, 0);
+    f.job_name.disabled = true;
+    f.dataset.version = String(j.version);
+    show();
+  }).catch(showError);
+}
+
+$("#jobForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (f.returnValue === "cancel") return;
+  ev.preventDefault();
+  $("#jobErr").hidden = true;
+
+  let params;
+  try { params = JSON.parse(f.params.value || "{}"); }
+  catch { $("#jobErr").textContent = "params must be valid JSON"; $("#jobErr").hidden = false; return; }
+
+  const body = {
+    job_name: f.job_name.value, handler_key: f.handler_key.value,
+    executor_group: f.executor_group.value, schedule_kind: f.schedule_kind.value,
+    schedule_expr: f.schedule_expr.value, enabled: f.enabled.value === "true",
+    concurrency_policy: f.concurrency_policy.value, misfire_policy: f.misfire_policy.value,
+    max_attempts: +f.max_attempts.value, max_recoveries: +f.max_recoveries.value,
+    lease_seconds: +f.lease_seconds.value, timeout_seconds: +f.timeout_seconds.value,
+    params, description: f.description.value, reason: f.reason.value,
+  };
+  const t = encodeURIComponent(state.tenant);
+  try {
+    if (f.dataset.editing) {
+      // If-Match against the version read when the form opened. A stale version is a 409,
+      // never a silent overwrite of someone else's edit.
+      await api("PATCH", `/api/tenants/${t}/jobs/${encodeURIComponent(f.dataset.editing)}`,
+        body, { "If-Match": f.dataset.version });
+    } else {
+      await api("POST", `/api/tenants/${t}/jobs`, body);
+    }
+    $("#jobDlg").close();
+    render();
+  } catch (e) {
+    $("#jobErr").textContent = String(e.message || e);
+    $("#jobErr").hidden = false;
+  }
+});
+
+function openLogin() { $("#loginErr").hidden = true; $("#login").showModal(); }
+
+$("#loginForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const f = ev.target;
+  try {
+    const me = await fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: f.username.value, password: f.password.value }),
+    });
+    const data = await me.json();
+    if (!me.ok) throw new Error(data.error || "sign in failed");
+    $("#login").close();
+    boot();
+  } catch (e) {
+    $("#loginErr").textContent = String(e.message || e);
+    $("#loginErr").hidden = false;
+  }
+});
+
+$("#signout").onclick = async () => {
+  await fetch("/api/logout", { method: "POST" });
+  location.reload();
+};
+
+function setView(v) {
+  state.view = v;
+  document.querySelectorAll("nav button").forEach(b =>
+    b.setAttribute("aria-current", String(b.dataset.view === v)));
+  $("#controls").innerHTML = "";
+  render();
+}
+
+document.querySelector("nav").onclick = ev => {
+  const b = ev.target.closest("button[data-view]");
+  if (b) setView(b.dataset.view);
+};
+$("#tenant").onchange = ev => { state.tenant = ev.target.value; render(); };
+
+async function boot() {
+  try {
+    const me = await api("GET", "/api/me");
+    state.role = me.role;
+    $("#who").textContent = `${me.actor} · ${me.role}`;
+    await loadTenants();
+    setView(state.view);
+  } catch (e) {
+    if (String(e.message).includes("signed in")) return;
+    showError(e);
+  }
+}
+boot();
+setInterval(() => { if (!document.hidden && !document.querySelector("dialog[open]")) render(); }, 5000);
+</script>
+</body>
+</html>

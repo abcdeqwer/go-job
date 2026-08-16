@@ -108,6 +108,7 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 	}{
 		{"active_kind IS NULL", "", "acquisition: the job is unheld, and that IS the guard"},
 		{"status = 'ready'", "", "the row has never been dispatched, so it carries no token"},
+		{"status = 'dead'", "", "a dead row's token was cleared when it became terminal"},
 		{"status IN ('dispatching', 'running')", "status = 'cancel_requested'",
 			"operator cancel: acts against whoever holds the job, by design"},
 	}
@@ -196,9 +197,14 @@ func TestEveryUpdateBumpsWriteSeq(t *testing.T) {
 			continue
 		}
 		checked++
-		if !strings.Contains(norm, "write_seq = write_seq + 1") &&
-			!strings.Contains(norm, "js.write_seq = js.write_seq + 1") {
-			t.Errorf("UPDATE does not increment write_seq, so a no-op repeat would be "+
+		// job_definition carries `version` instead, which serves the identical purpose: it is
+		// the optimistic-concurrency counter, it always changes, and an edit is refused on a
+		// stale value rather than reported through the affected-row count.
+		hasWitness := strings.Contains(norm, "write_seq = write_seq + 1") ||
+			strings.Contains(norm, "js.write_seq = js.write_seq + 1") ||
+			strings.Contains(norm, "version = version + 1")
+		if !hasWitness {
+			t.Errorf("UPDATE has no column that always changes, so a no-op repeat would be "+
 				"indistinguishable from a failed guard:\n  %s", norm)
 		}
 	}
@@ -683,10 +689,28 @@ func TestNoConcatenatedSQL(t *testing.T) {
 	}
 }
 
+// looksLikeSQL needs both a leading keyword AND a table this schema actually has.
+//
+// The keyword alone matched error messages: `"update job %q: %w"` was being extracted as a
+// statement and then failed for having no witness column. A false positive here is worse than
+// a missed statement, because the way it gets silenced is by loosening the real checks.
 func looksLikeSQL(v string) bool {
 	head := strings.ToUpper(strings.TrimSpace(v))
+	var keyword bool
 	for _, kw := range []string{"SELECT ", "UPDATE ", "INSERT ", "DELETE "} {
 		if strings.HasPrefix(head, kw) {
+			keyword = true
+			break
+		}
+	}
+	if !keyword {
+		return false
+	}
+	for _, table := range []string{
+		"JOB_DEFINITION", "JOB_STATE", "JOB_EXECUTION", "JOB_EXECUTION_ATTEMPT",
+		"JOB_EXECUTOR", "JOB_EXECUTOR_HANDLER", "JOB_AUDIT", "SCHEMA_IDENTITY",
+	} {
+		if strings.Contains(head, table) {
 			return true
 		}
 	}
@@ -713,13 +737,8 @@ func sqlStatementsInPackage(t *testing.T) []string {
 				if !ok || lit.Kind != token.STRING {
 					return true
 				}
-				v := strings.Trim(lit.Value, "`\"")
-				head := strings.ToUpper(strings.TrimSpace(v))
-				for _, kw := range []string{"SELECT ", "UPDATE ", "INSERT ", "DELETE "} {
-					if strings.HasPrefix(head, kw) {
-						out = append(out, v)
-						break
-					}
+				if v := strings.Trim(lit.Value, "`\""); looksLikeSQL(v) {
+					out = append(out, v)
 				}
 				return true
 			})

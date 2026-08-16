@@ -1,0 +1,364 @@
+package admin
+
+import (
+	"encoding/json"
+	"net/http"
+	"time"
+
+	gojob "github.com/abcdeqwer/go-job"
+	"github.com/abcdeqwer/go-job/internal/store"
+)
+
+// jobBody is the wire shape of a job, in both directions.
+//
+// Durations are seconds rather than Go duration strings, because this is consumed by a
+// browser and by whatever curl an operator writes at 3am, and "300" needs no parser.
+type jobBody struct {
+	JobName       string          `json:"job_name"`
+	HandlerKey    string          `json:"handler_key"`
+	ExecutorGroup string          `json:"executor_group"`
+	ScheduleKind  string          `json:"schedule_kind"`
+	ScheduleExpr  string          `json:"schedule_expr"`
+	Enabled       bool            `json:"enabled"`
+	Concurrency   string          `json:"concurrency_policy"`
+	Misfire       string          `json:"misfire_policy"`
+	MaxAttempts   int             `json:"max_attempts"`
+	MaxRecoveries int             `json:"max_recoveries"`
+	LeaseSeconds  int             `json:"lease_seconds"`
+	TimeoutSecond int             `json:"timeout_seconds"`
+	Params        json.RawMessage `json:"params"`
+	Description   string          `json:"description"`
+	Reason        string          `json:"reason"`
+}
+
+// toDefinition validates a job body and fills in the defaults that are decisions.
+//
+// Defaulting here rather than in the database means an operator creating a job through the
+// API and one created through a migration get the same policy, and that the reason for each
+// default lives with the reason for every other one.
+func (b jobBody) toDefinition() (gojob.Definition, error) {
+	d := gojob.Definition{
+		JobName:       b.JobName,
+		HandlerKey:    b.HandlerKey,
+		ExecutorGroup: b.ExecutorGroup,
+		ScheduleKind:  gojob.ScheduleKind(b.ScheduleKind),
+		ScheduleExpr:  b.ScheduleExpr,
+		Enabled:       b.Enabled,
+		Concurrency:   gojob.ConcurrencyPolicy(b.Concurrency),
+		Misfire:       gojob.MisfirePolicy(b.Misfire),
+		MaxAttempts:   b.MaxAttempts,
+		MaxRecoveries: b.MaxRecoveries,
+		Lease:         time.Duration(b.LeaseSeconds) * time.Second,
+		Timeout:       time.Duration(b.TimeoutSecond) * time.Second,
+		Params:        b.Params,
+		Description:   b.Description,
+	}
+
+	if d.JobName == "" || d.HandlerKey == "" {
+		return d, badRequest("job_name and handler_key are required")
+	}
+	switch d.ScheduleKind {
+	case gojob.ScheduleCron, gojob.ScheduleFixedDelay:
+	default:
+		return d, badRequest("schedule_kind must be CRON or FIXED_DELAY")
+	}
+	if d.ScheduleExpr == "" {
+		return d, badRequest("schedule_expr is required")
+	}
+
+	if d.Concurrency == "" {
+		d.Concurrency = gojob.DefaultConcurrencyPolicy
+	}
+	if d.Misfire == "" {
+		d.Misfire = gojob.DefaultMisfirePolicy
+	}
+	switch d.Concurrency {
+	case gojob.PolicyQueue, gojob.PolicyForbid:
+	default:
+		return d, badRequest("concurrency_policy must be QUEUE or FORBID")
+	}
+	switch d.Misfire {
+	case gojob.MisfireSkip, gojob.MisfireFireOnce:
+	default:
+		return d, badRequest("misfire_policy must be SKIP or FIRE_ONCE")
+	}
+
+	if d.MaxAttempts == 0 {
+		d.MaxAttempts = 3
+	}
+	if d.MaxRecoveries == 0 {
+		d.MaxRecoveries = 3
+	}
+	if d.Lease == 0 {
+		d.Lease = 60 * time.Second
+	}
+	if d.Timeout == 0 {
+		d.Timeout = 15 * time.Minute
+	}
+
+	// The same bounds the schema's CHECK constraints hold, applied here so a bad value is a
+	// readable 400 rather than a driver error the UI shows as "something went wrong".
+	if d.MaxAttempts < 1 || d.MaxAttempts > 100 {
+		return d, badRequest("max_attempts must be between 1 and 100")
+	}
+	if d.MaxRecoveries < 1 || d.MaxRecoveries > 100 {
+		return d, badRequest("max_recoveries must be between 1 and 100")
+	}
+	if d.Lease < 10*time.Second {
+		return d, badRequest("lease_seconds must be at least 10")
+	}
+	if d.Timeout < time.Second || d.Timeout > 7*24*time.Hour {
+		return d, badRequest("timeout_seconds must be between 1 and 604800")
+	}
+	if d.ScheduleKind == gojob.ScheduleFixedDelay {
+		if _, err := d.Delay(); err != nil {
+			return d, badRequest("%v", err)
+		}
+	}
+	if len(d.Params) > 0 {
+		var probe map[string]any
+		if err := json.Unmarshal(d.Params, &probe); err != nil {
+			return d, badRequest("params must be a JSON object")
+		}
+	}
+	return d, nil
+}
+
+func jobJSON(v store.JobView) map[string]any {
+	return map[string]any{
+		"job_name":           v.JobName,
+		"handler_key":        v.HandlerKey,
+		"executor_group":     v.ExecutorGroup,
+		"schedule_kind":      v.ScheduleKind,
+		"schedule_expr":      v.ScheduleExpr,
+		"enabled":            v.Enabled,
+		"retired":            v.Retired,
+		"paused":             v.OpsPaused,
+		"concurrency_policy": v.Concurrency,
+		"misfire_policy":     v.Misfire,
+		"max_attempts":       v.MaxAttempts,
+		"max_recoveries":     v.MaxRecoveries,
+		"lease_seconds":      int(v.Lease / time.Second),
+		"timeout_seconds":    int(v.Timeout / time.Second),
+		"params":             rawOrNull(v.Params),
+		"description":        v.Description,
+		"version":            v.Version,
+		"updated_by":         v.UpdatedBy,
+		"next_fire_at":       nullTime(v.NextFireAt),
+		"next_poll_at":       nullTime(v.NextPollAt),
+		"active_execution":   v.ActiveExec,
+		"active_owner":       v.ActiveOwner,
+		"last_success_at":    nullTime(v.LastSuccessAt),
+		"last_failure_at":    nullTime(v.LastFailureAt),
+		"config_version":     v.ConfigVersion,
+	}
+}
+
+func rawOrNull(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return json.RawMessage(b)
+}
+
+func (a *API) listJobs(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	jobs, err := st.Jobs(r.Context())
+	if err != nil {
+		return err
+	}
+	out := make([]map[string]any, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, jobJSON(j))
+	}
+	writeJSON(w, http.StatusOK, out)
+	return nil
+}
+
+func (a *API) getJob(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	j, err := st.Job(r.Context(), r.PathValue("name"))
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, jobJSON(j))
+	return nil
+}
+
+// createJob is how jobs come into existence — there is no other way.
+//
+// The scheduler holds no handler code, so creating a job means naming a handler_key plus a
+// schedule, parameters and policy. An unrecognised handler is ACCEPTED: a handler whose
+// executor is down or not yet deployed must still be nameable, or a job could never be created
+// before its executor ships. It shows as an orphan until an executor declares it.
+func (a *API) createJob(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	var body jobBody
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	def, err := body.toDefinition()
+	if err != nil {
+		return err
+	}
+	next, err := parseCron(def.ScheduleKind, def.ScheduleExpr, a.cfg.Clock.Now())
+	if err != nil {
+		return err
+	}
+	if err := st.CreateJob(r.Context(), def, next, ActorFrom(r.Context())); err != nil {
+		return err
+	}
+
+	j, err := st.Job(r.Context(), def.JobName)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusCreated, jobJSON(j))
+	return nil
+}
+
+// patchJob edits a job under If-Match against its version.
+//
+// A stale version is a 409, never a silent overwrite: two operators editing from two tabs is
+// ordinary, and the loser discovering five minutes later that their change vanished is not.
+func (a *API) patchJob(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	name := r.PathValue("name")
+
+	ifMatch := r.Header.Get("If-Match")
+	if ifMatch == "" {
+		return badRequest("If-Match with the job's current version is required")
+	}
+	version := int64(atoiDefault(ifMatch, -1))
+	if version < 0 {
+		return badRequest("If-Match must be the job's version number")
+	}
+
+	var body jobBody
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	body.JobName = name
+	def, err := body.toDefinition()
+	if err != nil {
+		return err
+	}
+	if _, err := parseCron(def.ScheduleKind, def.ScheduleExpr, a.cfg.Clock.Now()); err != nil {
+		return err
+	}
+
+	if err := st.UpdateJob(r.Context(), def, version, ActorFrom(r.Context()), body.Reason); err != nil {
+		return err
+	}
+	// next_fire_at is NOT recomputed here. The version bump makes the row drifted, and the
+	// drift scan recomputes it inside the same locked transaction shape materialization uses —
+	// so there is one recomputation path rather than two that can disagree.
+	j, err := st.Job(r.Context(), name)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, jobJSON(j))
+	return nil
+}
+
+func (a *API) pauseJob(w http.ResponseWriter, r *http.Request) error { return a.setPaused(w, r, true) }
+func (a *API) resumeJob(w http.ResponseWriter, r *http.Request) error {
+	return a.setPaused(w, r, false)
+}
+
+func (a *API) setPaused(w http.ResponseWriter, r *http.Request, paused bool) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	var body action
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	if err := st.SetPaused(r.Context(), r.PathValue("name"), paused,
+		ActorFrom(r.Context()), body.Reason); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"paused": paused})
+	return nil
+}
+
+func (a *API) retireJob(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	var body action
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	if err := st.Retire(r.Context(), r.PathValue("name"), ActorFrom(r.Context()), body.Reason); err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"retired": true})
+	return nil
+}
+
+// triggerJob queues a manual run, idempotently on request_id.
+//
+// The request_id is required rather than generated server-side, because the repeat this
+// guards against is the CLIENT repeating — a double-clicked button, or a retry after a
+// timeout — and a server-generated id is different on every one of those.
+func (a *API) triggerJob(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	var body struct {
+		Reason    string          `json:"reason"`
+		RequestID string          `json:"request_id"`
+		Params    json.RawMessage `json:"params"`
+	}
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	if body.RequestID == "" {
+		return badRequest("request_id is required so a repeated click cannot run the job twice")
+	}
+	if len(body.Params) > 0 {
+		var probe map[string]any
+		if err := json.Unmarshal(body.Params, &probe); err != nil {
+			return badRequest("params must be a JSON object")
+		}
+	}
+
+	key, err := st.Trigger(r.Context(), r.PathValue("name"), body.RequestID,
+		ActorFrom(r.Context()), body.Reason, body.Params)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"execution_key": key})
+	return nil
+}
