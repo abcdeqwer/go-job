@@ -76,7 +76,7 @@ type Engine struct {
 	// missing from it costs a recovery cycle, an entry wrongly present is fenced on its next
 	// renewal.
 	mu      sync.Mutex
-	tracked map[int64]store.Holder
+	tracked map[int64]held
 
 	// unhealthy records executors whose dispatch path stopped answering, with the instant they
 	// may be tried again.
@@ -120,7 +120,7 @@ func New(cfg Config, st *store.Store, disp *dispatch.Client, clock gojob.Clock, 
 		clock:     clock,
 		fence:     fence,
 		log:       log.With("tenant", cfg.Tenant, "instance", cfg.InstanceID),
-		tracked:   make(map[int64]store.Holder),
+		tracked:   make(map[int64]held),
 		unhealthy: make(map[string]time.Time),
 		schedules: make(map[string]*cron.Expression),
 		stopClaim: make(chan struct{}),
@@ -351,11 +351,72 @@ func (e *Engine) compile(def gojob.Definition) (store.Schedule, error) {
 	return parsed, nil
 }
 
+// defaultLease is what a job whose definition carries no lease is renewed and gated under.
+//
+// One constant for both, because they are two halves of one rule: the heartbeat renews under
+// it and the dispatch gate measures against it, and if they disagreed the gate would either
+// refuse work whose lease is being renewed normally, or wave through a claim whose lease has
+// already lapsed.
+const defaultLease = 30 * time.Second
+
+// held is a tracked execution together with the last instant this instance PROVED it owned
+// the execution — the claim, or the most recent successful renewal.
+//
+// The instant is read from time.Now() and only ever used through time.Since, so it carries
+// Go's monotonic reading and measures elapsed time even if the host's wall clock steps. It is
+// deliberately not the business Clock: that clock is truncated, which strips the monotonic
+// reading, and a backward step would then make an old proof look fresh.
+type held struct {
+	h         store.Holder
+	confirmed time.Time
+}
+
 // track and untrack maintain the heartbeat set.
 func (e *Engine) track(h store.Holder) {
 	e.mu.Lock()
-	e.tracked[h.ExecutionID] = h
+	e.tracked[h.ExecutionID] = held{h: h, confirmed: time.Now()}
 	e.mu.Unlock()
+}
+
+// confirmHold records that ownership was just proved again.
+func (e *Engine) confirmHold(id int64, epoch int64) {
+	e.mu.Lock()
+	if cur, ok := e.tracked[id]; ok && cur.h.FenceEpoch == epoch {
+		cur.confirmed = time.Now()
+		e.tracked[id] = cur
+	}
+	e.mu.Unlock()
+}
+
+// holdIsFresh reports whether this instance's proof of ownership is recent enough to act on
+// IRREVERSIBLY — which, in this system, means handing the work to an executor.
+//
+// Every database write is fenced, so a stale instance cannot corrupt state. `Run` is the one
+// thing fencing cannot undo: a process frozen past its lease (a stop-the-world pause, a
+// suspended VM, a host migration) resumes holding a claim another instance has already
+// recovered and re-dispatched, and its Run call starts a second handler for work that is
+// already running. The subsequent Accept is correctly refused — far too late, because the
+// handler is running by then.
+//
+// So the send is gated on elapsed local time since ownership was last proved. Four fifths of
+// the lease, not all of it: the database's lease started slightly BEFORE this instance learned
+// it had one, and a send is not instantaneous. In healthy operation this is never close — the
+// heartbeat renews several times per lease — so the margin costs nothing and only bites in
+// the case it exists for.
+func (e *Engine) holdIsFresh(id int64, epoch int64, lease time.Duration) bool {
+	if lease <= 0 {
+		// Same fallback the renewal uses, and it must be the same: a gate stricter than the
+		// lease it is gating would refuse every dispatch for a job whose definition carries no
+		// lease, which is a stop, not a safety measure.
+		lease = defaultLease
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur, ok := e.tracked[id]
+	if !ok || cur.h.FenceEpoch != epoch {
+		return false
+	}
+	return time.Since(cur.confirmed) < lease-lease/5
 }
 
 // untrack stops renewing an execution, but ONLY if the holder currently tracked is the one
@@ -367,7 +428,7 @@ func (e *Engine) track(h store.Holder) {
 // being renewed and fall into recovery again while its executor is still running.
 func (e *Engine) untrack(id int64, epoch int64) {
 	e.mu.Lock()
-	if cur, ok := e.tracked[id]; ok && cur.FenceEpoch == epoch {
+	if cur, ok := e.tracked[id]; ok && cur.h.FenceEpoch == epoch {
 		delete(e.tracked, id)
 	}
 	e.mu.Unlock()
@@ -377,8 +438,8 @@ func (e *Engine) holders() []store.Holder {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]store.Holder, 0, len(e.tracked))
-	for _, h := range e.tracked {
-		out = append(out, h)
+	for _, t := range e.tracked {
+		out = append(out, t.h)
 	}
 	return out
 }

@@ -417,6 +417,16 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	return nil
 }
 
+// releaseContext bounds the release of held work, independently of the drain that preceded it.
+//
+// Separate, and detached, for one reason: the release matters MOST in the case where the drain
+// ran out of time. Deriving it from the drain's context meant that whenever the drain timed
+// out — the only case where anything is still held — the release began already cancelled and
+// failed on its first statement.
+func (r *Registry) releaseContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), r.opts.DrainTimeout)
+}
+
 // retire stops claiming, waits a bounded time for in-flight work, then closes the pool.
 //
 // The drain is bounded rather than absent OR unlimited. Closing immediately leaves running
@@ -457,7 +467,21 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 	if releaseHeld {
 		// Still holding the leases, so this can act as the owner. From the DATABASE, because
 		// an exhausted unknown dispatch is held and untracked.
-		t.engine.ReleaseOwnedWork(drainCtx)
+		//
+		// Its OWN bound, not the drain's. Passing drainCtx here meant the release was skipped
+		// in exactly the case it exists for: the loop above exits either because the tenant
+		// went quiet — in which case there is little to release — or because the bound
+		// elapsed, and in that second case drainCtx is already cancelled, so every query the
+		// release makes fails on its first statement. Every replica retires a disabled tenant,
+		// so nothing is left to recover what stayed held: job_state.active_kind stays set, the
+		// schema never becomes quiescent, and the DSN cutover that quiescence gates can never
+		// proceed.
+		//
+		// Detached from ctx as well, for the same reason at process scope: a shutdown that
+		// cancelled ctx would otherwise cancel the release it just decided to make.
+		releaseCtx, cancelRelease := r.releaseContext(ctx)
+		t.engine.ReleaseOwnedWork(releaseCtx)
+		cancelRelease()
 	} else if left := t.engine.Tracking(); left > 0 {
 		r.log.Warn("shutting down with work still in flight; those leases will expire and "+
 			"another instance will recover them", "tenant", t.name, "in_flight", left)

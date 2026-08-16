@@ -96,6 +96,11 @@ static analysis for everything else.
 
 28. ownership decisions use database time only and are unaffected by a shifted business
     clock;
+28a. a claim is not dispatched on once its lease may have elapsed, measured in MONOTONIC time
+    since ownership was last proved — a frozen process must not hand an executor work another
+    instance has already recovered, which is the one failure fencing cannot undo;
+28b. the control-plane fence expires on elapsed monotonic time, so a backward host-clock step
+    cannot make an old registry read look fresh and let a written-off instance keep claiming;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

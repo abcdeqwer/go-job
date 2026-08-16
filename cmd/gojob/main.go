@@ -190,7 +190,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	fence := control.NewFence(clock, c.stalenessLimit)
+	fence := control.NewFence(c.stalenessLimit)
 
 	outbound, err := outboundCredentials(c)
 	if err != nil {

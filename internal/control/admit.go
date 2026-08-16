@@ -129,23 +129,32 @@ func assertClockContract(ctx context.Context, db *sql.DB, tenant string, loc *ti
 // still reach the tenant database and recover them. What renewal would preserve is precisely
 // the thing being ruled out — an owner nobody can see, still holding work, while the API
 // concludes it is gone and lets a DSN cutover proceed.
+// The instants here come from time.Now() and are only ever read through time.Since, so they
+// carry Go's monotonic reading and measure elapsed time regardless of what the wall clock
+// does. They deliberately do NOT come from gojob.Clock: that is business time, it is truncated
+// to whole seconds — which strips the monotonic reading — and it can legitimately be shifted.
+// A backward wall-clock step would then make an arbitrarily old registry read look fresh, and
+// this instance would keep claiming and renewing after the control plane had written it off,
+// which is the exact state a DSN cutover assumes cannot exist.
 type Fence struct {
 	limit time.Duration
-	clock gojob.Clock
 
 	mu       sync.RWMutex
 	lastRead time.Time
 }
 
 // NewFence starts fenced: an instance has not read the registry until it has.
-func NewFence(clock gojob.Clock, limit time.Duration) *Fence {
-	return &Fence{limit: limit, clock: clock}
+//
+// It takes no Clock. The staleness of a registry read is a liveness question and it is
+// answered in monotonic time — see the type comment.
+func NewFence(limit time.Duration) *Fence {
+	return &Fence{limit: limit}
 }
 
 // Refresh records a successful registry read.
 func (f *Fence) Refresh() {
 	f.mu.Lock()
-	f.lastRead = f.clock.Now()
+	f.lastRead = time.Now()
 	f.mu.Unlock()
 }
 
@@ -158,7 +167,7 @@ func (f *Fence) Check() error {
 	if last.IsZero() {
 		return fmt.Errorf("%w: the registry has never been read", gojob.ErrControlStale)
 	}
-	if age := f.clock.Now().Sub(last); age > f.limit {
+	if age := time.Since(last); age > f.limit {
 		return fmt.Errorf("%w: last registry read was %s ago, limit is %s",
 			gojob.ErrControlStale, age.Truncate(time.Second), f.limit)
 	}

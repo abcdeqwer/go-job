@@ -45,8 +45,7 @@ func TestMaskedDSNNeverLeaksThePassword(t *testing.T) {
 // would let a process that cannot reach the control database begin claiming immediately,
 // which is the exact window a DSN cutover has to rule out.
 func TestFenceStartsFenced(t *testing.T) {
-	clock := gojob.NewFixedClock(time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC), time.UTC)
-	f := NewFence(clock, 30*time.Second)
+	f := NewFence(30 * time.Second)
 
 	if f.Healthy() {
 		t.Fatal("a fence that has never been refreshed reports healthy")
@@ -56,26 +55,24 @@ func TestFenceStartsFenced(t *testing.T) {
 	}
 }
 
+// The fence expires on ELAPSED time and recovers on a refresh.
+//
+// Real durations, deliberately short. The staleness of a registry read is a liveness
+// question, so it is answered in monotonic time — which means it cannot be driven by a
+// fakeable clock, and a test that drove one would be exercising something the fence no longer
+// consults.
 func TestFenceExpiresAndRecovers(t *testing.T) {
-	start := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-	clock := gojob.NewFixedClock(start, time.UTC)
-	f := NewFence(clock, 30*time.Second)
+	const limit = 40 * time.Millisecond
+	f := NewFence(limit)
 
 	f.Refresh()
 	if err := f.Check(); err != nil {
 		t.Fatalf("immediately after a refresh: %v", err)
 	}
 
-	// Inside the limit.
-	clock.Set(start.Add(29 * time.Second))
-	if err := f.Check(); err != nil {
-		t.Fatalf("29s after a refresh with a 30s limit: %v", err)
-	}
-
-	// Past it.
-	clock.Set(start.Add(31 * time.Second))
+	time.Sleep(3 * limit)
 	if err := f.Check(); !errors.Is(err, gojob.ErrControlStale) {
-		t.Fatalf("31s after a refresh with a 30s limit: %v, want ErrControlStale", err)
+		t.Fatalf("%s after a refresh with a %s limit: %v, want ErrControlStale", 3*limit, limit, err)
 	}
 	if f.Healthy() {
 		t.Fatal("a stale fence reports healthy; readiness must drop so callbacks stop arriving")
@@ -85,5 +82,28 @@ func TestFenceExpiresAndRecovers(t *testing.T) {
 	f.Refresh()
 	if err := f.Check(); err != nil {
 		t.Fatalf("after the registry became readable again: %v", err)
+	}
+}
+
+// A backward step in business time must not un-expire the fence.
+//
+// This is the failure the monotonic reading exists to prevent. An instance that loses the
+// control database while its host clock steps backward would, measured on the wall clock, see
+// a small or even negative age and keep claiming and renewing past the staleness limit —
+// while the control plane, whose observation of it has expired, concludes it is gone and lets
+// a DSN cutover proceed. The old schema and the new one then dispatch the same job.
+func TestFenceIgnoresBusinessClockSteps(t *testing.T) {
+	const limit = 40 * time.Millisecond
+	clock := gojob.NewFixedClock(time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC), time.UTC)
+
+	f := NewFence(limit)
+	f.Refresh()
+
+	// The business clock jumps an hour backward, exactly as a corrected host clock would.
+	clock.Set(clock.Now().Add(-time.Hour))
+
+	time.Sleep(3 * limit)
+	if err := f.Check(); !errors.Is(err, gojob.ErrControlStale) {
+		t.Fatalf("the fence did not expire after a backward business-clock step: %v", err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
+	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
 	"github.com/abcdeqwer/go-job/internal/store"
 )
 
@@ -473,5 +474,95 @@ func TestResultRedeliveryIsIdempotent(t *testing.T) {
 	}
 	if got.Outcome != gojob.AttemptSuccess {
 		t.Fatalf("outcome = %q, want success", got.Outcome)
+	}
+}
+
+// An adopted attempt keeps working: its progress is accepted and its result is recorded.
+//
+// Adoption is the handover that keeps a running handler alive when its scheduler dies. The
+// successor finds an expired lease, asks the executor, is told the attempt is still running,
+// and takes ownership — bumping fence_epoch on both rows while leaving run_token alone,
+// because it is the same attempt under new management. The executor is not told any of this
+// and goes on reporting under the token it was dispatched with, so those callbacks have to
+// keep working end to end against the adopted row.
+//
+// This is the sequential case: the adoption has fully landed before the callback arrives. The
+// INTERLEAVED case — an adoption between a callback's read and its write — cannot be produced
+// from out here, because by the time this test could bump the epoch the server would read the
+// new one. That one is pinned in TestRetryPastAdoption, which reproduces it from inside the
+// write.
+func TestAdoptionDoesNotFenceTheAttemptItAdopted(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	release := make(chan struct{})
+	h.exec.Handle("test.handler", func(hctx context.Context, p map[string]any) (string, error) {
+		<-release
+		return "done", nil
+	})
+	h.exec.Sent = nil
+	h.connect()
+
+	h.createJob(cronJob("adopted", "0 0 0 1 1 *"), h.clock.Now().Add(24*time.Hour))
+	key, err := h.store.Trigger(ctx, "adopted", "req-adopt", "test", "because", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.engine.Start(ctx)
+	defer func() { close(release); h.engine.Stop() }()
+
+	eventually(t, "the execution to be running", 25*time.Second, func() bool {
+		row, err := h.store.ExecutionByKey(ctx, key)
+		return err == nil && row.Status == gojob.StatusRunning
+	})
+
+	row, err := h.store.ExecutionByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly what Adopt writes, on BOTH rows it takes: the epoch moves, the token does not,
+	// the owner changes. Applied directly so the race is deterministic rather than dependent
+	// on a lease expiring at the right moment.
+	for _, q := range []string{
+		`UPDATE job_state SET write_seq = write_seq + 1, fence_epoch = fence_epoch + 1,
+		     active_owner = 'another-instance' WHERE job_name = ?`,
+		`UPDATE job_execution SET write_seq = write_seq + 1, fence_epoch = fence_epoch + 1,
+		     owner_instance = 'another-instance' WHERE job_name = ?`,
+	} {
+		if _, err := h.db.ExecContext(ctx, q, "adopted"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The executor's progress report, carrying the token it was dispatched with — which is
+	// still the token on the row.
+	resp, err := h.sched.ReportProgress(ctx, &gojobv1.ReportProgressRequest{
+		Tenant: tenantName, ExecutionKey: key, RunToken: row.RunToken,
+	})
+	if err != nil {
+		t.Fatalf("progress after adoption returned an error: %v", err)
+	}
+	if !resp.GetProceed() {
+		t.Fatal("a healthy handler was told to stop because its execution had just been " +
+			"adopted; adoption exists to keep exactly this handler running")
+	}
+
+	// And a result carrying the same token must be recorded, not aborted.
+	if _, err := h.sched.ReportResult(ctx, &gojobv1.ReportResultRequest{
+		Tenant: tenantName, ExecutionKey: key, RunToken: row.RunToken,
+		Outcome: &gojobv1.ExecutionOutcome{
+			Disposition: gojobv1.Disposition_DISPOSITION_SUCCESS,
+			Summary:     "done",
+		},
+	}); err != nil {
+		t.Fatalf("a result from the adopted attempt was refused: %v", err)
+	}
+	after, err := h.store.ExecutionByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != gojob.StatusSuccess {
+		t.Fatalf("execution is %q after a successful result, want success", after.Status)
 	}
 }

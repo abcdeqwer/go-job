@@ -300,7 +300,10 @@ func (s *Server) ReportProgress(ctx context.Context, req *gojobv1.ReportProgress
 		RunToken:     req.GetRunToken(),
 		FenceEpoch:   row.FenceEpoch,
 	}
-	if err := st.ExtendDeadline(ctx, h, roundUpSeconds(s.cfg.SilenceDeadline)); err != nil {
+	extend := func(h store.Holder) error {
+		return st.ExtendDeadline(ctx, h, roundUpSeconds(s.cfg.SilenceDeadline))
+	}
+	if err := s.retryPastAdoption(ctx, st, h, extend); err != nil {
 		if errors.Is(err, gojob.ErrFenced) {
 			// Not an RPC failure: the executor asked a reasonable question and the answer is
 			// "stop". Returning an error would leave it retrying a call whose answer will not
@@ -370,13 +373,62 @@ func (s *Server) ReportResult(ctx context.Context, req *gojobv1.ReportResultRequ
 		RunToken:     row.RunToken,
 		FenceEpoch:   row.FenceEpoch,
 	}
-	if err := outcome.Apply(ctx, st, h, req.GetOutcome(), row.DispatchedTo, s.backoffSeconds()); err != nil {
+	apply := func(h store.Holder) error {
+		return outcome.Apply(ctx, st, h, req.GetOutcome(), row.DispatchedTo, s.backoffSeconds())
+	}
+	if err := s.retryPastAdoption(ctx, st, h, apply); err != nil {
 		if errors.Is(err, gojob.ErrFenced) {
 			return nil, status.Error(codes.Aborted, "this attempt has been fenced")
 		}
 		return nil, status.Errorf(codes.Internal, "record result: %v", err)
 	}
 	return &gojobv1.ReportResultResponse{}, nil
+}
+
+// executionReader is the one thing retryPastAdoption needs from a store: the current row.
+//
+// Narrow on purpose. The rule it implements is a decision about a race between two writes,
+// and a race is worth a test that reproduces it deterministically rather than one that runs
+// the pieces in a fixed order and reports the race as covered.
+type executionReader interface {
+	ExecutionByKey(ctx context.Context, key string) (store.Stale, error)
+}
+
+// retryPastAdoption runs a fenced write once more when the fence was RECOVERY ADOPTING THIS
+// VERY ATTEMPT, rather than anything superseding it.
+//
+// Both callbacks read the execution row and then write against the epoch they read. Between
+// those two statements, recovery can adopt the execution: it finds an expired lease, asks the
+// executor, is told the attempt is still running, and takes ownership — bumping fence_epoch
+// while leaving run_token untouched, because it is the SAME attempt under new management.
+// That is the handover working exactly as designed.
+//
+// Read naively, the write then affects zero rows and the executor is told to stop. So a
+// handover — the mechanism whose entire purpose is to keep a running handler alive across the
+// loss of its scheduler — would kill the handler it just rescued, and a result arriving in
+// that window would be answered ABORTED and discarded.
+//
+// The distinguishing question is whether the RUN TOKEN still matches. A token names one
+// attempt and is minted per dispatch, so a token that is still on the row means this caller is
+// still the current attempt and the epoch change was a change of owner, not of attempt. Once,
+// not in a loop: a second adoption inside one callback is not a case worth serving, and a
+// retry loop against a row being repeatedly fenced is how a callback becomes a hot spin.
+func (s *Server) retryPastAdoption(ctx context.Context, st executionReader, h store.Holder,
+	write func(store.Holder) error) error {
+
+	err := write(h)
+	if !errors.Is(err, gojob.ErrFenced) {
+		return err
+	}
+	row, readErr := st.ExecutionByKey(ctx, h.ExecutionKey)
+	if readErr != nil || row.RunToken != h.RunToken || row.FenceEpoch == h.FenceEpoch {
+		// Genuinely fenced: a different attempt owns the row, the row is gone, or the epoch
+		// did not move and the refusal was about something else — a terminal status, or an
+		// elapsed runtime cap.
+		return err
+	}
+	h.FenceEpoch = row.FenceEpoch
+	return write(h)
 }
 
 func roundUpSeconds(d time.Duration) int {

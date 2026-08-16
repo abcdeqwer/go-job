@@ -209,6 +209,26 @@ WHERE id = ? AND status = 'dispatching'
   AND run_token = ? AND fence_epoch = ?;
 ```
 
+### A claim is only dispatchable while its lease is provably live
+
+Fencing makes every stale WRITE harmless. `Run` is not a write — it is an irreversible side
+effect on another process — so it needs a guard fencing cannot give it.
+
+A scheduler that freezes after claiming (a stop-the-world pause, a suspended VM, a host
+migration) resumes holding a claim whose lease expired while it was stopped. Another instance
+has by then recovered the execution, reconciled with the executor, and re-dispatched it. The
+frozen instance's control fence is satisfied — its last registry read was seconds ago by the
+clock it kept — so nothing else stands between it and a `Run` call carrying the old token. The
+executor has no reason to refuse: it answered `NOT_FOUND` for that key a moment ago. Two
+handlers now run. The `Accept` that follows is correctly refused, which changes nothing.
+
+So the scheduler records, in MONOTONIC time, the instant it last PROVED it owned each
+execution — the claim, and every successful renewal — and refuses to send once four fifths of
+the lease has elapsed since. Monotonic because a wall clock can step; four fifths rather than
+all of it because the database's lease began slightly before this instance learned of it, and
+a send is not instantaneous. In healthy operation the heartbeat renews several times per lease
+and this is never close.
+
 **`dispatched_to` is written in the claim transaction, before the `Run` call is made** — not
 on acceptance. The target is known as soon as the executor is selected, and writing it only
 after the reply creates a window that loses work: the executor accepts, the scheduler dies

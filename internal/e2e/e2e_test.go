@@ -48,6 +48,7 @@ type harness struct {
 	engine  *engine.Engine
 	exec    *testexec.Executor
 	disp    *dispatch.Client
+	sched   *server.Server
 	cancel  context.CancelFunc
 	dial    func(string) (*grpc.ClientConn, error)
 	connect func()
@@ -147,6 +148,7 @@ func (h *harness) startExecutorAndScheduler() {
 		SilenceDeadline:   30 * time.Second,
 	}, staticTenants{h.store}, h.disp, alwaysUnfenced{}, h.clock, func() int { return 1 }, log)
 	gojobv1.RegisterJobSchedulerServer(grpcSrv, schedSrv)
+	h.sched = schedSrv
 
 	go func() { _ = grpcSrv.Serve(lis) }()
 	t.Cleanup(func() { grpcSrv.Stop(); _ = lis.Close() })

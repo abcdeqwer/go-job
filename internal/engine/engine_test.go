@@ -121,3 +121,54 @@ func TestJitter(t *testing.T) {
 		}
 	}
 }
+
+// A claim's proof of ownership expires in ELAPSED time, and a stale proof must not be
+// dispatched on.
+//
+// This is the one place fencing cannot help. Every write this instance makes is guarded, so a
+// stale instance corrupts nothing — but `Run` is not a write, it is an irreversible external
+// side effect. A process frozen past its lease (a stop-the-world pause, a suspended VM, a
+// host migration) resumes holding a claim another instance has already recovered, reconciled
+// and re-dispatched. Its control fence is fine — its last registry read was seconds ago by
+// the clock it kept — so nothing else stops it handing the same work to an executor. The
+// Accept that follows is correctly refused, long after two handlers are running.
+func TestHoldFreshnessGatesDispatch(t *testing.T) {
+	e := &Engine{tracked: map[int64]held{}}
+	h := store.Holder{ExecutionID: 7, FenceEpoch: 3, ExecutionKey: "job:1"}
+
+	const lease = 50 * time.Millisecond
+	e.track(h)
+	if !e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+		t.Fatal("a claim made a moment ago is not considered fresh")
+	}
+
+	// An execution this instance does not track, or tracks at another epoch, is never fresh:
+	// both mean the proof belongs to somebody else.
+	if e.holdIsFresh(999, h.FenceEpoch, lease) {
+		t.Error("an untracked execution reported a live hold")
+	}
+	if e.holdIsFresh(h.ExecutionID, h.FenceEpoch+1, lease) {
+		t.Error("a hold at a different epoch reported live; that entry belongs to another attempt")
+	}
+
+	// Past the lease, with no renewal in between.
+	time.Sleep(lease)
+	if e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+		t.Fatal("a claim older than its lease is still considered dispatchable; a frozen " +
+			"process would hand out work another instance has already recovered")
+	}
+
+	// A successful renewal is what makes it fresh again — that is the heartbeat's other job.
+	e.confirmHold(h.ExecutionID, h.FenceEpoch)
+	if !e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+		t.Fatal("a renewed lease did not restore the hold; a slow routing decision would be " +
+			"refused even while its lease is being renewed normally")
+	}
+
+	// And a renewal for a DIFFERENT epoch must not refresh this entry.
+	time.Sleep(lease)
+	e.confirmHold(h.ExecutionID, h.FenceEpoch+1)
+	if e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+		t.Fatal("a renewal at another epoch refreshed this hold")
+	}
+}

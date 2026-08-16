@@ -19,8 +19,12 @@ proto:
 		--go-grpc_opt=require_unimplemented_servers=false \
 		proto/gojob/v1/executor.proto
 
+# The scheduler is concurrent by construction — several loops per tenant, several tenants per
+# process, and a gRPC server on top — so the race detector is part of the check rather than
+# something to reach for after a mystery. It needs GOJOB_TEST_DSN pointed at a MySQL the tests
+# may create and drop schemas in; without it the database-backed tests skip.
 .PHONY: check
 check:
 	gofmt -l .
 	go vet ./...
-	go test ./...
+	go test -race ./...

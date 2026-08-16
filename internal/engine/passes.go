@@ -438,6 +438,18 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 		if e.stopping() {
 			return dispatch.Unknown
 		}
+		// And the DATABASE lease, measured locally. The control fence above says this instance
+		// may still operate; it says nothing about whether this instance still owns THIS
+		// execution. A process frozen past its lease passes the control fence the moment it
+		// resumes — its last registry read was seconds ago by the wall clock it kept — while
+		// another instance has already recovered and re-dispatched the work.
+		if !e.holdIsFresh(h.ExecutionID, h.FenceEpoch, def.Lease) {
+			e.log.Warn("not dispatching: this instance has not proved it still owns the "+
+				"execution within its lease; leaving the row to recovery",
+				"execution", h.ExecutionKey, "executor", target.ExecutorID)
+			e.untrack(h.ExecutionID, h.FenceEpoch)
+			return dispatch.Unknown
+		}
 		if attempt > 0 {
 			// The wall-clock bound is checked BEFORE the send, not after. Checked afterwards
 			// it does not bound anything: a call that returns just inside the window is

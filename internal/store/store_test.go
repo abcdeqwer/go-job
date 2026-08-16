@@ -745,10 +745,14 @@ func packageFunctions(t *testing.T) map[string]packageFunc {
 					// reversed order, which is a false positive that can only be silenced by
 					// weakening the real check.
 					recv, ok := sel.X.(*ast.Ident)
-					if !ok || recv.Name != "tx" || len(call.Args) < 2 {
+					if !ok || recv.Name != "tx" {
 						return true
 					}
-					switch q := call.Args[1].(type) {
+					at, runs := statementArg(sel.Sel.Name)
+					if !runs || len(call.Args) <= at {
+						return true
+					}
+					switch q := call.Args[at].(type) {
 					case *ast.BasicLit:
 						if q.Kind == token.STRING {
 							pf.events = append(pf.events, tableEvents(strings.Trim(q.Value, "`\""))...)
@@ -885,18 +889,18 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 				if !ok {
 					return true
 				}
-				switch sel.Sel.Name {
-				case "ExecContext", "QueryContext", "QueryRowContext":
-				default:
-					return true
-				}
-				// (ctx, query, args...)
-				if len(call.Args) < 2 {
+				// Every database/sql method that RUNS a statement, not only the Context
+				// variants. Recognising three of six left `tx.Exec(q)` unaudited, and with it
+				// a statement built by concatenation — neither `"UP"` nor `"DATE job_execution
+				// SET ..."` looks like SQL to the literal extractor, so the fence, write_seq,
+				// clock and lock-order checks would all pass without ever seeing it.
+				at, runs := statementArg(sel.Sel.Name)
+				if !runs || len(call.Args) <= at {
 					return true
 				}
 				checked++
 
-				switch q := call.Args[1].(type) {
+				switch q := call.Args[at].(type) {
 				case *ast.BasicLit:
 					if q.Kind != token.STRING {
 						t.Errorf("%s: SQL argument is not a string literal", fset.Position(q.Pos()))
@@ -920,7 +924,7 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 				default:
 					t.Errorf("%s: SQL is built rather than written out; the static checks read "+
 						"whole statements and would silently stop verifying this one",
-						fset.Position(call.Args[1].Pos()))
+						fset.Position(call.Args[at].Pos()))
 				}
 				return true
 			})
@@ -929,6 +933,27 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 	if checked < 20 {
 		t.Fatalf("found only %d SQL calls; the extractor is probably broken", checked)
 	}
+}
+
+// statementArg reports whether a database/sql method name executes SQL, and which argument
+// carries the statement.
+//
+// The non-Context variants are here deliberately. They are not used in this package and must
+// not become used — but a rule that simply does not mention them is not a rule against them,
+// it is a gap, and the gap is invisible because everything it lets through is also invisible.
+//
+// They also take the statement in a DIFFERENT POSITION: `ExecContext(ctx, q, args...)` puts it
+// second, `Exec(q, args...)` puts it first. A first attempt at this rule recognised the names
+// but kept the index — so `tx.Exec(q)` was skipped by an arity check expecting a context
+// argument, and the bypass survived being "fixed". The position is part of the answer.
+func statementArg(name string) (int, bool) {
+	switch name {
+	case "ExecContext", "QueryContext", "QueryRowContext":
+		return 1, true
+	case "Exec", "Query", "QueryRow":
+		return 0, true
+	}
+	return 0, false
 }
 
 // stringConsts collects every string constant, package level or function local, KEYED BY
