@@ -544,7 +544,7 @@ CREATE TABLE job_execution (
     lease_until    DATETIME     NULL,
     heartbeat_at   DATETIME     NULL,
     deadline_at    DATETIME     NULL,       -- silence deadline; extended by progress
-    timeout_at     DATETIME     NULL,       -- hard runtime cap; never extended
+    timeout_at     DATETIME     NULL,   -- per-attempt runtime cap; see §8
     started_at     DATETIME     NULL,
     finished_at    DATETIME     NULL,
     failure_kind   VARCHAR(48)  NULL,
@@ -862,14 +862,32 @@ Two clocks, and every column belongs to exactly one of them.
 | **business** | `next_fire_at`, `next_poll_at`, `scheduled_at`, `available_at`, `started_at`, `finished_at`, `created_at`, `updated_at` | the configured `Location` |
 | **ownership** | `lease_until`, `heartbeat_at`, `deadline_at`, `timeout_at` | the database's `NOW()` |
 
-`timeout_at` is set once, **in the claim transaction** — alongside `dispatched_to`, before
-the `Run` call — to `NOW() + timeout_seconds`, and is **never extended**.
+`timeout_at` is set **in the claim transaction** — alongside `dispatched_to`, before the `Run`
+call — to `NOW() + timeout_seconds`, and is **never extended within an attempt**.
+
+It is a **per-attempt** budget, not a per-execution one. `timeout_seconds` reads as "one run
+of this handler should not take longer than this", and that is what it means: each attempt
+gets the whole of it. Sharing one cap across a job's attempts sounds tidier and is not — with
+three attempts and a sixty-second cap, a first attempt that burns fifty-five seconds leaves
+the third with five, so the retry is a guaranteed timeout dressed up as a second chance.
+
+The claim therefore writes `COALESCE(timeout_at, NOW() + timeout_seconds)`, and exactly two
+transitions clear it: a **retry** back to `ready`, and a **recovery** back to `ready`. Both are
+new attempts. A **refusal** deliberately does not clear it — no handler started, so no new
+budget was earned, and clearing it there is how a row that keeps being refused near its cap
+gets the cap pushed forward for ever.
+
+A `ready` row whose cap has already elapsed — reachable when a retry's backoff extends past it
+— is ended by the next claim rather than dispatched. Nothing else can: the timeout scan looks
+only at rows with an owner, and a `ready` row has none.
 
 Setting it on acceptance instead would leave the same crash window `dispatched_to` closes: a
 scheduler that dies after the executor accepted but before recording acceptance leaves a
 successor with no cap at all, which then grants a fresh one or none. Starting the clock at
 claim rather than acceptance charges the dispatch round trip to the job's budget — a second
-or two against a cap measured in minutes or hours, in exchange for a cap that survives. It has to be a durable ownership instant rather than a timer in the
+or two against a cap measured in minutes or hours, in exchange for a cap that survives.
+
+It has to be a durable ownership instant rather than a timer in the
 dispatching scheduler's memory: an execution can outlive the instance that started it, and a
 successor that inherited only a progress-extended silence deadline would have no way to know
 how much of the original cap had already elapsed — it would grant a fresh one, or none.

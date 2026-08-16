@@ -223,13 +223,9 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 				continue
 			}
 			assignments++
-			upper := strings.ToUpper(a.value)
-			// A conditional assignment is fine as long as every branch is NULL or NOW()-
-			// derived; checking for the absence of a bare placeholder catches the case the
-			// rule exists for, which is a Go time.Time being bound into an ownership column.
-			if upper != "NULL" && !strings.Contains(upper, "NOW()") {
-				t.Errorf("ownership column %s assigned %q, which is neither NULL nor derived from NOW():\n  %s",
-					a.column, a.value, norm)
+			if !ownershipValueIsSafe(unqualified(a.column), a.value) {
+				t.Errorf("ownership column %s assigned %q, which is not one of the forms that "+
+					"provably carry no Go time.Time:\n  %s", a.column, a.value, norm)
 			}
 		}
 	}
@@ -287,6 +283,76 @@ func unqualified(col string) string {
 		col = col[dot+1:]
 	}
 	return col
+}
+
+// ownershipValueIsSafe validates an assignment to an ownership column against the exhaustive
+// list of forms that cannot carry a Go time.Time.
+//
+// "NULL, or contains NOW() somewhere" was too crude in both directions. It rejected
+// `IF(? = 'ready', NULL, timeout_at)`, whose every branch is safe, and it would have accepted
+// anything at all with NOW() buried in it. A flat "no ? placeholders" rule cannot work either,
+// because `TIMESTAMPADD(SECOND, ?, NOW())` binds a seconds count and is the normal way to set
+// a lease.
+//
+// So the safe shapes are named and anything else fails. A new shape is a deliberate addition
+// here — which is the point, because this is the check that keeps ownership independent of
+// clock skew between scheduler hosts, and that failure only ever appears once two hosts drift.
+func ownershipValueIsSafe(col, value string) bool {
+	v := strings.TrimSpace(value)
+	upper := strings.ToUpper(v)
+
+	switch {
+	case upper == "NULL", upper == "NOW()":
+		return true
+	case unqualified(v) == col: // preserved unchanged
+		return true
+	}
+
+	if args, ok := callArgs(upper, "TIMESTAMPADD"); ok && len(args) == 3 {
+		return strings.TrimSpace(args[2]) == "NOW()"
+	}
+	if args, ok := callArgs(upper, "COALESCE"); ok {
+		for _, a := range args {
+			if !ownershipValueIsSafe(col, a) {
+				return false
+			}
+		}
+		return true
+	}
+	if args, ok := callArgs(upper, "IF"); ok && len(args) == 3 {
+		// The condition is a discriminator, not a timestamp; only the branches matter.
+		return ownershipValueIsSafe(col, args[1]) && ownershipValueIsSafe(col, args[2])
+	}
+	return false
+}
+
+// callArgs splits `NAME(a, b, c)` into its top-level arguments.
+func callArgs(v, name string) ([]string, bool) {
+	v = strings.TrimSpace(v)
+	if !strings.HasPrefix(v, name+"(") || !strings.HasSuffix(v, ")") {
+		return nil, false
+	}
+	return splitTopLevel(v[len(name)+1 : len(v)-1]), true
+}
+
+// splitTopLevel splits on commas that are not inside parentheses.
+func splitTopLevel(s string) []string {
+	var out []string
+	depth, last := 0, 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(s[last:i]))
+				last = i + 1
+			}
+		}
+	}
+	return append(out, strings.TrimSpace(s[last:]))
 }
 
 type assignment struct{ column, value string }

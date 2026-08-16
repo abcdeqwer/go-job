@@ -115,11 +115,6 @@ type MaterializeResult struct {
 	MissedExact bool
 }
 
-// misfireHorizon bounds how far back a catch-up fire may be found. A year is far past any
-// outage worth catching up on, and it stops a job that has been disabled for years from
-// materializing an execution dated to when it was last enabled.
-const misfireHorizon = 366 * 24 * time.Hour
-
 // missedCountLimit caps the walk that counts missed instants. The count is a metric — nothing
 // branches on its exact value — so truncating it is cheaper than being precise about a
 // week-long outage of a per-second job.
@@ -131,7 +126,9 @@ const missedCountLimit = 1000
 // grace is the misfire threshold: a fire instant within grace of now counts as ON TIME, not
 // as missed. Without it SKIP is unusable — a scan running a second late on a per-second job
 // would see one missed instant plus one due instant on every pass, skip both, and the job
-// would never run at all. grace should be at least the scan interval plus expected jitter.
+// would never run at all. Pass gojob.DefaultMisfireGrace(scanInterval) unless you have a
+// reason not to; anything below the scan interval plus its jitter reproduces the starvation
+// in a milder form.
 //
 // The state row is taken FOR UPDATE SKIP LOCKED, so two schedulers that both decide an
 // instant is due do not both reach the insert: the loser skips this job on this pass and on
@@ -244,7 +241,7 @@ func (s *Store) MaterializeCron(ctx context.Context, jobName string, compile Com
 			// fire strictly before the grace boundary, not the last fire before now. Using
 			// Latest(now) would jump over the instants inside the grace window, which are on
 			// time and have not been materialized yet, and silently drop them.
-			latest, ok, err := sched.Latest(onTimeFrom.Add(-time.Nanosecond), misfireHorizon)
+			latest, ok, err := sched.Latest(onTimeFrom.Add(-time.Nanosecond), gojob.MisfireHorizon)
 			if err != nil {
 				return fmt.Errorf("find latest missed fire for %q: %w", jobName, err)
 			}

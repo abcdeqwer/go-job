@@ -165,6 +165,10 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 // Resolve is recovery phase 3 for the unknown case: the executor said NOT_FOUND, was
 // unreachable, or answered about a different attempt.
 //
+// A recovery that returns the row to `ready` clears timeout_at, because the re-dispatch that
+// follows is a new attempt and the cap is a per-attempt budget. A recovery that ends the
+// execution keeps it as evidence.
+//
 // It does NOT touch attempt_no. That was incremented when the dispatch was accepted, and the
 // re-dispatch that follows recovery increments it again — which is exactly the budget a crash
 // should cost. Incrementing here as well would exhaust a budget of three in two real handler
@@ -246,6 +250,7 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 			    terminal_reason = ?,
 			    finished_at    = IF(? = 'ready', NULL, ?),
 			    available_at   = IF(? = 'ready', TIMESTAMPADD(SECOND, ?, ?), available_at),
+			    timeout_at     = IF(? = 'ready', NULL, timeout_at),
 			    fence_epoch    = fence_epoch + 1,
 			    recovery_count = recovery_count + 1,
 			    owner_instance = NULL, dispatched_to = NULL, run_token = NULL,
@@ -256,6 +261,7 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 			string(landed), nullString(string(reason)),
 			string(landed), now,
 			string(landed), backoffSeconds, now,
+			string(landed),
 			now, v.ID, v.RunToken, v.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("resolve execution %d: %w", v.ID, err)

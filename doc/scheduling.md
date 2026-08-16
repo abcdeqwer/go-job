@@ -101,6 +101,12 @@ Applies to fire instants that passed while nothing was running:
 | `SKIP` | advance to the first future fire; record how many were missed |
 | `FIRE_ONCE` | create one catch-up execution for the **latest** missed fire, then advance |
 
+**`FIRE_ONCE` is the default.** `SKIP` runs nothing from the past, so once anything has been
+missed the currently-due instant goes with it — a five-minute outage costs a daily job its
+whole day. That is the right answer for a job whose work is only meaningful at its own
+instant, and the wrong one to arrive at by accident during an incident. A job that must not
+catch up says so.
+
 Unbounded replay is not offered. An outage of an hour must not become an hour of catch-up
 executions arriving at once — that turns a recovery into a second incident. A bounded
 catch-up policy would need an explicit maximum, a defined ordering and a load test before
@@ -114,8 +120,12 @@ is **on time**, however late the scan actually ran.
 Without that threshold the policy is unusable. A scan running one second late on a
 `* * * * * *` job sees one past instant plus the due one; both are "in the past", so `SKIP`
 advances to the future and creates nothing — on every pass, for ever, reporting no error while
-the missed counter climbs. `grace` must therefore be at least the scan interval plus expected
-jitter.
+the missed counter climbs.
+
+**The default is `max(60s, 3 x scan interval)`.** The floor of a minute matches Quartz and is
+what most people already expect; the three-interval term is what stops that expectation
+quietly breaking when someone widens the scan, because at a 60s interval a fixed 60s grace
+leaves no room at all for jitter.
 
 The boundary is half-open — `[due, now-grace)` — so an instant landing exactly on it is on
 time. A closed boundary would put a reliably-one-grace-period-late job on the wrong side of it

@@ -59,8 +59,13 @@ CREATE TABLE job_definition (
     enabled            TINYINT(1)   NOT NULL DEFAULT 1,
     retired            TINYINT(1)   NOT NULL DEFAULT 0,
 
-    concurrency_policy VARCHAR(16)  NOT NULL,  -- QUEUE | FORBID
-    misfire_policy     VARCHAR(16)  NOT NULL,  -- SKIP | FIRE_ONCE
+    -- Defaults are decisions, recorded in the library's defaults.go with their reasons.
+    -- FIRE_ONCE rather than SKIP: SKIP advances to the first FUTURE fire and runs nothing from
+    -- the past, so a five-minute outage costs a daily job its whole day. That is the right
+    -- answer for some jobs, but it is a surprising default, and the surprise arrives during an
+    -- incident. A job that genuinely must not catch up says so explicitly.
+    concurrency_policy VARCHAR(16)  NOT NULL DEFAULT 'QUEUE',      -- QUEUE | FORBID
+    misfire_policy     VARCHAR(16)  NOT NULL DEFAULT 'FIRE_ONCE',  -- SKIP | FIRE_ONCE
 
     max_attempts       INT          NOT NULL,
     max_recoveries     INT          NOT NULL,
@@ -178,7 +183,8 @@ CREATE TABLE job_execution (
     lease_until     DATETIME     NULL,
     heartbeat_at    DATETIME     NULL,
     deadline_at     DATETIME     NULL,      -- silence budget; extended by progress
-    timeout_at      DATETIME     NULL,      -- hard runtime cap; set at claim, never extended
+    timeout_at      DATETIME     NULL,      -- per-attempt runtime cap; set at claim, never
+                                            -- extended; cleared only by retry and recovery
 
     -- Business clock.
     started_at      DATETIME     NULL,

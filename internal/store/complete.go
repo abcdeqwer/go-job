@@ -92,6 +92,17 @@ func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 // it here means the decision is made against the values the row actually holds at commit —
 // including the charge chargeUnacceptedAttempt may have just applied.
 //
+// The runtime cap is a PER-ATTEMPT budget, so returning the row to `ready` clears timeout_at
+// and the next claim mints a fresh one. Sharing one cap across attempts sounds tidier but is
+// not: a job with three attempts and a sixty-second timeout would spend most of that budget on
+// its first attempt and give the third a few seconds, which is a guaranteed timeout dressed up
+// as a retry.
+//
+// The `dead` branch keeps timeout_at, because the row is terminal and the value is evidence.
+// A REFUSAL deliberately does not clear it — no handler started, so no new budget is earned,
+// and clearing it there is how a row that keeps being refused near its cap gets the cap pushed
+// forward for ever.
+//
 // backoffSeconds is bounded, and jitter is applied by the caller after computing the base
 // delay so the sequence stays testable.
 func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds int) error {
@@ -114,6 +125,7 @@ func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds i
 			    finished_at     = IF(attempt_no >= max_attempts, ?, NULL),
 			    available_at    = IF(attempt_no >= max_attempts,
 			                         available_at, TIMESTAMPADD(SECOND, ?, ?)),
+			    timeout_at      = IF(attempt_no >= max_attempts, timeout_at, NULL),
 			    owner_instance  = NULL,
 			    dispatched_to   = NULL,
 			    run_token       = NULL,
