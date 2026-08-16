@@ -65,8 +65,6 @@ type Config struct {
 
 // Server implements gojobv1.JobSchedulerServer.
 type Server struct {
-	gojobv1.UnimplementedJobSchedulerServer
-
 	cfg     Config
 	tenants Tenants
 	prober  Prober

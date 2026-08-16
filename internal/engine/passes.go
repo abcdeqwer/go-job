@@ -28,6 +28,9 @@ func (e *Engine) materializePass(ctx context.Context) {
 		e.log.Error("cron due scan failed", "error", err)
 	}
 	for _, d := range due {
+		if e.stopping() {
+			return
+		}
 		res, err := e.store.MaterializeCron(ctx, d.JobName, e.compile, e.cfg.MisfireGrace)
 		switch {
 		case errors.Is(err, gojob.ErrContended):
@@ -51,11 +54,14 @@ func (e *Engine) materializePass(ctx context.Context) {
 		return
 	}
 	for _, d := range polls {
+		if e.stopping() {
+			return
+		}
 		// A poll key carries a fresh monotonic identifier rather than being derived from an
 		// instant: a timestamp-derived key would collide with a retained pass after a
 		// business-clock shift, and a reusable per-job key would make every pass after the
 		// first a duplicate.
-		key := "p:" + d.JobName + ":" + uuid.NewString()
+		key := store.ExecutionKey("p", d.JobName, uuid.NewString())
 		res, err := e.store.MaterializePoll(ctx, d.JobName, key, e.compile)
 		switch {
 		case errors.Is(err, gojob.ErrContended):
@@ -80,6 +86,9 @@ func (e *Engine) driftPass(ctx context.Context) {
 		return
 	}
 	for _, name := range names {
+		if e.stopping() {
+			return
+		}
 		next, err := e.store.Recompute(ctx, name, e.compile)
 		if errors.Is(err, gojob.ErrContended) {
 			continue
@@ -105,12 +114,8 @@ func (e *Engine) dispatchPass(ctx context.Context) {
 			continue
 		}
 		for _, c := range candidates {
-			select {
-			case <-e.stop:
+			if e.stopping() || ctx.Err() != nil {
 				return
-			case <-ctx.Done():
-				return
-			default:
 			}
 			e.claimAndDispatch(ctx, c)
 		}
@@ -254,7 +259,17 @@ func (e *Engine) pickExecutors(ctx context.Context, def gojob.Definition) ([]sto
 		return nil, fmt.Errorf("%w: handler %q%s", gojob.ErrNotRunnable,
 			def.HandlerKey, groupSuffix(def.ExecutorGroup))
 	}
-	sort.SliceStable(live, func(i, j int) bool { return headroom(live[i]) > headroom(live[j]) })
+	// An executor whose dispatch path has been blackholed goes to the BACK rather than being
+	// removed. Removing it would make a fleet of one unroutable the moment its first dispatch
+	// timed out; ordering it last means a healthy instance is always preferred and a
+	// quarantined one is still tried when it is the only thing there is.
+	sort.SliceStable(live, func(i, j int) bool {
+		hi, hj := e.dispatchHealthy(live[i].ExecutorID), e.dispatchHealthy(live[j].ExecutorID)
+		if hi != hj {
+			return hi
+		}
+		return headroom(live[i]) > headroom(live[j])
+	})
 	return live, nil
 }
 
@@ -366,6 +381,23 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 	spec dispatch.RunSpec, target store.Executor, deadline time.Time) dispatch.Answer {
 
 	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			// Re-read the cap before every re-send. A first call can consume most of what was
+			// left, and re-sending the ORIGINAL budget would tell the executor it may run for
+			// longer than the scheduler will wait — after which the timeout pass fences and
+			// releases the row while that executor still believes it owns the work.
+			cur, err := e.store.ExecutionByKey(ctx, h.ExecutionKey)
+			if err != nil {
+				return dispatch.Unknown
+			}
+			if cur.RemainingTimeout <= 0 {
+				e.log.Warn("runtime cap elapsed mid-dispatch; leaving the row to the timeout scan",
+					"execution", h.ExecutionKey, "executor", target.ExecutorID)
+				return dispatch.Unknown
+			}
+			spec.RemainingTimeout = cur.RemainingTimeout
+		}
+
 		res := e.disp.Run(ctx, spec)
 
 		switch res.Answer {
@@ -402,7 +434,13 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 			// good: the executor stays registration-live so it keeps being chosen, the leases
 			// keep being renewed, and no budget is ever consumed.
 			if attempt+1 >= e.cfg.DispatchResendLimit || time.Now().After(deadline) {
-				e.log.Warn("dispatch outcome unknown after the re-send bound; leaving it to recovery",
+				// Mark the path unhealthy. An executor that heartbeats but never answers Run
+				// stays registration-live, so without this it is chosen again on the next
+				// claim, exhausts the bound again, and marches the job to dead through its
+				// recovery budget without any business code running.
+				e.markUnhealthy(target.ExecutorID)
+				e.log.Warn("dispatch outcome unknown after the re-send bound; "+
+					"suppressing this executor and leaving the row to recovery",
 					"execution", h.ExecutionKey, "executor", target.ExecutorID,
 					"attempts", attempt+1, "code", res.Code, "error", res.Err)
 				return dispatch.Unknown
@@ -440,6 +478,9 @@ func (e *Engine) recoverPass(ctx context.Context) {
 		return
 	}
 	for _, v := range stale {
+		if e.stopping() {
+			return
+		}
 		e.recoverOne(ctx, v)
 	}
 }
@@ -547,6 +588,9 @@ func (e *Engine) timeoutPass(ctx context.Context) {
 		return
 	}
 	for _, v := range over {
+		if e.stopping() {
+			return
+		}
 		e.fenceTimedOut(ctx, v)
 	}
 }
@@ -565,23 +609,84 @@ func (e *Engine) silencePass(ctx context.Context) {
 		return
 	}
 	for _, v := range silent {
-		// Ask it to stop first. It cannot be relied on, but an executor that DOES comply stops
-		// burning resources on work the scheduler has already written off.
+		if e.stopping() {
+			return
+		}
+		e.resolveSilent(ctx, v)
+	}
+}
+
+// resolveSilent decides what a silent execution actually is, by asking its executor.
+//
+// Silence is not proof the work stopped. An executor whose progress loop died, or whose
+// reports are merely slow, is still running the handler — and fencing it on the strength of a
+// missing progress report releases the job lock while that handler writes, after which the
+// next execution of the same job starts alongside it.
+//
+// So this is the same three-phase shape recovery uses, for the same reason: reconcile OUTSIDE
+// any transaction, and only treat the attempt as unknown when the executor genuinely cannot
+// answer for it.
+func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
+	rec := dispatch.Reconciliation{}
+	if v.DispatchedTo != "" {
+		if addr, ok := e.addressOf(ctx, v.DispatchedTo); ok {
+			rec = e.disp.GetExecution(ctx, addr, e.cfg.Tenant, v.ExecutionKey, e.cfg.ReconcileDeadline)
+		}
+	}
+	if rec.Reachable && rec.RunToken != "" && rec.RunToken != v.RunToken {
+		rec = dispatch.Reconciliation{} // an answer about a different attempt
+	}
+
+	switch {
+	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING:
+		// It IS running; its reports were merely late. Extend the silence budget and leave it
+		// alone. The runtime cap is untouched, so a handler that never finishes is still
+		// bounded — by the cap, which is the bound that means "too long".
+		h := store.Holder{
+			JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
+			Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: v.FenceEpoch,
+		}
+		if err := e.store.ExtendDeadline(ctx, h, e.silenceSeconds()); err != nil &&
+			!errors.Is(err, gojob.ErrFenced) {
+			e.log.Error("extending a late executor's silence budget failed",
+				"execution", v.ExecutionKey, "error", err)
+		}
+		e.log.Info("executor was late, not lost; silence budget extended",
+			"execution", v.ExecutionKey, "executor", v.DispatchedTo)
+
+	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED:
+		e.adoptResult(ctx, v, rec)
+
+	default:
+		// Unreachable, NOT_FOUND, or an answer about someone else. Only now is the attempt
+		// genuinely unknown. Ask it to stop on the way out — it cannot be relied on, but an
+		// executor that does comply stops burning resources on work already written off.
 		e.requestStop(ctx, v, "no progress within the silence budget")
 
 		err := e.store.ExpireSilent(ctx, v)
 		if errors.Is(err, gojob.ErrContended) {
-			continue
+			return
 		}
 		if err != nil {
 			e.log.Error("expiring a silent execution failed",
 				"execution", v.ExecutionKey, "error", err)
-			continue
+			return
 		}
 		e.untrack(v.ID, v.FenceEpoch)
-		e.log.Warn("execution ended: no progress within its silence budget",
+		e.log.Warn("execution ended: silent and unreachable",
 			"execution", v.ExecutionKey, "job", v.JobName, "executor", v.DispatchedTo)
 	}
+}
+
+// silenceSeconds is how long an executor may say nothing. It tracks the executor liveness
+// window, because an executor that is not heartbeating at all is a different problem with a
+// different scan.
+func (e *Engine) silenceSeconds() int {
+	s := int(e.cfg.ExecutorLiveness / time.Second)
+	if s < 1 {
+		s = 30
+	}
+	return s
 }
 
 // cancelPass carries an operator's cancel to the executor holding the work.
@@ -598,6 +703,9 @@ func (e *Engine) cancelPass(ctx context.Context) {
 		return
 	}
 	for _, v := range rows {
+		if e.stopping() {
+			return
+		}
 		e.requestStop(ctx, v, "cancelled by an operator")
 	}
 }

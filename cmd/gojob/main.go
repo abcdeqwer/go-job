@@ -69,12 +69,13 @@ type config struct {
 	trustedRoleHeader string
 	cookieSecure      bool
 
-	tlsCert     string
-	tlsKey      string
-	tlsClientCA string
-	outboundCA  string
-	execToken   string
-	allowNoAuth bool
+	tlsCert       string
+	tlsKey        string
+	tlsClientCA   string
+	outboundCA    string
+	execToken     string
+	allowNoAuth   bool
+	allowUnlisted bool
 
 	hashPassword string
 	hashToken    string
@@ -130,6 +131,8 @@ func run() error {
 		"bearer token sent to executors when dispatching, for fleets not using mTLS")
 	flag.BoolVar(&c.allowNoAuth, "allow-unauthenticated-executors", false,
 		"accept executor calls that present no credential; only for a network that is itself the boundary")
+	flag.BoolVar(&c.allowUnlisted, "allow-unlisted-executors", false,
+		"let an authenticated executor act for a tenant it has no executor_identity row for")
 
 	flag.StringVar(&c.hashPassword, "hash-password", "",
 		"print a bcrypt hash for this password and exit, for provisioning the first account")
@@ -202,6 +205,7 @@ func run() error {
 		MaxOpenConns:    16,
 		MaxIdleConns:    4,
 		ConnMaxLifetime: 30 * time.Minute,
+		DrainTimeout:    15 * time.Second,
 		OpenDB: func(dsn string) (*sql.DB, error) {
 			return sql.Open("mysql", withDefaults(dsn, loc))
 		},
@@ -234,7 +238,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	auth := &server.DBAuthenticator{DB: controlDB, RequireCredential: !c.allowNoAuth}
+	auth := &server.DBAuthenticator{
+		DB:                      controlDB,
+		RequireCredential:       !c.allowNoAuth,
+		AllowUnlistedIdentities: c.allowUnlisted,
+	}
+	if c.allowUnlisted {
+		log.Warn("authenticated executors are accepted for tenants they are NOT listed for; " +
+			"any certificate the client CA signed can register as any tenant")
+	}
 	if c.allowNoAuth {
 		// Said loudly, once, at startup. A mode that lets anything reachable register for a
 		// tenant and be handed that tenant's work is not something anyone should discover by

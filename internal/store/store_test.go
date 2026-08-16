@@ -763,7 +763,12 @@ func stringConsts(pkgs map[string]*ast.Package) map[string]string {
 }
 
 // sqlParameterNames collects the names of `string` parameters, so a helper that runs a
-// statement handed to it is not flagged. The literal at the call site is what gets inspected.
+// statement handed to it is not flagged here.
+//
+// Allowing that leaves a hole, and TestHelperCallSitesPassLiterals closes it: the literal
+// reaching the helper is what has to be inspectable, and without checking the CALL SITES a
+// caller could pass a built string into `due(ctx, built, n)` and the whole statement would
+// disappear from every other check in this file.
 func sqlParameterNames(pkgs map[string]*ast.Package) map[string]bool {
 	out := map[string]bool{}
 	for _, pkg := range pkgs {
@@ -787,6 +792,118 @@ func sqlParameterNames(pkgs map[string]*ast.Package) map[string]bool {
 		}
 	}
 	return out
+}
+
+// Whatever a SQL-running helper is handed must itself be inspectable.
+//
+// The rule above accepts `QueryContext(ctx, query)` inside a helper whose `query` is a
+// parameter. That is only sound if every caller passes something this file can read — a
+// literal or a resolvable constant. Without this check, a caller could assemble a statement
+// and hand it in, and the fence, clock and write_seq checks would all report success while
+// the statement they exist to verify was never extracted at all.
+func TestHelperCallSitesPassLiterals(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+	consts := stringConsts(pkgs)
+
+	// Which package functions take a statement, and in which position.
+	sqlArg := map[string]int{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Type.Params == nil || !runsSQLFromParameter(fd) {
+					continue
+				}
+				pos := 0
+				for _, f := range fd.Type.Params.List {
+					for _, name := range f.Names {
+						if id, ok := f.Type.(*ast.Ident); ok && id.Name == "string" &&
+							(name.Name == "query" || name.Name == "q") {
+							sqlArg[fd.Name.Name] = pos
+						}
+						pos++
+					}
+				}
+			}
+		}
+	}
+	if len(sqlArg) == 0 {
+		return // no such helper; nothing to check
+	}
+
+	var checked int
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				name := ""
+				switch fn := call.Fun.(type) {
+				case *ast.Ident:
+					name = fn.Name
+				case *ast.SelectorExpr:
+					name = fn.Sel.Name
+				}
+				idx, isHelper := sqlArg[name]
+				if !isHelper || idx >= len(call.Args) {
+					return true
+				}
+				checked++
+				switch q := call.Args[idx].(type) {
+				case *ast.BasicLit:
+					if q.Kind != token.STRING {
+						t.Errorf("%s: a SQL helper was handed a non-string literal", fset.Position(q.Pos()))
+					}
+				case *ast.Ident:
+					if _, known := consts[q.Name]; !known {
+						t.Errorf("%s: a SQL helper was handed %q, which this file cannot resolve "+
+							"to a statement", fset.Position(q.Pos()), q.Name)
+					}
+				default:
+					t.Errorf("%s: a SQL helper was handed a built statement; it would vanish "+
+						"from every static check in this file", fset.Position(call.Args[idx].Pos()))
+				}
+				return true
+			})
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no call sites found for the SQL helpers; the extractor is probably broken")
+	}
+}
+
+// runsSQLFromParameter reports whether a function passes one of its own parameters to a
+// database call.
+func runsSQLFromParameter(fd *ast.FuncDecl) bool {
+	found := false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "ExecContext", "QueryContext", "QueryRowContext":
+		default:
+			return true
+		}
+		if id, ok := call.Args[1].(*ast.Ident); ok && (id.Name == "query" || id.Name == "q") {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 func looksLikeSQL(v string) bool {

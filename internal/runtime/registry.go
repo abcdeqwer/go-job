@@ -35,6 +35,10 @@ type Options struct {
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
 
+	// DrainTimeout bounds how long retiring a tenant waits for its in-flight work. Zero means
+	// no wait at all, which is only right for a shutdown that is already out of time.
+	DrainTimeout time.Duration
+
 	Engine engine.Config
 
 	// OpenDB is the driver hook. The library never imports a MySQL driver: the host chooses
@@ -64,6 +68,12 @@ type Registry struct {
 	tenants   map[string]*tenant
 	admitting map[string]bool
 
+	// seen is the newest generation this instance has read for each tenant. Admission is
+	// asynchronous, so it publishes against this rather than against what it started with:
+	// a slow admission for an old generation must not install its engine after a cutover has
+	// already moved the tenant to a new schema, or both would dispatch the same job.
+	seen map[string]int64
+
 	wg   sync.WaitGroup
 	stop chan struct{}
 	once sync.Once
@@ -76,6 +86,7 @@ func NewRegistry(opts Options, ctl *control.Store, fence *control.Fence,
 		opts: opts, control: ctl, fence: fence, disp: disp, log: log,
 		tenants:   make(map[string]*tenant),
 		admitting: make(map[string]bool),
+		seen:      make(map[string]int64),
 		stop:      make(chan struct{}),
 	}
 }
@@ -157,11 +168,27 @@ func (r *Registry) reconcile(ctx context.Context) {
 	r.fence.Refresh()
 
 	want := make(map[string]control.Tenant, len(rows))
+	r.mu.Lock()
 	for _, t := range rows {
+		if g := r.seen[t.Name]; t.Generation > g {
+			r.seen[t.Name] = t.Generation
+		}
 		if t.Enabled {
 			want[t.Name] = t
 		}
 	}
+	// A tenant that has vanished from the registry entirely stops being tracked, so its
+	// generation cannot pin an admission for a row that no longer exists.
+	present := make(map[string]bool, len(rows))
+	for _, t := range rows {
+		present[t.Name] = true
+	}
+	for name := range r.seen {
+		if !present[name] {
+			delete(r.seen, name)
+		}
+	}
+	r.mu.Unlock()
 
 	r.mu.RLock()
 	have := make(map[string]*tenant, len(r.tenants))
@@ -277,31 +304,81 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	cfg.InstanceID = r.opts.InstanceID
 
 	runCtx, runCancel := context.WithCancel(ctx)
-	eng := engine.New(cfg, st, r.disp, r.opts.Clock, r.fence, r.log)
-	eng.Start(runCtx)
+	// Disarmed once the engine is published and retire() owns the cancel. Anything that leaves
+	// before then — a superseded generation, a failure — releases the context here rather than
+	// leaking a goroutine per abandoned admission.
+	published := false
+	defer func() {
+		if !published {
+			runCancel()
+		}
+	}()
 
+	eng := engine.New(cfg, st, r.disp, r.opts.Clock, r.fence, r.log)
+
+	// Publish under the lock, against the NEWEST generation seen — not against the one this
+	// admission started with.
+	//
+	// Admission takes time: a pool, a schema check, a time-zone check. In that window the
+	// tenant can be disabled, proven quiescent, re-pointed at a different schema and
+	// re-enabled, and another replica can already be running the new one. Installing this
+	// engine anyway would put two schemas in service for one tenant, each correctly excluding
+	// only itself, dispatching the same logical job twice — the exact split brain the whole
+	// cutover procedure exists to prevent.
 	r.mu.Lock()
-	r.tenants[t.Name] = &tenant{
-		name: t.Name, generation: t.Generation,
-		db: db, store: st, engine: eng, cancel: runCancel,
+	stale := r.seen[t.Name] != t.Generation
+	if !stale {
+		r.tenants[t.Name] = &tenant{
+			name: t.Name, generation: t.Generation,
+			db: db, store: st, engine: eng, cancel: runCancel,
+		}
 	}
 	r.mu.Unlock()
 
+	if stale {
+		_ = db.Close()
+		return fmt.Errorf("admission for %s generation %d was superseded before it completed",
+			t.Name, t.Generation)
+	}
+
+	published = true
+	eng.Start(runCtx)
 	r.log.Info("tenant admitted", "tenant", t.Name, "generation", t.Generation,
 		"schema", t.SchemaUUID)
 	return nil
 }
 
-// retire stops a tenant's engine and closes its pool.
+// retire stops claiming, waits a bounded time for in-flight work, then closes the pool.
 //
-// It does NOT release the leases of work still in flight. A handler that has not proved it
-// stopped keeps its lease until it expires: expiry is not proof a handler stopped, but
-// releasing early is a guarantee that a second executor may start while the first is still
-// writing.
+// The drain is bounded rather than absent OR unlimited. Closing immediately leaves running
+// executors with nowhere to report — their results arrive at a scheduler that no longer has
+// the tenant and are answered NOT_FOUND, so perfectly good work is recorded as unknown.
+// Waiting forever makes a disable that an operator issued during an incident hang on the one
+// job that is stuck.
+//
+// It does NOT release the leases of whatever is still in flight when the bound elapses. A
+// handler that has not proved it stopped keeps its lease until it expires: expiry is not proof
+// a handler stopped, but releasing early is a guarantee that a second executor may start while
+// the first is still writing.
 func (r *Registry) retire(t *tenant, why string) {
 	r.log.Info("retiring tenant", "tenant", t.name, "reason", why,
 		"still_tracking", t.engine.Tracking())
+
+	// Stop() drops the loops, so nothing new is claimed from here on.
 	t.engine.Stop()
+
+	if n := t.engine.Tracking(); n > 0 {
+		deadline := time.Now().Add(r.opts.DrainTimeout)
+		for time.Now().Before(deadline) && t.engine.Tracking() > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if left := t.engine.Tracking(); left > 0 {
+			r.log.Warn("tenant retired with work still in flight; those leases will expire "+
+				"and another instance will recover them",
+				"tenant", t.name, "in_flight", left)
+		}
+	}
+
 	t.cancel()
 	if err := t.db.Close(); err != nil {
 		r.log.Warn("closing a tenant pool failed", "tenant", t.name, "error", err)

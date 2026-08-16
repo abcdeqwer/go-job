@@ -385,7 +385,11 @@ func (a *API) oldSchemaQuiescent(ctx context.Context, name string) (bool, error)
 			return false, fmt.Errorf("%w: cannot read %s to prove it is quiescent: %v",
 				control.ErrNotQuiesced, name, err)
 		}
-		return q, nil
+		if !q.Quiet() {
+			return false, fmt.Errorf("%w: %s still holds %d job(s) with %d execution(s) in flight",
+				control.ErrNotQuiesced, name, q.Held, q.InFlight)
+		}
+		return true, nil
 	}
 	return false, fmt.Errorf("%w: tenant %q", errNotFound, name)
 }
@@ -437,7 +441,13 @@ func (a *API) quiescence(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		body["schema_quiescent"] = q
+		body["schema_quiescent"] = q.Quiet()
+		body["held"] = q.Held
+		body["in_flight"] = q.InFlight
+		// Surfaced, not gated on. Queued work does not block a cutover — a disabled tenant has
+		// no scheduler draining it, so gating would make a cutover unreachable — but
+		// abandoning it silently is not something an operator should find out afterwards.
+		body["queued_and_would_be_abandoned"] = q.Queued
 	}
 	writeJSON(w, http.StatusOK, body)
 	return nil

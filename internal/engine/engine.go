@@ -77,6 +77,19 @@ type Engine struct {
 	mu      sync.Mutex
 	tracked map[int64]store.Holder
 
+	// unhealthy records executors whose dispatch path stopped answering, with the instant they
+	// may be tried again.
+	//
+	// An executor that heartbeats but cannot accept work is the case registration liveness
+	// alone cannot see: it stays routable, keeps being chosen, exhausts the re-send bound,
+	// recovers as unknown, and is chosen again — until the recovery budget kills the job
+	// without one line of business code having run. Suppressing the path is what breaks that
+	// loop. It is per instance and in memory on purpose: it is an observation about THIS
+	// process's connectivity, and writing it to the database would let one instance's network
+	// problem deprioritise an executor every other instance can reach perfectly well.
+	healthMu  sync.Mutex
+	unhealthy map[string]time.Time
+
 	// schedules caches compiled cron expressions by expression text. Compilation is cheap but
 	// happens inside a transaction holding the job's lock, and the cache keeps that window
 	// from including a parse.
@@ -98,6 +111,7 @@ func New(cfg Config, st *store.Store, disp *dispatch.Client, clock gojob.Clock, 
 		fence:     fence,
 		log:       log.With("tenant", cfg.Tenant, "instance", cfg.InstanceID),
 		tracked:   make(map[int64]store.Holder),
+		unhealthy: make(map[string]time.Time),
 		schedules: make(map[string]*cron.Expression),
 		stop:      make(chan struct{}),
 	}
@@ -177,6 +191,54 @@ func (e *Engine) runLoop(ctx context.Context, name string, interval time.Duratio
 			e.safely(ctx, name, fn)
 		}
 	}
+}
+
+// markUnhealthy suppresses an executor's dispatch path for a while.
+func (e *Engine) markUnhealthy(executorID string) {
+	e.healthMu.Lock()
+	e.unhealthy[executorID] = time.Now().Add(e.dispatchQuarantine())
+	e.healthMu.Unlock()
+}
+
+// dispatchHealthy reports whether an executor may be dispatched to.
+func (e *Engine) dispatchHealthy(executorID string) bool {
+	e.healthMu.Lock()
+	defer e.healthMu.Unlock()
+	until, ok := e.unhealthy[executorID]
+	if !ok {
+		return true
+	}
+	if time.Now().After(until) {
+		delete(e.unhealthy, executorID)
+		return true
+	}
+	return false
+}
+
+// dispatchQuarantine is how long a blackholed executor is skipped. Long enough to stop the
+// loop, short enough that a transient failure does not take an instance out of the fleet for
+// an operator's whole afternoon.
+func (e *Engine) dispatchQuarantine() time.Duration {
+	if e.cfg.ExecutorLiveness > 0 {
+		return e.cfg.ExecutorLiveness
+	}
+	return 30 * time.Second
+}
+
+// stopping reports whether this pass must abandon what it is doing.
+//
+// It is checked between ITEMS, not only at the pass boundary. A recovery pass over a hundred
+// rows, each with a five-second reconciliation deadline, runs for minutes — and if control
+// connectivity is lost a second after the pass started, a boundary-only check would let it go
+// on adopting, resolving and renewing long after the staleness limit said this instance had
+// lost the right to act. The fence exists precisely so an invisible owner stops writing.
+func (e *Engine) stopping() bool {
+	select {
+	case <-e.stop:
+		return true
+	default:
+	}
+	return e.fence.Check() != nil
 }
 
 // safely runs one pass and turns a panic into a logged error rather than a dead loop.
@@ -297,6 +359,11 @@ func (e *Engine) Tracking() int {
 // instance makes no further write for it. That is what makes a revived zombie harmless.
 func (e *Engine) heartbeatPass(ctx context.Context) {
 	for _, h := range e.holders() {
+		// A renewal after the fence lapsed is the single worst write this instance can make:
+		// it keeps an owner alive that the control plane has already concluded is gone.
+		if e.stopping() {
+			return
+		}
 		lease := e.leaseSecondsFor(ctx, h.JobName)
 		err := e.store.Renew(ctx, h, lease)
 		switch {

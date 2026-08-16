@@ -140,7 +140,7 @@ func (c *jobExecutorClient) GetExecution(ctx context.Context, in *GetExecutionRe
 }
 
 // JobExecutorServer is the server API for JobExecutor service.
-// All implementations must embed UnimplementedJobExecutorServer
+// All implementations should embed UnimplementedJobExecutorServer
 // for forward compatibility.
 //
 // ---------------------------------------------------------------------------
@@ -188,10 +188,9 @@ type JobExecutorServer interface {
 	// UNKNOWN — never "it did not run". Durable proof that work happened belongs in the
 	// handler's own idempotency key, not here.
 	GetExecution(context.Context, *GetExecutionRequest) (*GetExecutionResponse, error)
-	mustEmbedUnimplementedJobExecutorServer()
 }
 
-// UnimplementedJobExecutorServer must be embedded to have
+// UnimplementedJobExecutorServer should be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
@@ -210,8 +209,7 @@ func (UnimplementedJobExecutorServer) Cancel(context.Context, *CancelRequest) (*
 func (UnimplementedJobExecutorServer) GetExecution(context.Context, *GetExecutionRequest) (*GetExecutionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetExecution not implemented")
 }
-func (UnimplementedJobExecutorServer) mustEmbedUnimplementedJobExecutorServer() {}
-func (UnimplementedJobExecutorServer) testEmbeddedByValue()                     {}
+func (UnimplementedJobExecutorServer) testEmbeddedByValue() {}
 
 // UnsafeJobExecutorServer may be embedded to opt out of forward compatibility for this service.
 // Use of this interface is not recommended, as added methods to JobExecutorServer will
@@ -428,7 +426,7 @@ func (c *jobSchedulerClient) ReportResult(ctx context.Context, in *ReportResultR
 }
 
 // JobSchedulerServer is the server API for JobScheduler service.
-// All implementations must embed UnimplementedJobSchedulerServer
+// All implementations should embed UnimplementedJobSchedulerServer
 // for forward compatibility.
 //
 // ---------------------------------------------------------------------------
@@ -466,10 +464,9 @@ type JobSchedulerServer interface {
 	//	ABORTED   this attempt was fenced by a DIFFERENT token; discard and do not retry
 	//	NOT_FOUND unknown execution; discard
 	ReportResult(context.Context, *ReportResultRequest) (*ReportResultResponse, error)
-	mustEmbedUnimplementedJobSchedulerServer()
 }
 
-// UnimplementedJobSchedulerServer must be embedded to have
+// UnimplementedJobSchedulerServer should be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
@@ -488,8 +485,7 @@ func (UnimplementedJobSchedulerServer) ReportProgress(context.Context, *ReportPr
 func (UnimplementedJobSchedulerServer) ReportResult(context.Context, *ReportResultRequest) (*ReportResultResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportResult not implemented")
 }
-func (UnimplementedJobSchedulerServer) mustEmbedUnimplementedJobSchedulerServer() {}
-func (UnimplementedJobSchedulerServer) testEmbeddedByValue()                      {}
+func (UnimplementedJobSchedulerServer) testEmbeddedByValue() {}
 
 // UnsafeJobSchedulerServer may be embedded to opt out of forward compatibility for this service.
 // Use of this interface is not recommended, as added methods to JobSchedulerServer will

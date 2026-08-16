@@ -14,7 +14,9 @@ proto:
 	PATH="$(PATH):$(GOBIN)" protoc \
 		--proto_path=proto \
 		--go_out=. --go_opt=module=github.com/abcdeqwer/go-job \
-		--go-grpc_out=. --go-grpc_opt=module=github.com/abcdeqwer/go-job \
+		--go-grpc_out=. \
+		--go-grpc_opt=module=github.com/abcdeqwer/go-job \
+		--go-grpc_opt=require_unimplemented_servers=false \
 		proto/gojob/v1/executor.proto
 
 .PHONY: check

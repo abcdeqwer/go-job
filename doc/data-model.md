@@ -224,16 +224,49 @@ CREATE TABLE admin_user (
     PRIMARY KEY (username)
 );
 
+-- Admin sessions.
+--
+-- In the database rather than in each process, because the scheduler runs as a cluster behind
+-- a load balancer: a process-local map means signing in through one replica and getting a 401
+-- from the next, and signing OUT through one replica while the token stays valid on every
+-- other. Only the token's SHA-256 is stored, so a backup is not a set of live sessions.
+CREATE TABLE admin_session (
+    token_sha256 CHAR(64)     NOT NULL,
+    username     VARCHAR(64)  NOT NULL,
+    role         VARCHAR(16)  NOT NULL,
+    created_at   DATETIME     NOT NULL,
+    expires_at   DATETIME     NOT NULL,
+    PRIMARY KEY (token_sha256),
+    KEY idx_admin_session_expiry (expires_at)
+);
+
 -- Which authenticated identity may register as what. Without this table the authorization
 -- rule in dispatch.md has no source of truth, and "bound to (tenant, group)" is a sentence
 -- rather than a check.
+--
+-- One row per (identity, tenant): an identity acts for a tenant as at most one group, and a
+-- key that allowed several would make "which group is this?" a query with more than one
+-- answer. An empty executor_group means any group.
+--
+-- An identity with NO row for a tenant is REFUSED. An earlier revision treated an empty table
+-- as "authorization not configured, allow everything", which in an mTLS installation means any
+-- certificate the client CA ever signed can register as an arbitrary production tenant and be
+-- handed that tenant's work.
 CREATE TABLE executor_identity (
-    identity       VARCHAR(255) NOT NULL,   -- mTLS subject, or credential id
+    identity       VARCHAR(255) NOT NULL,   -- mTLS subject, or the name a token is issued to
     tenant         VARCHAR(64)  NOT NULL,
-    executor_group VARCHAR(64)  NOT NULL,
+    executor_group VARCHAR(64)  NOT NULL DEFAULT '',   -- empty = any group
+
+    -- SHA-256, hex, of a shared token, for deployments that cannot run mTLS. NULL when the
+    -- identity authenticates by certificate — which is the arrangement to prefer, because a
+    -- certificate is revocable, is not replayable, and does not have to be distributed to
+    -- every executor as a secret in an environment variable.
+    token_sha256   CHAR(64)     NULL,
+
     disabled       TINYINT(1)   NOT NULL DEFAULT 0,
     created_at     DATETIME     NOT NULL,
-    PRIMARY KEY (identity, tenant, executor_group)
+    PRIMARY KEY (identity, tenant),
+    KEY idx_executor_identity_token (token_sha256)
 );
 
 -- Actions on the registry itself: adding, disabling or re-pointing a tenant.

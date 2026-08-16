@@ -41,7 +41,10 @@ type Authenticator interface {
 	Authenticate(ctx context.Context) (Identity, error)
 
 	// Authorize checks that an identity may act for a tenant and group.
-	Authorize(ctx context.Context, id Identity, tenant, group string) error
+	//
+	// checkGroup is false for messages that carry no group; see the implementation's comment
+	// for why enforcing one against them breaks every callback an executor makes.
+	Authorize(ctx context.Context, id Identity, tenant, group string, checkGroup bool) error
 }
 
 // ErrNoIdentity means the call carried no usable credential.
@@ -71,6 +74,20 @@ type DBAuthenticator struct {
 	// it off is a deliberate choice for a deployment whose network genuinely is the boundary,
 	// and it is logged at startup so nobody discovers it by reading the code.
 	RequireCredential bool
+
+	// AllowUnlistedIdentities lets an authenticated caller act for any tenant when
+	// executor_identity holds no row for it.
+	//
+	// It is off by default, and that matters more than it looks. An earlier version treated an
+	// EMPTY table as "authorization not configured, allow everything" — which in an mTLS
+	// installation means any certificate the configured client CA ever signed can register as
+	// an arbitrary production tenant and be handed that tenant's jobs and parameters. A
+	// bootstrap convenience that grants the whole system to anything the CA trusts is not a
+	// bootstrap convenience.
+	//
+	// Bootstrapping is instead: insert the row, then start. It is one INSERT, and it is
+	// visible in the audit trail rather than in nobody's memory.
+	AllowUnlistedIdentities bool
 }
 
 // Authenticate reads a credential off the call.
@@ -94,38 +111,35 @@ func (a *DBAuthenticator) Authenticate(ctx context.Context) (Identity, error) {
 	return Identity{Subject: "anonymous"}, nil
 }
 
-// Authorize checks the identity against the tenant's executor_identity rows.
+// Authorize checks the identity against executor_identity.
 //
-// An installation with NO identity rows for a tenant is open for that tenant, deliberately:
-// requiring rows before anything can register would make a fresh installation impossible to
-// start without a chicken-and-egg step. The moment one row exists, the table is authoritative
-// and an unlisted identity is refused — so turning it on is adding a row, not flipping a flag
-// somewhere else.
-func (a *DBAuthenticator) Authorize(ctx context.Context, id Identity, tenant, group string) error {
-	var configured int
-	if err := a.DB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM executor_identity WHERE disabled = 0`).Scan(&configured); err != nil {
-		// A table this query cannot read must not fail open. The whole point of the check is
-		// that it is the last thing between a reachable port and a tenant's work.
-		return status.Errorf(codes.Internal, "read executor identities: %v", err)
-	}
-	if configured == 0 {
-		return nil
-	}
-
+// checkGroup is false for the calls that carry no group — Heartbeat, ReportProgress,
+// ReportResult. Only Register names one, and enforcing a group requirement against a message
+// that structurally cannot carry it would authorize the registration and then refuse every
+// callback for the same executor: it would go stale, and its results would be denied, while
+// looking to an operator like an executor that registered and then died.
+func (a *DBAuthenticator) Authorize(ctx context.Context, id Identity, tenant, group string, checkGroup bool) error {
 	var allowedGroup string
 	err := a.DB.QueryRowContext(ctx, `
 		SELECT executor_group FROM executor_identity
 		WHERE identity = ? AND tenant = ? AND disabled = 0`,
 		id.Subject, tenant).Scan(&allowedGroup)
+
 	if errors.Is(err, sql.ErrNoRows) {
+		if a.AllowUnlistedIdentities {
+			return nil
+		}
 		return status.Errorf(codes.PermissionDenied,
-			"identity %q is not authorized for this tenant", id.Subject)
+			"identity %q is not authorized for tenant %q; add a row to executor_identity",
+			id.Subject, tenant)
 	}
 	if err != nil {
+		// A table this query cannot read must not fail open. The whole point of the check is
+		// that it is the last thing between a reachable port and a tenant's work.
 		return status.Errorf(codes.Internal, "read executor identity: %v", err)
 	}
-	if allowedGroup != "" && allowedGroup != group {
+	if checkGroup && allowedGroup != "" && allowedGroup != group {
+		// A canary registering as the main group would silently take production traffic.
 		return status.Errorf(codes.PermissionDenied,
 			"identity %q may act only as group %q, not %q", id.Subject, allowedGroup, group)
 	}
@@ -212,9 +226,9 @@ func UnaryAuthInterceptor(auth Authenticator) grpc.UnaryServerInterceptor {
 		if err != nil {
 			return nil, err
 		}
-		tenant, group := tenantAndGroupOf(req)
+		tenant, group, hasGroup := tenantAndGroupOf(req)
 		if tenant != "" {
-			if err := auth.Authorize(ctx, id, tenant, group); err != nil {
+			if err := auth.Authorize(ctx, id, tenant, group, hasGroup); err != nil {
 				return nil, err
 			}
 		}
@@ -239,7 +253,7 @@ func IdentityFrom(ctx context.Context) Identity {
 // A request whose tenant cannot be determined is authenticated but not authorized against a
 // tenant, and every handler resolves the tenant itself anyway — so an unrecognised message
 // type fails in the handler rather than silently skipping a check it was supposed to make.
-func tenantAndGroupOf(req any) (tenant, group string) {
+func tenantAndGroupOf(req any) (tenant, group string, hasGroup bool) {
 	type tenanted interface{ GetTenant() string }
 	type grouped interface{ GetGroup() string }
 
@@ -247,7 +261,7 @@ func tenantAndGroupOf(req any) (tenant, group string) {
 		tenant = t.GetTenant()
 	}
 	if g, ok := req.(grouped); ok {
-		group = g.GetGroup()
+		group, hasGroup = g.GetGroup(), true
 	}
-	return tenant, group
+	return tenant, group, hasGroup
 }

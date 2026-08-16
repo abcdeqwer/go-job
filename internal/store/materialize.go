@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -657,11 +660,35 @@ func nullBytes(b []byte) any {
 
 // CronExecutionKey derives the idempotency key for a cron fire instant.
 //
-// It uses the instant's Unix second, not its wall clock. A wall-clock key would collide
-// during a fall-back hour, where two real instants share one local time — and a collision
-// there is silent, because a duplicate key is exactly how this design expresses "already
-// materialized". The instant is unambiguous, and it also means re-pointing a job at a
-// different time zone produces genuinely different keys rather than accidental matches.
+// It uses the instant's Unix second, not its wall clock. A wall-clock key would collide during
+// a fall-back hour, where two real instants share one local time — and a collision there is
+// silent, because a duplicate key is exactly how this design expresses "already materialized".
+// The instant is unambiguous, and it also means re-pointing a job at a different time zone
+// produces genuinely different keys rather than accidental matches.
 func CronExecutionKey(jobName string, fireAt time.Time) string {
-	return fmt.Sprintf("c:%s:%d", jobName, fireAt.Unix())
+	return ExecutionKey("c", jobName, strconv.FormatInt(fireAt.Unix(), 10))
 }
+
+// ExecutionKey builds a key that is legible, bounded and injective.
+//
+// The column is VARCHAR(160) and a job name may be 128 characters, so the obvious
+// `<prefix>:<job>:<discriminator>` overruns it — for a 122-character fixed-delay job plus a
+// UUID it is 161, and EVERY materialization fails. Truncating instead is worse: two request
+// ids sharing a prefix would produce one key, insertExecution would read the duplicate as its
+// expected idempotency race, and the second caller would be told its run was accepted when no
+// execution exists for it.
+//
+// So the key carries as much of the readable form as fits, plus a hash of the FULL input. The
+// hash is what makes it injective; the prefix is what makes it possible to read a log line.
+func ExecutionKey(prefix, jobName, discriminator string) string {
+	full := prefix + ":" + jobName + ":" + discriminator
+	if len(full) <= maxExecutionKey {
+		return full
+	}
+	sum := sha256.Sum256([]byte(full))
+	suffix := "~" + hex.EncodeToString(sum[:12]) // 24 hex chars plus the marker
+	return full[:maxExecutionKey-len(suffix)] + suffix
+}
+
+// maxExecutionKey is job_execution.execution_key's width.
+const maxExecutionKey = 160

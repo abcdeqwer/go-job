@@ -247,6 +247,16 @@ func (s *Store) Retire(ctx context.Context, jobName, actor, reason string) error
 	now := s.clock.Now()
 
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		// The state row first, in the canonical order.
+		//
+		// Without it, retirement races materialization: a materializer holding the lock has
+		// already read the old definition, and inserts its execution after this transaction's
+		// cancellation scan has run. That row is then `ready` on a retired job — permanently
+		// deferred, because every claim rejects it as unrunnable, and permanently blocking the
+		// schema's quiescence.
+		if _, err := lockState(ctx, tx, jobName); err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_definition
 			SET retired = 1, enabled = 0, version = version + 1, updated_by = ?, updated_at = ?
@@ -324,10 +334,7 @@ func (s *Store) Trigger(ctx context.Context, jobName, requestID, actor, reason s
 	}
 
 	now := s.clock.Now()
-	key := fmt.Sprintf("m:%s:%s", jobName, requestID)
-	if len(key) > 160 {
-		key = key[:160]
-	}
+	key := ExecutionKey("m", jobName, requestID)
 
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		def, err := readDefinition(ctx, tx, jobName)
@@ -654,26 +661,44 @@ func (s *Store) DeclaredHandlers(ctx context.Context, liveness time.Duration) ([
 	return out, rows.Err()
 }
 
-// Quiescent reports whether anything is still held in this schema.
+// Quiescence is what a schema still has outstanding.
+type Quiescence struct {
+	// Held is the number of jobs some execution currently owns, and InFlight the executions
+	// actually running. Together they are what a DSN cutover must wait for: two schemas in
+	// service for one tenant would each correctly exclude only themselves.
+	Held     int
+	InFlight int
+
+	// Queued is `ready` work — created, not started, owned by nobody. It does NOT block a
+	// cutover, because a disabled tenant has no scheduler draining it and gating on it would
+	// make a cutover permanently unreachable. It is reported instead, because abandoning it
+	// silently is not something an operator should discover afterwards.
+	Queued int
+}
+
+// Quiet reports whether a cutover may proceed.
+func (q Quiescence) Quiet() bool { return q.Held == 0 && q.InFlight == 0 }
+
+// Quiescent counts what this schema still has outstanding.
 //
 // It is the mechanical half of a DSN cutover: acknowledgement can only say who REPLIED, while
-// this says whether anything is actually held. An instance partitioned from the control
-// database stops reporting but is still perfectly able to reach this one, so its rows are
-// visible here even though its acknowledgements are not.
-func (s *Store) Quiescent(ctx context.Context) (bool, error) {
-	var held, outstanding int
+// this says what is actually held. An instance partitioned from the control database stops
+// replying but is still perfectly able to reach this one, so its rows are visible here even
+// though its acknowledgements are not.
+func (s *Store) Quiescent(ctx context.Context) (Quiescence, error) {
+	var q Quiescence
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM job_state WHERE active_kind IS NOT NULL`).Scan(&held); err != nil {
-		return false, fmt.Errorf("count held jobs: %w", err)
+		`SELECT COUNT(*) FROM job_state WHERE active_kind IS NOT NULL`).Scan(&q.Held); err != nil {
+		return q, fmt.Errorf("count held jobs: %w", err)
 	}
-	// `ready` counts too. It is not held by anyone, but it IS work this schema still expects
-	// to run: leaving it behind on a cutover either loses it, or runs it later if anything
-	// ever points at the old schema again. A cutover that silently drops queued work is not a
-	// cutover an operator can reason about.
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM job_execution
-		 WHERE status IN ('ready', 'dispatching', 'running', 'cancel_requested')`).Scan(&outstanding); err != nil {
-		return false, fmt.Errorf("count outstanding executions: %w", err)
+		 WHERE status IN ('dispatching', 'running', 'cancel_requested')`).Scan(&q.InFlight); err != nil {
+		return q, fmt.Errorf("count in-flight executions: %w", err)
 	}
-	return held == 0 && outstanding == 0, nil
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM job_execution WHERE status = 'ready'`).Scan(&q.Queued); err != nil {
+		return q, fmt.Errorf("count queued executions: %w", err)
+	}
+	return q, nil
 }

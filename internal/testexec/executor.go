@@ -25,9 +25,16 @@ import (
 type Handler func(ctx context.Context, params map[string]any) (summary string, err error)
 
 // Executor hosts handlers and talks to a scheduler.
+//
+// It does NOT embed UnimplementedJobExecutorServer, and the generated code is produced with
+// require_unimplemented_servers=false so that it does not have to. Embedding the stub supplies
+// UNIMPLEMENTED for every method an implementation forgot, which is exactly the failure the
+// contract is generated to prevent: a missing method would compile here and be discovered at
+// registration, in production, by an executor that cannot be reconciled with.
+//
+// The cost is that adding an RPC to the contract breaks every executor's build until it is
+// implemented. That is the intended cost.
 type Executor struct {
-	gojobv1.UnimplementedJobExecutorServer
-
 	ID       string
 	Group    string
 	Address  string
