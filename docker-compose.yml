@@ -6,6 +6,9 @@
 services:
   mysql:
     image: mysql:8.4
+    # Not a requirement — go-job writes and compares ownership with UTC_TIMESTAMP() and
+    # business columns as values it computes, so the server's zone participates in nothing.
+    # It is set here only so a human running `SELECT NOW()` against the demo sees UTC.
     command: --default-time-zone=+00:00
     environment:
       MYSQL_ROOT_PASSWORD: gojob

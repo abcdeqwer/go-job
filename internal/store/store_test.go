@@ -1257,3 +1257,73 @@ func TestInsertAssignmentsPairColumnsWithValues(t *testing.T) {
 		t.Error("an unpairable INSERT was treated as auditable")
 	}
 }
+
+// The two clock families must never meet in one expression.
+//
+// This became possible to get wrong when ownership moved to UTC_TIMESTAMP(). Before, both
+// families were the session's wall clock and a cross-family comparison was merely
+// ill-advised; now they are genuinely different wall clocks living in adjacent columns of the
+// same row — `deadline_at` holds UTC, `started_at` holds business time — so
+// `TIMESTAMPDIFF(SECOND, started_at, deadline_at)` is wrong by the business offset, silently,
+// and correct on any machine whose business location happens to be UTC. Which is every
+// machine these tests run on.
+func TestClockFamiliesAreNeverCompared(t *testing.T) {
+	const (
+		business  = `available_at|scheduled_at|next_fire_at|next_poll_at|started_at|finished_at|created_at|updated_at`
+		ownership = `lease_until|heartbeat_at|deadline_at|timeout_at`
+	)
+	var (
+		bizCol  = regexp.MustCompile(`(?i)(?:\w+\.)?\b(` + business + `)\b`)
+		ownCol  = regexp.MustCompile(`(?i)(?:\w+\.)?\b(` + ownership + `)\b`)
+		compare = regexp.MustCompile(`(?i)(?:\w+\.)?\b(` + business + `|` + ownership + `)\s*(?:<=|>=|<|>|=)\s*`)
+		order   = regexp.MustCompile(`(?i)(?:\w+\.)?\b(` + business + `|` + ownership + `)\s*(?:<=|>=|<|>)\s*`)
+		mixer   = regexp.MustCompile(`(?i)\b(TIMESTAMPDIFF|TIMESTAMPADD|GREATEST|LEAST|DATEDIFF)\s*\(`)
+	)
+	mixes := func(expr string) bool {
+		return bizCol.MatchString(expr) && ownCol.MatchString(expr)
+	}
+
+	var checked int
+	for _, s := range sqlStatementsInPackage(t) {
+		norm := strings.Join(strings.Fields(s), " ")
+
+		// Comparisons, in two passes with different operator sets.
+		//
+		// Inside WHERE, `=` is a comparison. Outside it, `=` is an assignment — and an
+		// ownership column may legitimately appear in a SET clause as a discriminator, as in
+		// `available_at = IF(timeout_at < UTC_TIMESTAMP(), available_at, ...)`, which decides
+		// a branch rather than comparing the two clocks. So outside WHERE only the ordering
+		// operators are read, which are never assignments.
+		where := ""
+		if i := strings.Index(strings.ToUpper(norm), " WHERE "); i >= 0 {
+			where, norm = norm[i:], norm[:i]
+		}
+		for _, pass := range []struct {
+			text string
+			re   *regexp.Regexp
+		}{{where, compare}, {norm, order}} {
+			for _, loc := range pass.re.FindAllStringSubmatchIndex(pass.text, -1) {
+				checked++
+				lhs, rhs := pass.text[loc[2]:loc[3]], balancedExpr(pass.text[loc[1]:])
+				if mixes(lhs + " " + rhs) {
+					t.Errorf("a business column and an ownership column are compared (%q against "+
+						"%q); they hold different wall clocks, so the comparison is wrong by the "+
+						"business offset and right on any UTC machine:\n  %s %s", lhs, rhs, norm, where)
+				}
+			}
+		}
+
+		// And arithmetic: a duration between the two families is the same defect.
+		for _, loc := range mixer.FindAllStringSubmatchIndex(norm+" "+where, -1) {
+			checked++
+			full := norm + " " + where
+			if args := balancedList(full[loc[1]:]); mixes(args) {
+				t.Errorf("%s combines a business column with an ownership column in %q:\n  %s",
+					full[loc[2]:loc[3]], args, full)
+			}
+		}
+	}
+	if checked < 10 {
+		t.Fatalf("inspected only %d expressions; the extractor is probably broken", checked)
+	}
+}
