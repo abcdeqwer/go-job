@@ -300,3 +300,21 @@ func HandlerIsServed(ctx context.Context, tx *sql.Tx, def gojob.Definition, live
 	}
 	return true, nil
 }
+
+// ExecutorAddress resolves a registration to its address.
+//
+// An empty address with no error means the registration is gone — reaped, or the executor
+// deregistered. That is a real answer rather than a failure: there is no process to reconcile
+// with, so the attempt is unknown and recovery says so.
+func (s *Store) ExecutorAddress(ctx context.Context, executorID string) (string, error) {
+	var addr string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT address FROM job_executor WHERE executor_id = ?`, executorID).Scan(&addr)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve executor %q: %w", executorID, err)
+	}
+	return addr, nil
+}

@@ -598,3 +598,19 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 		}, now)
 	})
 }
+
+// Definition reads a job's configuration outside a transaction, for callers that need it to
+// make a routing or lease decision before they claim.
+//
+// It is deliberately NOT what the claim uses. The claim re-reads under the state row's lock,
+// because a configuration read before the lock can be stale by the time the lock is taken —
+// and claiming under one configuration while tracking under another is how a lease is renewed
+// at the wrong interval.
+func (s *Store) Definition(ctx context.Context, jobName string) (gojob.Definition, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return gojob.Definition{}, fmt.Errorf("begin read of %q: %w", jobName, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	return readDefinition(ctx, tx, jobName)
+}

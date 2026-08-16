@@ -1,0 +1,383 @@
+// Package engine runs the scheduler's loops for one tenant.
+//
+// Every instance runs the same loops and none of them is a leader. Materialization takes the
+// state row FOR UPDATE SKIP LOCKED so exactly one instance creates a given fire instant;
+// claiming is guarded by the same row; recovery is idempotent under its guards. What makes
+// that safe is specified in doc/protocol.md — this package is the part that decides WHEN each
+// transaction runs, not what it means.
+package engine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"strings"
+	"sync"
+	"time"
+
+	gojob "github.com/abcdeqwer/go-job"
+	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
+	"github.com/abcdeqwer/go-job/internal/cron"
+	"github.com/abcdeqwer/go-job/internal/dispatch"
+	"github.com/abcdeqwer/go-job/internal/store"
+)
+
+// Config is the timing of the loops. Every value has a failure at the wrong setting, so the
+// defaults live in the root package's defaults.go with their reasons.
+type Config struct {
+	InstanceID string
+	Tenant     string
+
+	ScanInterval      time.Duration
+	RecoverInterval   time.Duration
+	ReapInterval      time.Duration
+	MisfireGrace      time.Duration
+	ExecutorLiveness  time.Duration
+	ExecutorRetention time.Duration
+
+	// PageSize bounds every discovery query. Unbounded pages turn a backlog into one very
+	// long transaction and a memory spike at the worst possible moment.
+	PageSize int
+
+	// BackoffBase and BackoffMax bound retry, contention and orphan deferral. Deterministic
+	// base, jitter applied after, so the sequence stays testable.
+	BackoffBase time.Duration
+	BackoffMax  time.Duration
+
+	// ReconcileDeadline bounds recovery's GetExecution call.
+	ReconcileDeadline time.Duration
+
+	// DispatchResendLimit and DispatchResendWindow bound the unknown-outcome re-send. Without
+	// a bound an execution can be stranded permanently: an executor whose outbound heartbeats
+	// still succeed stays registration-live, so it keeps being chosen, while its Run path is
+	// unreachable and never answers — the scheduler would re-send for ever, renewing both
+	// leases each cycle, so the lease never expires, recovery never runs, and no budget is
+	// ever consumed.
+	DispatchResendLimit  int
+	DispatchResendWindow time.Duration
+}
+
+// Fence is the control-plane self-fence. Every loop asks it before doing anything, so a
+// partitioned instance stops acting rather than continuing to hold work invisibly.
+type Fence interface{ Check() error }
+
+// Engine runs one tenant.
+type Engine struct {
+	cfg   Config
+	store *store.Store
+	disp  *dispatch.Client
+	clock gojob.Clock
+	fence Fence
+	log   *slog.Logger
+
+	// tracked holds the executions this instance owns, so the heartbeat loop knows what to
+	// renew. It is a cache of what the database already says, never the authority: an entry
+	// missing from it costs a recovery cycle, an entry wrongly present is fenced on its next
+	// renewal.
+	mu      sync.Mutex
+	tracked map[int64]store.Holder
+
+	// schedules caches compiled cron expressions by expression text. Compilation is cheap but
+	// happens inside a transaction holding the job's lock, and the cache keeps that window
+	// from including a parse.
+	schedMu   sync.RWMutex
+	schedules map[string]*cron.Expression
+
+	wg   sync.WaitGroup
+	stop chan struct{}
+	once sync.Once
+}
+
+// New builds an engine. It does not start any loops.
+func New(cfg Config, st *store.Store, disp *dispatch.Client, clock gojob.Clock, fence Fence, log *slog.Logger) *Engine {
+	return &Engine{
+		cfg:       cfg,
+		store:     st,
+		disp:      disp,
+		clock:     clock,
+		fence:     fence,
+		log:       log.With("tenant", cfg.Tenant, "instance", cfg.InstanceID),
+		tracked:   make(map[int64]store.Holder),
+		schedules: make(map[string]*cron.Expression),
+		stop:      make(chan struct{}),
+	}
+}
+
+// Start launches every loop.
+func (e *Engine) Start(ctx context.Context) {
+	loops := []struct {
+		name     string
+		interval time.Duration
+		fn       func(context.Context)
+	}{
+		{"materialize", e.cfg.ScanInterval, e.materializePass},
+		{"drift", e.cfg.ScanInterval * 2, e.driftPass},
+		{"dispatch", e.cfg.ScanInterval, e.dispatchPass},
+		{"heartbeat", e.heartbeatInterval(), e.heartbeatPass},
+		{"recover", e.cfg.RecoverInterval, e.recoverPass},
+		{"timeout", e.cfg.RecoverInterval, e.timeoutPass},
+		{"reap", e.cfg.ReapInterval, e.reapPass},
+	}
+	for _, l := range loops {
+		e.wg.Add(1)
+		go e.runLoop(ctx, l.name, l.interval, l.fn)
+	}
+}
+
+// Stop stops claiming and waits for the loops to finish.
+//
+// It does NOT release the leases of work still in flight. If a handler has not proved it
+// stopped, its lease is left to expire rather than released: expiry is not proof a handler
+// stopped, but releasing early is a guarantee that a second executor may start while the
+// first is still writing.
+func (e *Engine) Stop() {
+	e.once.Do(func() { close(e.stop) })
+	e.wg.Wait()
+}
+
+func (e *Engine) heartbeatInterval() time.Duration {
+	// A third of the shortest lease any job may configure. The schema's floor is ten seconds,
+	// so three seconds is the interval that keeps even that job's lease alive.
+	return 3 * time.Second
+}
+
+// runLoop ticks fn, with jitter so a fleet restarted together does not synchronise into a
+// thundering herd against one state row.
+func (e *Engine) runLoop(ctx context.Context, name string, interval time.Duration, fn func(context.Context)) {
+	defer e.wg.Done()
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	// Stagger the first tick across the interval so seven loops in fifty instances do not all
+	// fire at the same millisecond.
+	select {
+	case <-time.After(jitter(interval)):
+	case <-e.stop:
+		return
+	case <-ctx.Done():
+		return
+	}
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.stop:
+			return
+		case <-t.C:
+			if err := e.fence.Check(); err != nil {
+				// Fenced. Not an error to log every tick — it is already visible in readiness.
+				continue
+			}
+			e.safely(ctx, name, fn)
+		}
+	}
+}
+
+// safely runs one pass and turns a panic into a logged error rather than a dead loop.
+//
+// A panic in one pass must not take the scheduler down: the other loops are still holding
+// leases, and a process that exits without renewing them turns a bug in the drift scan into a
+// recovery cycle for every running job.
+func (e *Engine) safely(ctx context.Context, name string, fn func(context.Context)) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Error("scheduler loop panicked", "loop", name, "panic", r)
+		}
+	}()
+	fn(ctx)
+}
+
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(d)))
+}
+
+// backoff computes a bounded, deterministic delay, with jitter applied afterwards so the base
+// sequence stays testable.
+func (e *Engine) backoff(attempt int) int {
+	base := e.cfg.BackoffBase
+	if base <= 0 {
+		base = 5 * time.Second
+	}
+	max := e.cfg.BackoffMax
+	if max <= 0 {
+		max = 5 * time.Minute
+	}
+	d := base
+	for i := 0; i < attempt && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	d += jitter(d / 4)
+	s := int(d / time.Second)
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
+// compile turns a definition into a schedule, from the definition read INSIDE the
+// materialization transaction. The cache is keyed by expression text rather than by job name,
+// so an edit produces a different key and cannot be served a stale compilation.
+func (e *Engine) compile(def gojob.Definition) (store.Schedule, error) {
+	if def.ScheduleKind != gojob.ScheduleCron {
+		return nil, fmt.Errorf("%w: %q is not a cron job", gojob.ErrProtocol, def.JobName)
+	}
+	e.schedMu.RLock()
+	got, ok := e.schedules[def.ScheduleExpr]
+	e.schedMu.RUnlock()
+	if ok {
+		return got, nil
+	}
+
+	parsed, err := cron.Parse(def.ScheduleExpr)
+	if err != nil {
+		return nil, fmt.Errorf("job %q: %w", def.JobName, err)
+	}
+	e.schedMu.Lock()
+	e.schedules[def.ScheduleExpr] = parsed
+	e.schedMu.Unlock()
+	return parsed, nil
+}
+
+// track and untrack maintain the heartbeat set.
+func (e *Engine) track(h store.Holder) {
+	e.mu.Lock()
+	e.tracked[h.ExecutionID] = h
+	e.mu.Unlock()
+}
+
+func (e *Engine) untrack(id int64) {
+	e.mu.Lock()
+	delete(e.tracked, id)
+	e.mu.Unlock()
+}
+
+func (e *Engine) holders() []store.Holder {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]store.Holder, 0, len(e.tracked))
+	for _, h := range e.tracked {
+		out = append(out, h)
+	}
+	return out
+}
+
+// Tracking reports how many executions this instance owns. Graceful shutdown and the
+// quiescence check both need it, and so does the admin UI.
+func (e *Engine) Tracking() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.tracked)
+}
+
+// heartbeatPass renews the lease of everything this instance owns.
+//
+// A renewal that affects zero rows means ownership is lost. The handler context is abandoned,
+// fence_lost is emitted, and the execution is dropped from the tracked set — after which this
+// instance makes no further write for it. That is what makes a revived zombie harmless.
+func (e *Engine) heartbeatPass(ctx context.Context) {
+	for _, h := range e.holders() {
+		lease := e.leaseSecondsFor(ctx, h.JobName)
+		if err := e.store.Renew(ctx, h, lease); err != nil {
+			if errors.Is(err, gojob.ErrFenced) {
+				e.log.Warn("fence lost; abandoning execution",
+					"job", h.JobName, "execution", h.ExecutionKey, "epoch", h.FenceEpoch)
+			} else {
+				e.log.Error("lease renewal failed", "job", h.JobName,
+					"execution", h.ExecutionKey, "error", err)
+			}
+			e.untrack(h.ExecutionID)
+		}
+	}
+}
+
+// leaseSecondsFor reads a job's configured lease. A read failure falls back to the schema's
+// floor rather than to zero: renewing for zero seconds would expire the lease instantly and
+// hand a healthy execution to recovery.
+func (e *Engine) leaseSecondsFor(ctx context.Context, jobName string) int {
+	def, err := e.store.Definition(ctx, jobName)
+	if err != nil || def.Lease <= 0 {
+		return 30
+	}
+	return int(def.Lease / time.Second)
+}
+
+// reapPass removes registrations of executors that stopped heartbeating long ago, and reports
+// jobs no live executor can run.
+//
+// An orphan is never dispatched and never marked failed — nothing was attempted — so the only
+// way anyone learns about it is this log line. That is the difference between noticing in a
+// minute that a job has no executor and noticing next week that it stopped running.
+func (e *Engine) reapPass(ctx context.Context) {
+	if n, err := e.store.ReapExecutors(ctx, e.cfg.ExecutorRetention); err != nil {
+		e.log.Error("reaping dead executors failed", "error", err)
+	} else if n > 0 {
+		e.log.Info("reaped dead executor registrations", "count", n)
+	}
+
+	orphans, err := e.store.Orphans(ctx, e.cfg.ExecutorLiveness)
+	if err != nil {
+		e.log.Error("orphan scan failed", "error", err)
+		return
+	}
+	for _, o := range orphans {
+		e.log.Warn("job has no live executor",
+			"job", o.JobName, "handler", o.HandlerKey, "group", o.Group)
+	}
+}
+
+// dispositionToOutcome maps a conforming executor's reported disposition onto the scheduler's
+// terminal vocabulary. The bool is whether the attempt may be retried.
+//
+// DISPOSITION_UNSPECIFIED is treated as a failure rather than as a success. An executor that
+// does not say what happened has not said it worked, and the expensive mistake is the other
+// one: recording success for a run whose outcome nobody stated.
+func dispositionToOutcome(d gojobv1.Disposition, failureKind string) (gojob.Status, gojob.TerminalReason, gojob.AttemptOutcome, bool) {
+	switch d {
+	case gojobv1.Disposition_DISPOSITION_SUCCESS:
+		return gojob.StatusSuccess, gojob.ReasonHandlerConfirmed, gojob.AttemptSuccess, false
+
+	case gojobv1.Disposition_DISPOSITION_STOPPED:
+		// The handler confirmed it stopped, which is the only way `cancelled` is reached with
+		// side effects actually accounted for.
+		return gojob.StatusCancelled, gojob.ReasonHandlerConfirmed, gojob.AttemptFailed, false
+
+	case gojobv1.Disposition_DISPOSITION_TIMED_OUT:
+		// Deliberately not retryable: a job that exhausted its entire runtime budget will most
+		// likely exhaust it again, and retrying is how one slow run becomes an afternoon of
+		// them. An operator who disagrees can retry it explicitly, which is exactly the
+		// judgement a human should make and the scheduler should not.
+		return gojob.StatusDead, gojob.ReasonTimeout, gojob.AttemptFailed, false
+
+	default:
+		if permanentFailure(failureKind) {
+			return gojob.StatusDead, gojob.ReasonPermanentFailure, gojob.AttemptFailed, false
+		}
+		return gojob.StatusDead, "", gojob.AttemptFailed, true
+	}
+}
+
+// permanentFailure decides whether a reported failure kind is worth retrying.
+//
+// The contract is a naming convention rather than an enum, because failure kinds are the
+// executor's vocabulary and an enum here would mean every new kind of permanent failure needs
+// a scheduler release. A kind is permanent if it is exactly "permanent" or is namespaced
+// under "permanent." — so `permanent.validation` and `permanent.not_found` need no change here.
+//
+// Retrying a validation failure is not merely wasteful: it burns the attempt budget on an
+// input that cannot become valid, so the row reaches `dead` with a budget-exhausted reason
+// that hides the actual cause.
+func permanentFailure(kind string) bool {
+	return kind == "permanent" || strings.HasPrefix(kind, "permanent.")
+}
