@@ -11,6 +11,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,11 @@ type Config struct {
 	ExecutorLiveness time.Duration
 	InstanceLiveness time.Duration
 	Clock            gojob.Clock
+
+	// OpenDB opens a coordination schema by DSN. The API needs it to prove an old schema is
+	// quiescent and to verify a new one's identity before a cutover — both of which have to
+	// talk to the database in question rather than to whatever this replica happens to hold.
+	OpenDB func(dsn string) (*sql.DB, error)
 }
 
 // API is the operator HTTP surface.
@@ -320,18 +326,84 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 	if err := requireReason(body.Reason); err != nil {
 		return err
 	}
+	if body.DSN == "" || body.SchemaUUID == "" {
+		return badRequest("dsn and schema_uuid are required; the uuid is what the new schema " +
+			"must present, and without it a mistyped DSN is undetectable")
+	}
 	name := r.PathValue("tenant")
 
-	quiet := true
-	if st, ok := a.tenants.Store(name); ok {
-		q, err := st.Quiescent(r.Context())
-		if err != nil {
-			return err
-		}
-		quiet = q
+	// Quiescence is proven against the OLD schema, by opening it directly.
+	//
+	// Asking THIS replica's admitted set cannot work: the tenant must be disabled before a
+	// cutover, and a disabled tenant has already been retired from every replica — so the
+	// check would find no store and pass by default, which is the opposite of what it is for.
+	//
+	// Acknowledgement counting cannot work either. It says who REPLIED; an instance
+	// partitioned from the control database stops replying while remaining perfectly able to
+	// reach the tenant's database, and its held rows are visible there even though its
+	// acknowledgements are not.
+	quiet, err := a.oldSchemaQuiescent(r.Context(), name)
+	if err != nil {
+		return err
 	}
+
+	// And the NEW schema must present the identity it is claimed to have, BEFORE the registry
+	// records it. Storing an unverified DSN moves the failure from this request — where an
+	// operator is watching and can fix it — to the next admission, where it surfaces as a
+	// tenant that silently stopped scheduling.
+	if err := a.verifyNewSchema(r.Context(), name, body.DSN, body.SchemaUUID); err != nil {
+		return err
+	}
+
 	return a.control.SetTenantDSN(r.Context(), name, body.DSN, body.SchemaUUID,
 		ActorFrom(r.Context()), quiet)
+}
+
+// oldSchemaQuiescent opens the tenant's CURRENT coordination schema and asks it directly.
+func (a *API) oldSchemaQuiescent(ctx context.Context, name string) (bool, error) {
+	tenants, err := a.control.Tenants(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, t := range tenants {
+		if t.Name != name {
+			continue
+		}
+		if t.Enabled {
+			return false, fmt.Errorf("%w: %s must be disabled before its DSN can change",
+				control.ErrNotQuiesced, name)
+		}
+		db, err := a.cfg.OpenDB(t.DSN)
+		if err != nil {
+			return false, fmt.Errorf("%w: cannot open %s to prove it is quiescent: %v",
+				control.ErrNotQuiesced, name, err)
+		}
+		defer db.Close()
+
+		q, err := store.New(db, a.cfg.Clock).Quiescent(ctx)
+		if err != nil {
+			return false, fmt.Errorf("%w: cannot read %s to prove it is quiescent: %v",
+				control.ErrNotQuiesced, name, err)
+		}
+		return q, nil
+	}
+	return false, fmt.Errorf("%w: tenant %q", errNotFound, name)
+}
+
+// verifyNewSchema refuses a DSN whose schema is not the one it is claimed to be.
+func (a *API) verifyNewSchema(ctx context.Context, name, dsn, schemaUUID string) error {
+	db, err := a.cfg.OpenDB(dsn)
+	if err != nil {
+		return badRequest("cannot open the new DSN: %v", err)
+	}
+	defer db.Close()
+
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := control.Admit(probeCtx, db, name, schemaUUID, a.cfg.Clock.Location()); err != nil {
+		return badRequest("the new schema was refused: %v", err)
+	}
+	return nil
 }
 
 // quiescence reports who has not acknowledged the current generation, and whether the schema

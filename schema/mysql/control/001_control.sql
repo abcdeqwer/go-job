@@ -85,12 +85,46 @@ CREATE TABLE control_lease (
 -- and be handed that tenant's work by ordinary routing.
 -- ---------------------------------------------------------------------------
 CREATE TABLE executor_identity (
-    identity       VARCHAR(255) NOT NULL,   -- mTLS subject, or credential id
+    identity       VARCHAR(255) NOT NULL,   -- mTLS subject, or the name a token is issued to
     tenant         VARCHAR(64)  NOT NULL,
-    executor_group VARCHAR(64)  NOT NULL,
+
+    -- Empty means "any group". Naming one is what stops a canary in a partial rollout
+    -- registering as the main group and silently taking production traffic.
+    executor_group VARCHAR(64)  NOT NULL DEFAULT '',
+
+    -- SHA-256, hex, of a shared token — for deployments that cannot run mTLS. NULL when the
+    -- identity authenticates by certificate, which is the arrangement to prefer: a
+    -- certificate is revocable, is not replayable, and does not have to be distributed to
+    -- every executor as a secret in an environment variable.
+    --
+    -- The token itself is never stored. An operator who loses it issues a new one.
+    token_sha256   CHAR(64)     NULL,
+
     disabled       TINYINT(1)   NOT NULL DEFAULT 0,
     created_at     DATETIME     NOT NULL,
-    PRIMARY KEY (identity, tenant, executor_group)
+    PRIMARY KEY (identity, tenant),
+    KEY idx_executor_identity_token (token_sha256)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Admin sessions.
+--
+-- In the database rather than in each process's memory, because the scheduler runs as a
+-- cluster behind a load balancer. A process-local map means signing in through one replica
+-- and getting a 401 from the next, and — worse — signing OUT through one replica while the
+-- token stays valid on every other, which is the opposite of what pressing the button means.
+--
+-- Only the token's SHA-256 is stored. A stolen database backup is then not a set of live
+-- sessions, and no log line or error can print a usable one.
+-- ---------------------------------------------------------------------------
+CREATE TABLE admin_session (
+    token_sha256 CHAR(64)     NOT NULL,
+    username     VARCHAR(64)  NOT NULL,
+    role         VARCHAR(16)  NOT NULL,
+    created_at   DATETIME     NOT NULL,
+    expires_at   DATETIME     NOT NULL,
+    PRIMARY KEY (token_sha256),
+    KEY idx_admin_session_expiry (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------

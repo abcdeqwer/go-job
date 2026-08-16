@@ -60,8 +60,9 @@ type Registry struct {
 	disp    *dispatch.Client
 	log     *slog.Logger
 
-	mu      sync.RWMutex
-	tenants map[string]*tenant
+	mu        sync.RWMutex
+	tenants   map[string]*tenant
+	admitting map[string]bool
 
 	wg   sync.WaitGroup
 	stop chan struct{}
@@ -73,8 +74,9 @@ func NewRegistry(opts Options, ctl *control.Store, fence *control.Fence,
 	disp *dispatch.Client, log *slog.Logger) *Registry {
 	return &Registry{
 		opts: opts, control: ctl, fence: fence, disp: disp, log: log,
-		tenants: make(map[string]*tenant),
-		stop:    make(chan struct{}),
+		tenants:   make(map[string]*tenant),
+		admitting: make(map[string]bool),
+		stop:      make(chan struct{}),
 	}
 }
 
@@ -190,14 +192,46 @@ func (r *Registry) reconcile(ctx context.Context) {
 			r.observe(ctx, name, w.Generation)
 			continue
 		}
-		if err := r.admit(ctx, w); err != nil {
-			r.log.Error("admitting a tenant failed", "tenant", name, "error", err)
-			_ = r.control.RecordAdmission(ctx, name, "", err)
-			continue
+		// Admission runs OFF the poll loop.
+		//
+		// It opens a pool, verifies a schema and checks a time zone, each with its own
+		// timeout. Doing that inline serialises every tenant behind every other, and three
+		// unreachable ones consume the whole staleness limit — after which this instance
+		// fences ITSELF and stops scheduling for the tenants that were perfectly healthy. One
+		// tenant's database being down must not be able to stop the others.
+		if !r.beginAdmit(name) {
+			continue // already being admitted by an earlier pass
 		}
-		_ = r.control.RecordAdmission(ctx, name, control.SchemaVersion, nil)
-		r.observe(ctx, name, w.Generation)
+		go func(t control.Tenant) {
+			defer r.endAdmit(t.Name)
+			if err := r.admit(ctx, t); err != nil {
+				r.log.Error("admitting a tenant failed", "tenant", t.Name, "error", err)
+				_ = r.control.RecordAdmission(ctx, t.Name, "", err)
+				return
+			}
+			_ = r.control.RecordAdmission(ctx, t.Name, control.SchemaVersion, nil)
+			r.observe(ctx, t.Name, t.Generation)
+		}(w)
 	}
+}
+
+// beginAdmit claims the right to admit a tenant, so successive poll passes do not start a
+// second admission for one already in flight — which would open two pools and leave one of
+// them leaked behind whichever registration lost.
+func (r *Registry) beginAdmit(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.admitting[name] {
+		return false
+	}
+	r.admitting[name] = true
+	return true
+}
+
+func (r *Registry) endAdmit(name string) {
+	r.mu.Lock()
+	delete(r.admitting, name)
+	r.mu.Unlock()
 }
 
 // observe reports what this instance has applied, and whether it is holding anything.
@@ -228,6 +262,8 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	db.SetMaxIdleConns(r.opts.MaxIdleConns)
 	db.SetConnMaxLifetime(r.opts.ConnMaxLifetime)
 
+	// Bounded, and bounded well under the staleness limit even though this no longer runs on
+	// the poll loop: an admission that hangs holds a pool open and a goroutine with it.
 	admitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := control.Admit(admitCtx, db, t.Name, t.SchemaUUID, r.opts.Clock.Location()); err != nil {

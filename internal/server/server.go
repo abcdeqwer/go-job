@@ -243,6 +243,17 @@ func (s *Server) ReportProgress(ctx context.Context, req *gojobv1.ReportProgress
 		return nil, status.Errorf(codes.Internal, "read execution: %v", err)
 	}
 
+	// A cancelled run is told to stop HERE, not only through the outbound Cancel call.
+	//
+	// ReportProgress is the one call a long handler makes on a timer, so it is the channel a
+	// cancel is guaranteed to reach — an outbound Cancel needs the executor to be reachable
+	// from a scheduler, and a handler that is not watching its context never sees it at all.
+	// Answering proceed=true here told every cancelled handler to carry on, AND renewed its
+	// silence budget while doing so, so it ran to natural completion.
+	if row.Status == gojob.StatusCancelRequested {
+		return &gojobv1.ReportProgressResponse{Proceed: false}, nil
+	}
+
 	h := store.Holder{
 		JobName:      row.JobName,
 		ExecutionID:  row.ID,
@@ -284,6 +295,14 @@ func (s *Server) ReportResult(ctx context.Context, req *gojobv1.ReportResultRequ
 	}
 	if req.GetOutcome() == nil {
 		return nil, status.Error(codes.InvalidArgument, "outcome is required")
+	}
+	// An unspecified disposition is refused rather than absorbed. The proto requires one, and
+	// treating a missing one as a retryable failure consumes an attempt and reruns real work
+	// because a client sent an empty message — which is a bug in the caller that should be
+	// reported to the caller, not paid for by the job.
+	if req.GetOutcome().GetDisposition() == gojobv1.Disposition_DISPOSITION_UNSPECIFIED {
+		return nil, status.Error(codes.InvalidArgument,
+			"outcome.disposition is required; it is what says whether the work succeeded")
 	}
 
 	if _, err := st.Attempt(ctx, req.GetExecutionKey(), req.GetRunToken()); err == nil {

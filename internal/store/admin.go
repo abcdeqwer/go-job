@@ -25,16 +25,6 @@ type JobView struct {
 	ConfigVersion int64
 }
 
-const jobSelect = `
-	SELECT d.job_name, d.handler_key, COALESCE(d.executor_group, ''), d.schedule_kind, d.schedule_expr,
-	       d.enabled, d.retired, d.concurrency_policy, d.misfire_policy,
-	       d.max_attempts, d.max_recoveries, d.lease_seconds, d.timeout_seconds,
-	       d.params_json, COALESCE(d.description, ''), d.version, COALESCE(d.updated_by, ''),
-	       s.next_fire_at, s.next_poll_at, s.ops_paused,
-	       COALESCE(s.active_execution, ''), COALESCE(s.active_owner, ''),
-	       s.last_success_at, s.last_failure_at, s.config_version
-	FROM job_definition d JOIN job_state s ON s.job_name = d.job_name`
-
 func scanJob(rows interface{ Scan(...any) error }) (JobView, error) {
 	var (
 		v        JobView
@@ -59,7 +49,18 @@ func scanJob(rows interface{ Scan(...any) error }) (JobView, error) {
 
 // Jobs lists every job with its effective state.
 func (s *Store) Jobs(ctx context.Context) ([]JobView, error) {
-	rows, err := s.db.QueryContext(ctx, jobSelect+` ORDER BY d.job_name`)
+	const q = `
+		SELECT d.job_name, d.handler_key, COALESCE(d.executor_group, ''), d.schedule_kind, d.schedule_expr,
+		       d.enabled, d.retired, d.concurrency_policy, d.misfire_policy,
+		       d.max_attempts, d.max_recoveries, d.lease_seconds, d.timeout_seconds,
+		       d.params_json, COALESCE(d.description, ''), d.version, COALESCE(d.updated_by, ''),
+		       s.next_fire_at, s.next_poll_at, s.ops_paused,
+		       COALESCE(s.active_execution, ''), COALESCE(s.active_owner, ''),
+		       s.last_success_at, s.last_failure_at, s.config_version
+		FROM job_definition d JOIN job_state s ON s.job_name = d.job_name
+		ORDER BY d.job_name`
+
+	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -81,7 +82,18 @@ var ErrNoSuchJob = errors.New("gojob: no such job")
 
 // Job reads one job.
 func (s *Store) Job(ctx context.Context, name string) (JobView, error) {
-	row := s.db.QueryRowContext(ctx, jobSelect+` WHERE d.job_name = ?`, name)
+	const q = `
+		SELECT d.job_name, d.handler_key, COALESCE(d.executor_group, ''), d.schedule_kind, d.schedule_expr,
+		       d.enabled, d.retired, d.concurrency_policy, d.misfire_policy,
+		       d.max_attempts, d.max_recoveries, d.lease_seconds, d.timeout_seconds,
+		       d.params_json, COALESCE(d.description, ''), d.version, COALESCE(d.updated_by, ''),
+		       s.next_fire_at, s.next_poll_at, s.ops_paused,
+		       COALESCE(s.active_execution, ''), COALESCE(s.active_owner, ''),
+		       s.last_success_at, s.last_failure_at, s.config_version
+		FROM job_definition d JOIN job_state s ON s.job_name = d.job_name
+		WHERE d.job_name = ?`
+
+	row := s.db.QueryRowContext(ctx, q, name)
 	v, err := scanJob(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return JobView{}, fmt.Errorf("%w: %s", ErrNoSuchJob, name)
@@ -249,6 +261,38 @@ func (s *Store) Retire(ctx context.Context, jobName, actor, reason string) error
 		if n == 0 {
 			return fmt.Errorf("%w: job %q is already retired or does not exist", gojob.ErrProtocol, jobName)
 		}
+
+		// Outstanding work has to be resolved, not left. Retiring only the definition leaves
+		// ready rows non-terminal and permanently deferred — the definition is unrunnable, so
+		// every claim rejects them with a backoff for ever — and leaves running work with
+		// nobody expecting it. Both show in the UI as a retired job that is somehow still busy.
+		//
+		// `ready` goes straight to `cancelled`: nothing was attempted, so there is nothing to
+		// prove stopped.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE job_execution
+			SET write_seq = write_seq + 1,
+			    status = 'cancelled', terminal_reason = ?, finished_at = ?,
+			    result_summary = 'the job was retired before this run started',
+			    updated_at = ?
+			WHERE job_name = ? AND status = 'ready'`,
+			string(gojob.ReasonRetired), now, now, jobName); err != nil {
+			return fmt.Errorf("cancel pending work of %q: %w", jobName, err)
+		}
+
+		// Anything in flight goes to `cancel_requested`, which KEEPS its lease and its slot.
+		// Marking it cancelled here would release the job while a handler is still writing,
+		// which is the overlap the whole protocol exists to prevent — retirement is not a
+		// reason to make an exception.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE job_execution
+			SET write_seq = write_seq + 1,
+			    status = 'cancel_requested', updated_at = ?
+			WHERE job_name = ? AND status IN ('dispatching', 'running')`,
+			now, jobName); err != nil {
+			return fmt.Errorf("stop in-flight work of %q: %w", jobName, err)
+		}
+
 		return audit(ctx, tx, now, actor, "job_retired", jobName, "", reason)
 	})
 }
@@ -617,15 +661,19 @@ func (s *Store) DeclaredHandlers(ctx context.Context, liveness time.Duration) ([
 // database stops reporting but is still perfectly able to reach this one, so its rows are
 // visible here even though its acknowledgements are not.
 func (s *Store) Quiescent(ctx context.Context) (bool, error) {
-	var held, running int
+	var held, outstanding int
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM job_state WHERE active_kind IS NOT NULL`).Scan(&held); err != nil {
 		return false, fmt.Errorf("count held jobs: %w", err)
 	}
+	// `ready` counts too. It is not held by anyone, but it IS work this schema still expects
+	// to run: leaving it behind on a cutover either loses it, or runs it later if anything
+	// ever points at the old schema again. A cutover that silently drops queued work is not a
+	// cutover an operator can reason about.
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM job_execution
-		 WHERE status IN ('dispatching', 'running', 'cancel_requested')`).Scan(&running); err != nil {
-		return false, fmt.Errorf("count in-flight executions: %w", err)
+		 WHERE status IN ('ready', 'dispatching', 'running', 'cancel_requested')`).Scan(&outstanding); err != nil {
+		return false, fmt.Errorf("count outstanding executions: %w", err)
 	}
-	return held == 0 && running == 0, nil
+	return held == 0 && outstanding == 0, nil
 }

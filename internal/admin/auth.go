@@ -3,14 +3,15 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -77,20 +78,17 @@ type TrustedHeader struct {
 }
 
 // Auth is session authentication against the control database's local accounts.
+//
+// Sessions live in the control database, not in this process. The scheduler runs as a cluster
+// behind a load balancer, and a process-local map means signing in through one replica and
+// getting a 401 from the next — and, worse, signing OUT through one replica while the token
+// stays valid on every other.
 type Auth struct {
-	db       *sql.DB
-	clock    gojob.Clock
-	ttl      time.Duration
-	trusted  TrustedHeader
-	secure   bool
-	mu       sync.RWMutex
-	sessions map[string]session
-}
-
-type session struct {
-	actor     string
-	role      Role
-	expiresAt time.Time
+	db      *sql.DB
+	clock   gojob.Clock
+	ttl     time.Duration
+	trusted TrustedHeader
+	secure  bool
 }
 
 // NewAuth builds the authenticator. secure marks the session cookie Secure, which a
@@ -100,10 +98,7 @@ func NewAuth(db *sql.DB, clock gojob.Clock, ttl time.Duration, trusted TrustedHe
 	if trusted.DefaultRole == "" {
 		trusted.DefaultRole = RoleViewer
 	}
-	return &Auth{
-		db: db, clock: clock, ttl: ttl, trusted: trusted, secure: secure,
-		sessions: make(map[string]session),
-	}
+	return &Auth{db: db, clock: clock, ttl: ttl, trusted: trusted, secure: secure}
 }
 
 const sessionCookie = "gojob_session"
@@ -147,13 +142,26 @@ func (a *Auth) identify(r *http.Request) (string, Role, bool) {
 	if err != nil {
 		return "", "", false
 	}
-	a.mu.RLock()
-	s, ok := a.sessions[c.Value]
-	a.mu.RUnlock()
-	if !ok || a.clock.Now().After(s.expiresAt) {
+
+	var (
+		username string
+		role     string
+	)
+	err = a.db.QueryRowContext(r.Context(), `
+		SELECT username, role FROM admin_session
+		WHERE token_sha256 = ? AND expires_at > ?`,
+		hashToken(c.Value), a.clock.Now()).Scan(&username, &role)
+	if err != nil {
 		return "", "", false
 	}
-	return s.actor, s.role, true
+	return username, Role(role), true
+}
+
+// hashToken is what is stored and compared. The token itself never reaches the database, so a
+// backup is not a set of live sessions and nothing downstream can log a usable one.
+func hashToken(tok string) string {
+	sum := sha256.Sum256([]byte(tok))
+	return hex.EncodeToString(sum[:])
 }
 
 // login authenticates a local account and issues a session cookie.
@@ -181,7 +189,7 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := a.auth.issue(body.Username, role)
+	token, err := a.auth.issue(r.Context(), body.Username, role)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -200,7 +208,7 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		a.auth.revoke(c.Value)
+		a.auth.revoke(r.Context(), c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true,
@@ -244,30 +252,35 @@ func (a *Auth) verify(ctx context.Context, username, password string) (Role, err
 	return got, nil
 }
 
-func (a *Auth) issue(actor string, role Role) (string, error) {
+func (a *Auth) issue(ctx context.Context, actor string, role Role) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", fmt.Errorf("generate session token: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
+	now := a.clock.Now()
 
-	a.mu.Lock()
-	a.sessions[token] = session{actor: actor, role: role, expiresAt: a.clock.Now().Add(a.ttl)}
-	// Expired sessions are swept here rather than by a timer: the map only grows on login, so
-	// the moment a new one is added is exactly when it is worth looking.
-	for k, s := range a.sessions {
-		if a.clock.Now().After(s.expiresAt) {
-			delete(a.sessions, k)
-		}
+	if _, err := a.db.ExecContext(ctx, `
+		INSERT INTO admin_session (token_sha256, username, role, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		hashToken(token), actor, string(role), now, now.Add(a.ttl)); err != nil {
+		return "", fmt.Errorf("record session: %w", err)
 	}
-	a.mu.Unlock()
+
+	// Expired rows are swept on login rather than by a timer: the table only grows when
+	// someone signs in, so that is exactly when it is worth looking, and a scheduler that
+	// nobody logs into should not be running a background job to tidy an empty table.
+	if _, err := a.db.ExecContext(ctx,
+		`DELETE FROM admin_session WHERE expires_at <= ?`, now); err != nil {
+		// Not fatal: a session that could not be swept is still refused on its expiry.
+		_ = err
+	}
 	return token, nil
 }
 
-func (a *Auth) revoke(token string) {
-	a.mu.Lock()
-	delete(a.sessions, token)
-	a.mu.Unlock()
+func (a *Auth) revoke(ctx context.Context, token string) {
+	_, _ = a.db.ExecContext(ctx,
+		`DELETE FROM admin_session WHERE token_sha256 = ?`, hashToken(token))
 }
 
 // HashPassword produces a stored credential, for provisioning the first account.

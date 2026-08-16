@@ -11,71 +11,57 @@ import (
 	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
 )
 
-// The code table is the whole of this package's judgement, and every row of it decides
-// whether an attempt is charged. Getting one wrong is invisible until a job either marches to
-// `dead` without running or retries for ever.
+// Only an OK response carrying refused=true may release a job. This is the whole of this
+// package's judgement, and getting it wrong in the permissive direction runs a job twice.
 func TestClassifyRun(t *testing.T) {
+	accepted := &gojobv1.RunResponse{}
+	declined := &gojobv1.RunResponse{Refused: true, RefusalReason: "at capacity"}
+
 	cases := []struct {
 		name string
+		resp *gojobv1.RunResponse
 		err  error
 		want Answer
 	}{
-		{"nil is acceptance", nil, Accepted},
-		{"explicit OK", status.Error(codes.OK, ""), Accepted},
+		{"plain OK is acceptance", accepted, nil, Accepted},
+		{"OK with refused is the ONLY refusal", declined, nil, Refused},
 
-		// Provable non-delivery. No attempt is charged and another instance is tried.
-		{"at capacity", status.Error(codes.ResourceExhausted, "busy"), Refused},
-		{"shutting down", status.Error(codes.Unavailable, "draining"), Refused},
-		{"unknown handler", status.Error(codes.FailedPrecondition, "no such handler"), Refused},
+		// A status cannot prove non-delivery: the executor may have taken the work and the
+		// response been lost on the way back. Every one of these is Unknown, which keeps the
+		// lease and lets the re-send or recovery resolve it.
+		{"draining", nil, status.Error(codes.Unavailable, "draining"), Unknown},
+		{"at capacity by status", nil, status.Error(codes.ResourceExhausted, "busy"), Unknown},
+		{"unknown handler", nil, status.Error(codes.FailedPrecondition, "no handler"), Unknown},
+		{"bad request", nil, status.Error(codes.InvalidArgument, "bad params"), Unknown},
+		{"unauthenticated", nil, status.Error(codes.Unauthenticated, ""), Unknown},
+		{"method missing", nil, status.Error(codes.Unimplemented, ""), Unknown},
+		{"deadline exceeded", nil, status.Error(codes.DeadlineExceeded, ""), Unknown},
+		{"canceled", nil, status.Error(codes.Canceled, ""), Unknown},
+		{"internal", nil, status.Error(codes.Internal, ""), Unknown},
+		{"aborted", nil, status.Error(codes.Aborted, ""), Unknown},
+		{"data loss", nil, status.Error(codes.DataLoss, ""), Unknown},
+		{"not a status error", nil, errors.New("raw transport failure"), Unknown},
 
-		// The executor rejected the request itself. Retrying against the same fleet fails
-		// identically, so it is refused rather than looped — but the caller must alert.
-		{"bad request", status.Error(codes.InvalidArgument, "bad params"), Refused},
-		{"unauthenticated", status.Error(codes.Unauthenticated, ""), Refused},
-		{"permission denied", status.Error(codes.PermissionDenied, ""), Refused},
-		{"method missing", status.Error(codes.Unimplemented, ""), Refused},
-
-		// Outcome genuinely unknown: the request may or may not have arrived. Never Refused,
-		// because releasing the job while an executor may be running it is the one mistake
-		// this classification exists to avoid.
-		{"deadline exceeded", status.Error(codes.DeadlineExceeded, ""), Unknown},
-		{"canceled", status.Error(codes.Canceled, ""), Unknown},
-		{"internal", status.Error(codes.Internal, ""), Unknown},
-		{"aborted", status.Error(codes.Aborted, ""), Unknown},
-		{"unknown", status.Error(codes.Unknown, ""), Unknown},
-		{"data loss", status.Error(codes.DataLoss, ""), Unknown},
-		{"not a status error", errors.New("raw transport failure"), Unknown},
-
-		// Already held is an acceptance at this layer; WHICH attempt it is belongs to the
-		// caller, which is the only party that knows the token it sent.
-		{"already exists", status.Error(codes.AlreadyExists, "held"), Accepted},
+		// Without the token detail, which attempt the executor holds is unestablished, so the
+		// dispatch cannot be recorded as accepted.
+		{"already exists, no token", nil, status.Error(codes.AlreadyExists, "held"), Unknown},
 	}
 
 	for _, c := range cases {
-		got := classifyRun(c.err)
+		got := classifyRun(c.resp, c.err)
 		if got.Answer != c.want {
 			t.Errorf("%s: classifyRun = %v, want %v", c.name, got.Answer, c.want)
 		}
 	}
 }
 
-// Any gRPC code the table does not name must fall to Unknown, not to Refused. This is the
-// property that keeps a future code — or one from a proxy in the middle — from silently
-// releasing a job an executor is running.
-func TestUnnamedCodesAreUnknown(t *testing.T) {
-	named := map[codes.Code]bool{
-		codes.OK: true, codes.AlreadyExists: true,
-		codes.ResourceExhausted: true, codes.Unavailable: true, codes.FailedPrecondition: true,
-		codes.InvalidArgument: true, codes.PermissionDenied: true,
-		codes.Unauthenticated: true, codes.Unimplemented: true,
-	}
-	for c := codes.Code(0); c <= codes.Unauthenticated; c++ {
-		if named[c] {
-			continue
-		}
-		if got := classifyRun(status.Error(c, "")); got.Answer != Unknown {
-			t.Errorf("code %v classified %v; unnamed codes must be Unknown so a job is never "+
-				"released while an executor may be running it", c, got.Answer)
+// No status code may ever produce Refused. This is the property, checked across the whole
+// code space rather than against a list that can drift.
+func TestNoStatusCodeCanRelease(t *testing.T) {
+	for c := codes.Code(1); c <= codes.Unauthenticated; c++ {
+		if got := classifyRun(nil, status.Error(c, "")); got.Answer == Refused {
+			t.Errorf("code %v classified Refused; only an OK response with refused=true may "+
+				"release a job, because a status cannot prove the request was not delivered", c)
 		}
 	}
 }
@@ -89,22 +75,12 @@ func TestAlreadyExistsCarriesTheHeldToken(t *testing.T) {
 		t.Fatalf("build status: %v", err)
 	}
 
-	got := classifyRun(st.Err())
+	got := classifyRun(nil, st.Err())
 	if got.Answer != Accepted {
 		t.Fatalf("Answer = %v, want Accepted", got.Answer)
 	}
 	if got.HeldToken != "tok-A" {
 		t.Fatalf("HeldToken = %q, want %q", got.HeldToken, "tok-A")
-	}
-}
-
-// ALREADY_EXISTS without a detail is still an acceptance, with no token to compare. A caller
-// that cannot tell which attempt is held must treat it conservatively; losing the detail must
-// not turn into losing the classification.
-func TestAlreadyExistsWithoutDetail(t *testing.T) {
-	got := classifyRun(status.Error(codes.AlreadyExists, "held"))
-	if got.Answer != Accepted || got.HeldToken != "" {
-		t.Fatalf("got %v/%q, want Accepted with no token", got.Answer, got.HeldToken)
 	}
 }
 

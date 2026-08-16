@@ -614,3 +614,35 @@ func (s *Store) Definition(ctx context.Context, jobName string) (gojob.Definitio
 	defer func() { _ = tx.Rollback() }()
 	return readDefinition(ctx, tx, jobName)
 }
+
+// Retarget records a new dispatch target for an execution that has not been accepted.
+//
+// It is written BEFORE the send, for the same reason the claim writes dispatched_to before
+// the first one: the network call is the point of no return, so everything needed to reason
+// about it afterwards must already be durable. Routing to a second executor without moving
+// the record would leave recovery reconciling with the first — which would answer NOT_FOUND,
+// be classified unknown, and re-dispatch beside a handler the second executor is running.
+//
+// Guarded on `dispatching`, so a target cannot move under an accepted attempt.
+func (s *Store) Retarget(ctx context.Context, h Holder, executorID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE job_execution
+		SET write_seq     = write_seq + 1,
+		    dispatched_to = ?,
+		    updated_at    = ?
+		WHERE id = ? AND status = 'dispatching'
+		  AND run_token = ? AND fence_epoch = ?`,
+		executorID, s.clock.Now(), h.ExecutionID, h.RunToken, h.FenceEpoch)
+	if err != nil {
+		return fmt.Errorf("retarget execution %d: %w", h.ExecutionID, err)
+	}
+	n, err := affected(res, "retarget")
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: execution %d is no longer dispatching under token %s epoch %d",
+			gojob.ErrFenced, h.ExecutionID, h.RunToken, h.FenceEpoch)
+	}
+	return nil
+}

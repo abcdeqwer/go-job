@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -132,7 +133,7 @@ func (h *harness) startExecutorAndScheduler() {
 	}
 
 	h.exec = testexec.New("exec-1", "default", "bufnet", tenantName, 4)
-	h.disp = dispatch.NewClient(time.Second, 5*time.Second)
+	h.disp = dispatch.NewClient(time.Second, 5*time.Second, dispatch.Credentials{})
 	h.disp.SetDialer(dial)
 
 	grpcSrv := grpc.NewServer()
@@ -263,4 +264,10 @@ func compileFor(t *testing.T) store.Compile {
 	return func(d gojob.Definition) (store.Schedule, error) {
 		return cron.Parse(d.ScheduleExpr)
 	}
+}
+
+func stringReader(s string) io.Reader { return strings.NewReader(s) }
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }

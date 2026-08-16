@@ -39,6 +39,10 @@ service JobExecutor {
   // response is a promise that a result will eventually be reported through
   // JobScheduler.ReportResult.
   //
+  // A REFUSAL is `RunResponse.refused = true` with an OK status, never an error code. See
+  // that field for why: a status cannot separate an application refusal from a transport
+  // failure after delivery, and reading one as the other runs a job twice.
+  //
   // Errors carry meaning and are part of the contract:
   //   ALREADY_EXISTS      this (tenant, execution_key) is already held. The error's
   //                       ExecutionHeld detail carries the run_token actually held, because
@@ -46,9 +50,10 @@ service JobExecutor {
   //                       attempt after a timeout (adopt it), or a NEW attempt colliding
   //                       with an older one the scheduler already fenced (do not adopt —
   //                       the old handler is still running and this attempt never started)
-  //   RESOURCE_EXHAUSTED  at capacity; the scheduler will try another instance
-  //   UNAVAILABLE         shutting down; the scheduler will try another instance
-  //   FAILED_PRECONDITION unknown handler_key
+  //
+  // Anything else — RESOURCE_EXHAUSTED, UNAVAILABLE, FAILED_PRECONDITION, DEADLINE_EXCEEDED,
+  // INTERNAL — is read by the scheduler as an UNKNOWN outcome, not as a refusal. Use the
+  // field to refuse; use a status only when the call genuinely failed.
   rpc Run(RunRequest) returns (RunResponse);
 
   // Cancel asks the executor to stop an execution.
@@ -228,12 +233,34 @@ message RunRequest {
 }
 
 message RunResponse {
-  // Echoed for correlation in logs. Acceptance is signalled by an OK status, not a field:
-  // a refusal is an error code, so no caller can ignore it by forgetting to read a bool.
+  // Echoed for correlation in logs.
   string execution_key = 1;
 
   // The token the executor is now running. Equal to RunRequest.run_token on a fresh accept.
   string run_token = 2;
+
+  // Whether the executor DECLINED to take this work.
+  //
+  // A refusal is a field rather than a status code, and the reason is the only sound one
+  // available: a gRPC status cannot distinguish an application's refusal from a transport
+  // failure that occurred AFTER the request was delivered. UNAVAILABLE means "draining" when
+  // the executor sends it and "the connection broke" when the transport does — and the second
+  // can happen once the handler is already running. A scheduler that reads the second as the
+  // first releases the job and dispatches a successor alongside a live handler.
+  //
+  // An OK response carrying refused = false is therefore the ONLY proof a dispatch was
+  // declined. Every non-OK status other than ALREADY_EXISTS is treated as an unknown outcome:
+  // the execution keeps its lease and its recorded target, and either the bounded re-send or
+  // recovery resolves it.
+  //
+  // The zero value is "accepted", deliberately. An executor that answers OK without setting
+  // anything is read as having taken the work, which is the conservative reading: the
+  // scheduler waits for a result and recovery reconciles, rather than starting a second run.
+  bool refused = 3;
+
+  // Why, when refused is true. Free text for the operator, not parsed.
+  //   at capacity / draining / unknown handler <key>
+  string refusal_reason = 4;
 }
 
 // Detail attached to an ALREADY_EXISTS error from Run, and to GetExecutionResponse.

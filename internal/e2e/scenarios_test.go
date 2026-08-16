@@ -369,13 +369,10 @@ func TestCancelIsTwoSteps(t *testing.T) {
 		t.Fatalf("status = %q immediately after a cancel, want cancel_requested", row.Status)
 	}
 
-	// The engine relays the cancel to the executor on its next timeout pass; do it directly so
-	// the test does not depend on that interval.
-	if err := h.disp.Cancel(context.Background(), "bufnet", tenantName, key, row.RunToken, "test"); err != nil {
-		t.Fatal(err)
-	}
-
-	eventually(t, "the handler to confirm it stopped", 20*time.Second, func() bool {
+	// No manual relay. The engine's cancel pass must find the row and call the executor, and
+	// the executor's progress loop must see proceed=false — an earlier version of this test
+	// called Cancel itself, which hid the fact that neither happened.
+	eventually(t, "the handler to confirm it stopped", 25*time.Second, func() bool {
 		row, err := h.store.ExecutionByKey(context.Background(), key)
 		return err == nil && row.Status.Terminal()
 	})

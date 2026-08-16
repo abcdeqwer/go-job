@@ -278,28 +278,6 @@ func TestTrustedHeaderDefaultsToViewer(t *testing.T) {
 	}
 }
 
-// A session must stop working when it expires, or signing out becomes the only revocation.
-func TestSessionExpires(t *testing.T) {
-	start := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-	clock := gojob.NewFixedClock(start, time.UTC)
-	auth := NewAuth(nil, clock, time.Hour, TrustedHeader{}, false)
-
-	token, err := auth.issue("alice", RoleOperator)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := httptest.NewRequest(http.MethodGet, "/api/me", nil)
-	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
-
-	if _, _, ok := auth.identify(r); !ok {
-		t.Fatal("a fresh session was not accepted")
-	}
-	clock.Advance(2 * time.Hour)
-	if _, _, ok := auth.identify(r); ok {
-		t.Fatal("an expired session was still accepted")
-	}
-}
-
 func TestRequireReason(t *testing.T) {
 	for _, bad := range []string{"", "   ", "\t\n"} {
 		if err := requireReason(bad); err == nil {

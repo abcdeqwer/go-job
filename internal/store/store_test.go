@@ -651,13 +651,18 @@ func whereClause(norm string) string {
 	return norm[i+len(" WHERE "):]
 }
 
-// Statements must be whole string literals, never assembled with `+`.
+// Every SQL argument must be a whole string literal or a package-level constant.
 //
-// Every other static check in this file reads SQL out of the source. A statement built by
-// concatenation reaches those checks as a fragment — so its fence, its clocks and its
-// write_seq stop being verified, silently, and the checks keep reporting success. That is
-// worse than not having them.
-func TestNoConcatenatedSQL(t *testing.T) {
+// This replaces a check for `+` between two things that each looked like SQL, which was far
+// too narrow: `"UPDATE " + "job_execution SET ..."` slips past it, and so does a statement
+// built through a helper or a fmt.Sprintf. Any of those reaches the other static checks in
+// this file as a fragment or not at all — so its fence, its clocks and its write_seq stop
+// being verified, silently, while the checks keep reporting success.
+//
+// The rule is stated from the other side instead: whatever is handed to ExecContext,
+// QueryContext or QueryRowContext must be inspectable. A literal is; a named constant is,
+// because sqlStatementsInPackage resolves those; anything else is not.
+func TestEverySQLArgumentIsInspectable(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
@@ -665,35 +670,125 @@ func TestNoConcatenatedSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse package: %v", err)
 	}
+
+	consts := stringConsts(pkgs)
+	params := sqlParameterNames(pkgs)
+	var checked int
+
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			ast.Inspect(file, func(n ast.Node) bool {
-				bin, ok := n.(*ast.BinaryExpr)
-				if !ok || bin.Op != token.ADD {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
 					return true
 				}
-				for _, side := range []ast.Expr{bin.X, bin.Y} {
-					lit, ok := side.(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				switch sel.Sel.Name {
+				case "ExecContext", "QueryContext", "QueryRowContext":
+				default:
+					return true
+				}
+				// (ctx, query, args...)
+				if len(call.Args) < 2 {
+					return true
+				}
+				checked++
+
+				switch q := call.Args[1].(type) {
+				case *ast.BasicLit:
+					if q.Kind != token.STRING {
+						t.Errorf("%s: SQL argument is not a string literal", fset.Position(q.Pos()))
+					}
+				case *ast.Ident:
+					// A resolvable constant is fine — the extractor reads those too. So is a
+					// parameter: a helper that takes a statement is passed one from a call
+					// site, and THAT literal is what gets inspected. What is not fine is a
+					// name holding something this file cannot follow to a statement.
+					_, isConst := consts[q.Name]
+					if !isConst && !params[q.Name] {
+						t.Errorf("%s: SQL comes from %q, which this file cannot resolve to a "+
+							"statement — the fence, clock and write_seq checks cannot see it",
+							fset.Position(q.Pos()), q.Name)
+					}
+				default:
+					t.Errorf("%s: SQL is built rather than written out; the static checks read "+
+						"whole statements and would silently stop verifying this one",
+						fset.Position(call.Args[1].Pos()))
+				}
+				return true
+			})
+		}
+	}
+	if checked < 20 {
+		t.Fatalf("found only %d SQL calls; the extractor is probably broken", checked)
+	}
+}
+
+// stringConsts collects every string constant, package level or function local. The extractor
+// resolves the same set, so a statement held in one is still inspected.
+func stringConsts(pkgs map[string]*ast.Package) map[string]string {
+	out := map[string]string{}
+	collect := func(gd *ast.GenDecl) {
+		if gd.Tok != token.CONST {
+			return
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, n := range vs.Names {
+				if i < len(vs.Values) {
+					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						out[n.Name] = strings.Trim(lit.Value, "`\"")
+					}
+				}
+			}
+		}
+	}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				if gd, ok := n.(*ast.GenDecl); ok {
+					collect(gd)
+				}
+				return true
+			})
+		}
+	}
+	return out
+}
+
+// sqlParameterNames collects the names of `string` parameters, so a helper that runs a
+// statement handed to it is not flagged. The literal at the call site is what gets inspected.
+func sqlParameterNames(pkgs map[string]*ast.Package) map[string]bool {
+	out := map[string]bool{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				fd, ok := n.(*ast.FuncDecl)
+				if !ok || fd.Type.Params == nil {
+					return true
+				}
+				for _, f := range fd.Type.Params.List {
+					id, ok := f.Type.(*ast.Ident)
+					if !ok || id.Name != "string" {
 						continue
 					}
-					if looksLikeSQL(strings.Trim(lit.Value, "`\"")) {
-						t.Errorf("%s: SQL assembled with `+`; the static checks read whole "+
-							"literals and would silently stop verifying this statement",
-							fset.Position(bin.Pos()))
+					for _, name := range f.Names {
+						out[name.Name] = true
 					}
 				}
 				return true
 			})
 		}
 	}
+	return out
 }
 
-// looksLikeSQL needs both a leading keyword AND a table this schema actually has.
-//
-// The keyword alone matched error messages: `"update job %q: %w"` was being extracted as a
-// statement and then failed for having no witness column. A false positive here is worse than
-// a missed statement, because the way it gets silenced is by loosening the real checks.
 func looksLikeSQL(v string) bool {
 	head := strings.ToUpper(strings.TrimSpace(v))
 	var keyword bool

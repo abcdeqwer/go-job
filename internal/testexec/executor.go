@@ -109,9 +109,13 @@ func (e *Executor) Describe(ctx context.Context, _ *gojobv1.DescribeRequest) (*g
 func (e *Executor) Run(ctx context.Context, req *gojobv1.RunRequest) (*gojobv1.RunResponse, error) {
 	h, ok := e.handlers[req.GetHandlerKey()]
 	if !ok {
-		// FAILED_PRECONDITION, not INTERNAL: routing is wrong, no attempt was started, and the
-		// scheduler must not charge a retry for it.
-		return nil, status.Errorf(codes.FailedPrecondition, "no handler %q", req.GetHandlerKey())
+		// Refused in the body, for the same reason as capacity: this executor knows for
+		// certain it did not take the work, and only the body can say so unambiguously.
+		return &gojobv1.RunResponse{
+			ExecutionKey:  req.GetExecutionKey(),
+			Refused:       true,
+			RefusalReason: "no handler " + req.GetHandlerKey(),
+		}, nil
 	}
 
 	e.mu.Lock()
@@ -127,7 +131,15 @@ func (e *Executor) Run(ctx context.Context, req *gojobv1.RunRequest) (*gojobv1.R
 	}
 	if len(e.running) >= e.Capacity {
 		e.mu.Unlock()
-		return nil, status.Error(codes.ResourceExhausted, "at capacity")
+		// A refusal is the RESPONSE, not a status code. A status cannot tell the scheduler
+		// apart from a transport failure after delivery, and it would have to read the
+		// ambiguous case as unknown — which costs a re-send cycle for something this executor
+		// knows for certain.
+		return &gojobv1.RunResponse{
+			ExecutionKey:  req.GetExecutionKey(),
+			Refused:       true,
+			RefusalReason: "at capacity",
+		}, nil
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -158,6 +170,17 @@ func (e *Executor) execute(ctx context.Context, req *gojobv1.RunRequest, h Handl
 	if p := req.GetParams(); p != nil && p.GetValues() != nil {
 		params = p.GetValues().AsMap()
 	}
+
+	// Progress on a timer, independent of the handler. The handlers most likely to run for
+	// hours are the least able to check in, so an executor that only reported when its
+	// business code remembered to would leave exactly those looking dead.
+	//
+	// It also carries cancellation: proceed=false is how a stop reaches a handler that is not
+	// watching its context, and is the one channel guaranteed to reach a long run.
+	progressCtx, stopProgress := context.WithCancel(ctx)
+	ctx, cancelForStop := context.WithCancel(ctx)
+	go e.reportProgress(progressCtx, req, cancelForStop)
+	defer stopProgress()
 
 	summary, err := h(ctx, params)
 	oc := &gojobv1.ExecutionOutcome{Summary: summary, DidWork: true}
@@ -219,6 +242,39 @@ func (e *Executor) report(req *gojobv1.RunRequest, oc *gojobv1.ExecutionOutcome)
 			return
 		}
 		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+}
+
+// reportProgress extends the execution's silence budget until the handler ends.
+func (e *Executor) reportProgress(ctx context.Context, req *gojobv1.RunRequest, stop context.CancelFunc) {
+	if e.sched == nil {
+		return
+	}
+	interval := time.Duration(req.GetSilenceDeadlineSeconds()) * time.Second / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			resp, err := e.sched.ReportProgress(callCtx, &gojobv1.ReportProgressRequest{
+				Tenant:       e.Tenant,
+				ExecutionKey: req.GetExecutionKey(),
+				RunToken:     req.GetRunToken(),
+			})
+			cancel()
+			if err == nil && !resp.GetProceed() {
+				// Cancelled, or fenced. Either way this attempt must stop.
+				stop()
+				return
+			}
+		}
 	}
 }
 

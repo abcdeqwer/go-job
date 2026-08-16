@@ -18,7 +18,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -77,9 +79,26 @@ type Result struct {
 // Connections are cached by address rather than by executor id: a restarted executor mints a
 // new id but usually keeps its address, and a fresh connection per dispatch would pay a
 // handshake on every job in a fleet where handshakes are the expensive part.
+// Credentials are how the scheduler proves itself to an executor, and how it verifies the
+// executor in return.
+//
+// Both directions matter. Without server verification the scheduler will hand a job's
+// parameters to whatever answers at the recorded address; without a client credential the
+// executor cannot tell a scheduler from anything else that can reach its port.
+type Credentials struct {
+	// Transport is the gRPC credential. nil means plaintext, which is a deliberate choice for
+	// a deployment whose network genuinely is the boundary and is logged at startup.
+	Transport credentials.TransportCredentials
+
+	// BearerToken is sent as `authorization: Bearer <token>` on every call, for executors that
+	// authenticate the scheduler by shared secret rather than by certificate.
+	BearerToken string
+}
+
 type Client struct {
 	dialTimeout time.Duration
 	callTimeout time.Duration
+	creds       Credentials
 
 	mu    sync.Mutex
 	conns map[string]*grpc.ClientConn
@@ -92,10 +111,11 @@ type Client struct {
 // NewClient builds a dispatch client. callTimeout bounds Run, Cancel and Describe; recovery's
 // GetExecution passes its own, shorter deadline, because that one is made while a job's
 // recovery is waiting on it.
-func NewClient(dialTimeout, callTimeout time.Duration) *Client {
+func NewClient(dialTimeout, callTimeout time.Duration, creds Credentials) *Client {
 	return &Client{
 		dialTimeout: dialTimeout,
 		callTimeout: callTimeout,
+		creds:       creds,
 		conns:       make(map[string]*grpc.ClientConn),
 	}
 }
@@ -117,10 +137,15 @@ func (c *Client) conn(address string) (*grpc.ClientConn, error) {
 	dial := c.dialer
 	if dial == nil {
 		dial = func(target string) (*grpc.ClientConn, error) {
-			// Credentials are the deployment's business. go-job does not invent a TLS story
-			// for a link that is usually inside one network and, when it is not, needs the
-			// operator's own certificates rather than a default nobody audited.
-			return grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			transport := c.creds.Transport
+			if transport == nil {
+				transport = insecure.NewCredentials()
+			}
+			opts := []grpc.DialOption{grpc.WithTransportCredentials(transport)}
+			if c.creds.BearerToken != "" {
+				opts = append(opts, grpc.WithUnaryInterceptor(bearerInterceptor(c.creds.BearerToken)))
+			}
+			return grpc.NewClient(target, opts...)
 		}
 	}
 	cc, err := dial(address)
@@ -157,6 +182,15 @@ func (c *Client) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// bearerInterceptor attaches the scheduler's credential to every outbound call.
+func bearerInterceptor(token string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any,
+		cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
 }
 
 // RunSpec is one dispatch.
@@ -216,19 +250,30 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) Result {
 	callCtx, cancel := context.WithTimeout(ctx, c.callTimeout)
 	defer cancel()
 
-	_, err = gojobv1.NewJobExecutorClient(cc).Run(callCtx, req)
-	return classifyRun(err)
+	resp, err := gojobv1.NewJobExecutorClient(cc).Run(callCtx, req)
+	return classifyRun(resp, err)
 }
 
 // classifyRun maps a Run reply onto the three outcomes.
 //
-// The mapping is exhaustive by construction: anything not named is Unknown, which is the safe
-// default because Unknown never loses work — it keeps the execution `dispatching` with its
-// target recorded, so either the re-send or recovery resolves it. Guessing Refused for an
-// unrecognised code would be the dangerous default: it releases the job while an executor may
-// be running it.
-func classifyRun(err error) Result {
+// The rule is short because the sound version of it has to be: **only an OK response can be a
+// refusal**, and only through RunResponse.refused. A gRPC status cannot separate an
+// application's refusal from a transport failure that happened AFTER the request was
+// delivered — UNAVAILABLE means "draining" when the executor sends it and "the connection
+// broke" when the transport does, and the second can occur once the handler is already
+// running. Reading that as a refusal releases the job and dispatches a successor beside a live
+// handler, which is the one outcome this whole design exists to prevent.
+//
+// Everything else is therefore Unknown. Unknown never loses work: the execution keeps its
+// lease and its recorded target, and either the bounded re-send or recovery resolves it. The
+// cost is that an executor which signals draining with a status rather than the field pays one
+// re-send cycle. That is the right direction to be wrong in.
+func classifyRun(resp *gojobv1.RunResponse, err error) Result {
 	if err == nil {
+		if resp.GetRefused() {
+			return Result{Answer: Refused, Code: codes.OK,
+				Err: fmt.Errorf("executor declined: %s", resp.GetRefusalReason())}
+		}
 		return Result{Answer: Accepted, Code: codes.OK}
 	}
 
@@ -237,33 +282,22 @@ func classifyRun(err error) Result {
 		return Result{Answer: Unknown, Code: codes.Unknown, Err: err}
 	}
 
-	switch st.Code() {
-	case codes.OK:
-		return Result{Answer: Accepted, Code: codes.OK}
-
-	case codes.AlreadyExists:
-		// The executor already holds this execution key. Whether that is an acceptance
-		// depends on WHICH token it holds, which the caller decides — it is the only party
-		// that knows the token it just sent.
-		return Result{Answer: Accepted, Code: st.Code(), HeldToken: heldToken(st), Err: err}
-
-	case codes.ResourceExhausted, codes.Unavailable, codes.FailedPrecondition:
-		// Provable non-delivery. RESOURCE_EXHAUSTED is capacity, UNAVAILABLE is a shutting-down
-		// or unreachable process, FAILED_PRECONDITION is an unknown handler — routing is wrong
-		// and the caller alerts on it. None is a handler start.
-		return Result{Answer: Refused, Code: st.Code(), Err: err}
-
-	case codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
-		// The executor rejected the request itself. Retrying it against the same fleet will
-		// fail the same way, so it is refused rather than retried into a loop — but it is a
-		// configuration fault and the caller must alert, not quietly back off.
-		return Result{Answer: Refused, Code: st.Code(), Err: err}
-
-	default:
-		// DEADLINE_EXCEEDED, CANCELED, INTERNAL, UNKNOWN, ABORTED and anything new: the
-		// request may or may not have arrived.
-		return Result{Answer: Unknown, Code: st.Code(), Err: err}
+	if st.Code() == codes.AlreadyExists {
+		// The executor already holds this execution key. WHICH attempt it holds decides
+		// whether this is an acceptance, and only the token detail says — so a reply without
+		// one is Unknown, not Accepted. Recording an attempt as running while the executor is
+		// in fact running a different, already-fenced one invents a start that never happened
+		// and then waits for a result that belongs to someone else.
+		tok := heldToken(st)
+		if tok == "" {
+			return Result{Answer: Unknown, Code: st.Code(),
+				Err: fmt.Errorf("ALREADY_EXISTS carried no held token, so which attempt is "+
+					"running cannot be established: %w", err)}
+		}
+		return Result{Answer: Accepted, Code: st.Code(), HeldToken: tok, Err: err}
 	}
+
+	return Result{Answer: Unknown, Code: st.Code(), Err: err}
 }
 
 // heldToken pulls the run token out of an ALREADY_EXISTS status detail.

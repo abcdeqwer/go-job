@@ -30,9 +30,11 @@ type Decision struct {
 
 // Classify maps a disposition and failure kind onto a decision.
 //
-// DISPOSITION_UNSPECIFIED is a failure, not a success. An executor that does not say what
-// happened has not said it worked, and the expensive mistake is the other one: recording
-// success for a run whose outcome nobody stated.
+// DISPOSITION_UNSPECIFIED should never reach here — the gRPC boundary rejects it with
+// INVALID_ARGUMENT, because absorbing it consumes an attempt and reruns real work on account
+// of a caller sending an empty message. It is nonetheless classified as a failure rather than
+// a success, for the paths that do not go through that boundary: an executor that does not say
+// what happened has not said it worked, and the expensive mistake is the other one.
 func Classify(d gojobv1.Disposition, failureKind string) Decision {
 	switch d {
 	case gojobv1.Disposition_DISPOSITION_SUCCESS:

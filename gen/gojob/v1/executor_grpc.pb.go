@@ -60,6 +60,10 @@ type JobExecutorClient interface {
 	// response is a promise that a result will eventually be reported through
 	// JobScheduler.ReportResult.
 	//
+	// A REFUSAL is `RunResponse.refused = true` with an OK status, never an error code. See
+	// that field for why: a status cannot separate an application refusal from a transport
+	// failure after delivery, and reading one as the other runs a job twice.
+	//
 	// Errors carry meaning and are part of the contract:
 	//
 	//	ALREADY_EXISTS      this (tenant, execution_key) is already held. The error's
@@ -68,9 +72,10 @@ type JobExecutorClient interface {
 	//	                    attempt after a timeout (adopt it), or a NEW attempt colliding
 	//	                    with an older one the scheduler already fenced (do not adopt —
 	//	                    the old handler is still running and this attempt never started)
-	//	RESOURCE_EXHAUSTED  at capacity; the scheduler will try another instance
-	//	UNAVAILABLE         shutting down; the scheduler will try another instance
-	//	FAILED_PRECONDITION unknown handler_key
+	//
+	// Anything else — RESOURCE_EXHAUSTED, UNAVAILABLE, FAILED_PRECONDITION, DEADLINE_EXCEEDED,
+	// INTERNAL — is read by the scheduler as an UNKNOWN outcome, not as a refusal. Use the
+	// field to refuse; use a status only when the call genuinely failed.
 	Run(ctx context.Context, in *RunRequest, opts ...grpc.CallOption) (*RunResponse, error)
 	// Cancel asks the executor to stop an execution.
 	//
@@ -154,6 +159,10 @@ type JobExecutorServer interface {
 	// response is a promise that a result will eventually be reported through
 	// JobScheduler.ReportResult.
 	//
+	// A REFUSAL is `RunResponse.refused = true` with an OK status, never an error code. See
+	// that field for why: a status cannot separate an application refusal from a transport
+	// failure after delivery, and reading one as the other runs a job twice.
+	//
 	// Errors carry meaning and are part of the contract:
 	//
 	//	ALREADY_EXISTS      this (tenant, execution_key) is already held. The error's
@@ -162,9 +171,10 @@ type JobExecutorServer interface {
 	//	                    attempt after a timeout (adopt it), or a NEW attempt colliding
 	//	                    with an older one the scheduler already fenced (do not adopt —
 	//	                    the old handler is still running and this attempt never started)
-	//	RESOURCE_EXHAUSTED  at capacity; the scheduler will try another instance
-	//	UNAVAILABLE         shutting down; the scheduler will try another instance
-	//	FAILED_PRECONDITION unknown handler_key
+	//
+	// Anything else — RESOURCE_EXHAUSTED, UNAVAILABLE, FAILED_PRECONDITION, DEADLINE_EXCEEDED,
+	// INTERNAL — is read by the scheduler as an UNKNOWN outcome, not as a refusal. Use the
+	// field to refuse; use a status only when the call genuinely failed.
 	Run(context.Context, *RunRequest) (*RunResponse, error)
 	// Cancel asks the executor to stop an execution.
 	//

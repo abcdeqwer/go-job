@@ -9,6 +9,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -25,6 +27,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	gojob "github.com/abcdeqwer/go-job"
 	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
@@ -66,7 +69,15 @@ type config struct {
 	trustedRoleHeader string
 	cookieSecure      bool
 
+	tlsCert     string
+	tlsKey      string
+	tlsClientCA string
+	outboundCA  string
+	execToken   string
+	allowNoAuth bool
+
 	hashPassword string
+	hashToken    string
 }
 
 func run() error {
@@ -107,8 +118,23 @@ func run() error {
 	flag.BoolVar(&c.cookieSecure, "cookie-secure", env("GOJOB_COOKIE_SECURE", "") != "",
 		"mark the session cookie Secure; set this when serving over TLS")
 
+	flag.StringVar(&c.tlsCert, "tls-cert", env("GOJOB_TLS_CERT", ""),
+		"certificate for the executor-facing gRPC service")
+	flag.StringVar(&c.tlsKey, "tls-key", env("GOJOB_TLS_KEY", ""),
+		"private key for -tls-cert")
+	flag.StringVar(&c.tlsClientCA, "tls-client-ca", env("GOJOB_TLS_CLIENT_CA", ""),
+		"CA that executor client certificates are verified against; enables mTLS")
+	flag.StringVar(&c.outboundCA, "executor-ca", env("GOJOB_EXECUTOR_CA", ""),
+		"CA that executor server certificates are verified against when dispatching")
+	flag.StringVar(&c.execToken, "executor-token", env("GOJOB_EXECUTOR_TOKEN", ""),
+		"bearer token sent to executors when dispatching, for fleets not using mTLS")
+	flag.BoolVar(&c.allowNoAuth, "allow-unauthenticated-executors", false,
+		"accept executor calls that present no credential; only for a network that is itself the boundary")
+
 	flag.StringVar(&c.hashPassword, "hash-password", "",
 		"print a bcrypt hash for this password and exit, for provisioning the first account")
+	flag.StringVar(&c.hashToken, "hash-token", "",
+		"print the SHA-256 of an executor token for executor_identity.token_sha256, and exit")
 	flag.Parse()
 
 	if c.hashPassword != "" {
@@ -117,6 +143,10 @@ func run() error {
 			return err
 		}
 		fmt.Println(h)
+		return nil
+	}
+	if c.hashToken != "" {
+		fmt.Println(server.HashToken(c.hashToken))
 		return nil
 	}
 
@@ -157,7 +187,12 @@ func run() error {
 		return err
 	}
 	fence := control.NewFence(clock, c.stalenessLimit)
-	disp := dispatch.NewClient(5*time.Second, 10*time.Second)
+
+	outbound, err := outboundCredentials(c)
+	if err != nil {
+		return err
+	}
+	disp := dispatch.NewClient(5*time.Second, 10*time.Second, outbound)
 
 	reg := runtime.NewRegistry(runtime.Options{
 		InstanceID:      c.instanceID,
@@ -195,7 +230,24 @@ func run() error {
 
 	reg.Run(ctx)
 
-	grpcSrv := grpc.NewServer()
+	inbound, err := inboundCredentials(c, log)
+	if err != nil {
+		return err
+	}
+	auth := &server.DBAuthenticator{DB: controlDB, RequireCredential: !c.allowNoAuth}
+	if c.allowNoAuth {
+		// Said loudly, once, at startup. A mode that lets anything reachable register for a
+		// tenant and be handed that tenant's work is not something anyone should discover by
+		// reading the source.
+		log.Warn("executor calls are accepted WITHOUT a credential; " +
+			"anything that can reach the gRPC port can register for any tenant")
+	}
+
+	grpcOpts := []grpc.ServerOption{grpc.UnaryInterceptor(server.UnaryAuthInterceptor(auth))}
+	if inbound != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(inbound))
+	}
+	grpcSrv := grpc.NewServer(grpcOpts...)
 	gojobv1.RegisterJobSchedulerServer(grpcSrv, server.New(server.Config{
 		HeartbeatInterval: c.executorLiveness / 3,
 		RegistrationTTL:   c.executorLiveness,
@@ -218,6 +270,9 @@ func run() error {
 		ExecutorLiveness: c.executorLiveness,
 		InstanceLiveness: c.stalenessLimit * 3,
 		Clock:            clock,
+		OpenDB: func(dsn string) (*sql.DB, error) {
+			return sql.Open("mysql", withDefaults(dsn, loc))
+		},
 	}, reg, ctl, reg, admin.NewAuth(controlDB, clock, c.sessionTTL, admin.TrustedHeader{
 		Enabled:    c.trustedUserHeader != "",
 		UserHeader: c.trustedUserHeader,
@@ -340,4 +395,80 @@ func offsetOf(loc *time.Location) string {
 		sign, off = "-", -off
 	}
 	return fmt.Sprintf("%s%02d:%02d", sign, off/3600, (off%3600)/60)
+}
+
+// inboundCredentials builds the executor-facing TLS configuration.
+//
+// A certificate without a client CA is server-only TLS: executors verify the scheduler, and
+// the scheduler falls back to bearer tokens to identify them. Adding a client CA turns on
+// mTLS, which is the arrangement to prefer — a certificate is revocable and is not replayable,
+// while a shared token has to be distributed to every executor and lives in an environment
+// variable on each of them.
+func inboundCredentials(c config, log *slog.Logger) (credentials.TransportCredentials, error) {
+	if c.tlsCert == "" && c.tlsKey == "" {
+		if c.tlsClientCA != "" {
+			return nil, errors.New("-tls-client-ca needs -tls-cert and -tls-key: " +
+				"client certificates cannot be verified over a plaintext connection")
+		}
+		log.Warn("the executor gRPC service is PLAINTEXT; " +
+			"job parameters and results cross the network unencrypted")
+		return nil, nil
+	}
+	if c.tlsCert == "" || c.tlsKey == "" {
+		return nil, errors.New("-tls-cert and -tls-key must be given together")
+	}
+
+	cert, err := tls.LoadX509KeyPair(c.tlsCert, c.tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("load the gRPC certificate: %w", err)
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+
+	if c.tlsClientCA != "" {
+		pool, err := certPool(c.tlsClientCA)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ClientCAs = pool
+		// RequireAndVerify, not VerifyIfGiven. "Verify it if they bothered to send one" is a
+		// setting that reads like security and authenticates nobody.
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return credentials.NewTLS(cfg), nil
+}
+
+// outboundCredentials builds what the scheduler presents when dispatching.
+func outboundCredentials(c config) (dispatch.Credentials, error) {
+	out := dispatch.Credentials{BearerToken: c.execToken}
+	if c.outboundCA == "" {
+		return out, nil
+	}
+	pool, err := certPool(c.outboundCA)
+	if err != nil {
+		return out, err
+	}
+	cfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if c.tlsCert != "" && c.tlsKey != "" {
+		// The scheduler presents its own certificate too, so an executor can verify the caller
+		// rather than accepting a dispatch from anything that reaches it.
+		cert, err := tls.LoadX509KeyPair(c.tlsCert, c.tlsKey)
+		if err != nil {
+			return out, fmt.Errorf("load the dispatch client certificate: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	out.Transport = credentials.NewTLS(cfg)
+	return out, nil
+}
+
+func certPool(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("%s contains no certificates", path)
+	}
+	return pool, nil
 }

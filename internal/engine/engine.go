@@ -116,6 +116,8 @@ func (e *Engine) Start(ctx context.Context) {
 		{"heartbeat", e.heartbeatInterval(), e.heartbeatPass},
 		{"recover", e.cfg.RecoverInterval, e.recoverPass},
 		{"timeout", e.cfg.RecoverInterval, e.timeoutPass},
+		{"silence", e.cfg.RecoverInterval, e.silencePass},
+		{"cancel", e.cfg.RecoverInterval, e.cancelPass},
 		{"reap", e.cfg.ReapInterval, e.reapPass},
 	}
 	for _, l := range loops {
@@ -255,9 +257,18 @@ func (e *Engine) track(h store.Holder) {
 	e.mu.Unlock()
 }
 
-func (e *Engine) untrack(id int64) {
+// untrack stops renewing an execution, but ONLY if the holder currently tracked is the one
+// the caller was acting for.
+//
+// The epoch check is what stops an ABA. A heartbeat pass snapshots holder H1; recovery adopts
+// the same execution as H2 and replaces the entry; H1's renewal then fails, correctly, because
+// it is fenced — and an unconditional delete would remove H2. The adopted execution would stop
+// being renewed and fall into recovery again while its executor is still running.
+func (e *Engine) untrack(id int64, epoch int64) {
 	e.mu.Lock()
-	delete(e.tracked, id)
+	if cur, ok := e.tracked[id]; ok && cur.FenceEpoch == epoch {
+		delete(e.tracked, id)
+	}
 	e.mu.Unlock()
 }
 
@@ -287,15 +298,25 @@ func (e *Engine) Tracking() int {
 func (e *Engine) heartbeatPass(ctx context.Context) {
 	for _, h := range e.holders() {
 		lease := e.leaseSecondsFor(ctx, h.JobName)
-		if err := e.store.Renew(ctx, h, lease); err != nil {
-			if errors.Is(err, gojob.ErrFenced) {
-				e.log.Warn("fence lost; abandoning execution",
-					"job", h.JobName, "execution", h.ExecutionKey, "epoch", h.FenceEpoch)
-			} else {
-				e.log.Error("lease renewal failed", "job", h.JobName,
-					"execution", h.ExecutionKey, "error", err)
-			}
-			e.untrack(h.ExecutionID)
+		err := e.store.Renew(ctx, h, lease)
+		switch {
+		case err == nil:
+
+		case errors.Is(err, gojob.ErrFenced):
+			// Ownership is provably gone. Abandon the handler context and make no further
+			// write for this execution — that is what makes a revived zombie harmless.
+			e.log.Warn("fence lost; abandoning execution",
+				"job", h.JobName, "execution", h.ExecutionKey, "epoch", h.FenceEpoch)
+			e.untrack(h.ExecutionID, h.FenceEpoch)
+
+		default:
+			// A transient database error is NOT proof of losing ownership, and dropping the
+			// holder here would stop renewing a lease this instance still holds — turning one
+			// failed query into a recovery cycle for a healthy execution. Keep it; the lease
+			// has room for several missed renewals, and if the database really is gone the
+			// lease expires and recovery does the right thing anyway.
+			e.log.Error("lease renewal failed; keeping the holder and retrying",
+				"job", h.JobName, "execution", h.ExecutionKey, "error", err)
 		}
 	}
 }

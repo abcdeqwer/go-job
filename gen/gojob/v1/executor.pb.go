@@ -538,11 +538,32 @@ func (x *RunRequest) GetParams() *JobParams {
 
 type RunResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Echoed for correlation in logs. Acceptance is signalled by an OK status, not a field:
-	// a refusal is an error code, so no caller can ignore it by forgetting to read a bool.
+	// Echoed for correlation in logs.
 	ExecutionKey string `protobuf:"bytes,1,opt,name=execution_key,json=executionKey,proto3" json:"execution_key,omitempty"`
 	// The token the executor is now running. Equal to RunRequest.run_token on a fresh accept.
-	RunToken      string `protobuf:"bytes,2,opt,name=run_token,json=runToken,proto3" json:"run_token,omitempty"`
+	RunToken string `protobuf:"bytes,2,opt,name=run_token,json=runToken,proto3" json:"run_token,omitempty"`
+	// Whether the executor DECLINED to take this work.
+	//
+	// A refusal is a field rather than a status code, and the reason is the only sound one
+	// available: a gRPC status cannot distinguish an application's refusal from a transport
+	// failure that occurred AFTER the request was delivered. UNAVAILABLE means "draining" when
+	// the executor sends it and "the connection broke" when the transport does — and the second
+	// can happen once the handler is already running. A scheduler that reads the second as the
+	// first releases the job and dispatches a successor alongside a live handler.
+	//
+	// An OK response carrying refused = false is therefore the ONLY proof a dispatch was
+	// declined. Every non-OK status other than ALREADY_EXISTS is treated as an unknown outcome:
+	// the execution keeps its lease and its recorded target, and either the bounded re-send or
+	// recovery resolves it.
+	//
+	// The zero value is "accepted", deliberately. An executor that answers OK without setting
+	// anything is read as having taken the work, which is the conservative reading: the
+	// scheduler waits for a result and recovery reconciles, rather than starting a second run.
+	Refused bool `protobuf:"varint,3,opt,name=refused,proto3" json:"refused,omitempty"`
+	// Why, when refused is true. Free text for the operator, not parsed.
+	//
+	//	at capacity / draining / unknown handler <key>
+	RefusalReason string `protobuf:"bytes,4,opt,name=refusal_reason,json=refusalReason,proto3" json:"refusal_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -587,6 +608,20 @@ func (x *RunResponse) GetExecutionKey() string {
 func (x *RunResponse) GetRunToken() string {
 	if x != nil {
 		return x.RunToken
+	}
+	return ""
+}
+
+func (x *RunResponse) GetRefused() bool {
+	if x != nil {
+		return x.Refused
+	}
+	return false
+}
+
+func (x *RunResponse) GetRefusalReason() string {
+	if x != nil {
+		return x.RefusalReason
 	}
 	return ""
 }
@@ -1583,10 +1618,12 @@ const file_gojob_v1_executor_proto_rawDesc = "" +
 	"\x18silence_deadline_seconds\x18\b \x01(\x05R\x16silenceDeadlineSeconds\x12:\n" +
 	"\x19remaining_timeout_seconds\x18\t \x01(\x05R\x17remainingTimeoutSeconds\x12+\n" +
 	"\x06params\x18\n" +
-	" \x01(\v2\x13.gojob.v1.JobParamsR\x06params\"O\n" +
+	" \x01(\v2\x13.gojob.v1.JobParamsR\x06params\"\x90\x01\n" +
 	"\vRunResponse\x12#\n" +
 	"\rexecution_key\x18\x01 \x01(\tR\fexecutionKey\x12\x1b\n" +
-	"\trun_token\x18\x02 \x01(\tR\brunToken\"5\n" +
+	"\trun_token\x18\x02 \x01(\tR\brunToken\x12\x18\n" +
+	"\arefused\x18\x03 \x01(\bR\arefused\x12%\n" +
+	"\x0erefusal_reason\x18\x04 \x01(\tR\rrefusalReason\"5\n" +
 	"\rExecutionHeld\x12$\n" +
 	"\x0eheld_run_token\x18\x01 \x01(\tR\fheldRunToken\"\x81\x01\n" +
 	"\rCancelRequest\x12\x16\n" +
