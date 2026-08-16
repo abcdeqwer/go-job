@@ -11,6 +11,8 @@ package dispatch
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -415,14 +417,52 @@ func (c *Client) Describe(ctx context.Context, address string) (*gojobv1.Describ
 		}
 		return nil, fmt.Errorf("%w: Describe at %s: %v", ErrContractProbe, address, err)
 	}
-	if resp.GetContractVersion() == "" {
-		return nil, fmt.Errorf("%w: %s reports no contract version", ErrContractProbe, address)
+	if resp.GetContractVersion() != ContractVersion {
+		return nil, fmt.Errorf("%w: %s speaks contract version %q, this scheduler speaks %q",
+			ErrContractProbe, address, resp.GetContractVersion(), ContractVersion)
 	}
 	if len(resp.GetHandlerKeys()) == 0 {
 		return nil, fmt.Errorf("%w: %s declares no handlers", ErrContractProbe, address)
 	}
+
+	// Describe alone is not enough. It is the method an executor is most likely to have
+	// implemented, and an executor that has ONLY it registers, receives work, and then fails
+	// its first recovery with UNIMPLEMENTED — which is the state recovery has no answer for,
+	// discovered in production, on a job that is already running.
+	//
+	// So GetExecution is probed too, with a key nothing can hold. NOT_FOUND is the right
+	// answer and proves the method is there; UNIMPLEMENTED proves it is not. The two are
+	// distinguishable, which is the whole reason this contract is gRPC rather than
+	// hand-written HTTP.
+	probeCtx, probeCancel := context.WithTimeout(ctx, c.callTimeout)
+	defer probeCancel()
+
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("%w: generating a probe key: %v", ErrContractProbe, err)
+	}
+	_, err = gojobv1.NewJobExecutorClient(cc).GetExecution(probeCtx, &gojobv1.GetExecutionRequest{
+		ExecutionKey: "probe:" + hex.EncodeToString(nonce),
+	})
+	switch status.Code(err) {
+	case codes.NotFound:
+		// Implemented, and correctly says it has never heard of this. What we wanted.
+	case codes.Unimplemented:
+		return nil, fmt.Errorf("%w: %s does not implement GetExecution, so a lost execution "+
+			"could never be reconciled with it", ErrContractProbe, address)
+	case codes.OK:
+		return nil, fmt.Errorf("%w: %s claims to be running an execution key that has never "+
+			"existed", ErrContractProbe, address)
+	default:
+		return nil, fmt.Errorf("%w: probing GetExecution at %s: %v", ErrContractProbe, address, err)
+	}
+
 	return resp, nil
 }
+
+// ContractVersion is the executor contract this scheduler speaks. An executor reporting
+// anything else is refused at registration rather than at its first incompatible call.
+const ContractVersion = "1"
 
 // roundUpSeconds never rounds a positive duration down to zero, because zero means "no budget"
 // on the wire and would be read by the executor as an instruction to give up immediately.

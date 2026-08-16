@@ -40,8 +40,19 @@ type Prober interface {
 // which must look identical from outside. Telling an unauthenticated caller which tenant
 // names exist is a small leak, and telling it which are merely disabled is a larger one.
 type Tenants interface {
-	Store(tenant string) (*store.Store, bool)
+	// Lookup resolves a tenant, and says why when it cannot. The distinction is load-bearing:
+	// see resolve.
+	Lookup(tenant string) (*store.Store, Availability)
 }
+
+// Availability mirrors the registry's, so this package does not import it.
+type Availability int
+
+const (
+	Available Availability = iota
+	Pending
+	Unknown
+)
 
 // Fence is the control-plane self-fence. A partitioned instance refuses callbacks rather than
 // applying them, because it may no longer be the instance the registry believes is running.
@@ -97,11 +108,22 @@ func (s *Server) resolve(tenant string) (*store.Store, error) {
 	if tenant == "" {
 		return nil, status.Error(codes.InvalidArgument, "tenant is required")
 	}
-	st, ok := s.tenants.Store(tenant)
-	if !ok {
+	st, avail := s.tenants.Lookup(tenant)
+	switch avail {
+	case Available:
+		return st, nil
+	case Pending:
+		// UNAVAILABLE, not NOT_FOUND, and the difference is a lost result.
+		//
+		// An executor treats NOT_FOUND as terminal and discards what it was reporting. This
+		// instance being mid-admission, or having failed one, says nothing about whether the
+		// work happened — so answering NOT_FOUND would throw away a real result and leave
+		// recovery to record unknown and possibly rerun completed work. UNAVAILABLE tells the
+		// executor to retry, and a load balancer to try another instance.
+		return nil, status.Error(codes.Unavailable, "this scheduler has not admitted that tenant yet")
+	default:
 		return nil, status.Error(codes.NotFound, "unknown tenant")
 	}
-	return st, nil
 }
 
 // Register records an executor and reconciles what it says it is holding.

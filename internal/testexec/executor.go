@@ -207,18 +207,25 @@ func (e *Executor) execute(ctx context.Context, req *gojobv1.RunRequest, h Handl
 
 	summary, err := h(ctx, params)
 	oc := &gojobv1.ExecutionOutcome{Summary: summary, DidWork: true}
+
+	// The CONTEXT is checked before the error, not after.
+	//
+	// A cancellation-aware handler that notices ctx.Done() and returns cleanly returns a nil
+	// error — and reporting that as SUCCESS tells the scheduler work completed that was in fact
+	// stopped partway. The same applies at the cap: a handler that exits tidily when its
+	// deadline passes has not succeeded, it has run out of time.
 	switch {
-	case err == nil:
-		oc.Disposition = gojobv1.Disposition_DISPOSITION_SUCCESS
 	case ctx.Err() == context.DeadlineExceeded:
 		oc.Disposition = gojobv1.Disposition_DISPOSITION_TIMED_OUT
 		oc.FailureKind = "timeout"
-		oc.ErrorDetail = err.Error()
+		oc.ErrorDetail = errText(err, "the runtime cap elapsed")
 	case ctx.Err() == context.Canceled:
 		// The handler confirmed it stopped. This is the only path that reaches `cancelled`
 		// with side effects actually accounted for.
 		oc.Disposition = gojobv1.Disposition_DISPOSITION_STOPPED
-		oc.ErrorDetail = err.Error()
+		oc.ErrorDetail = errText(err, "the handler was asked to stop and did")
+	case err == nil:
+		oc.Disposition = gojobv1.Disposition_DISPOSITION_SUCCESS
 	default:
 		oc.Disposition = gojobv1.Disposition_DISPOSITION_FAILED
 		oc.FailureKind = "handler"
@@ -234,6 +241,13 @@ func (e *Executor) execute(ctx context.Context, req *gojobv1.RunRequest, h Handl
 	e.mu.Unlock()
 
 	e.report(req, oc)
+}
+
+func errText(err error, fallback string) string {
+	if err != nil {
+		return err.Error()
+	}
+	return fallback
 }
 
 // attemptKey identifies one attempt. The pair, not the execution: a retry is a different

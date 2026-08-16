@@ -286,6 +286,9 @@ func (a *API) addTenant(w http.ResponseWriter, r *http.Request) error {
 	if err := a.control.AddTenant(r.Context(), body.Tenant, body.DSN, body.SchemaUUID, actor); err != nil {
 		return err
 	}
+	if err := a.control.Audit(r.Context(), actor, "tenant_added_reason", body.Tenant, body.Reason); err != nil {
+		return err
+	}
 	writeJSON(w, http.StatusCreated, map[string]string{"tenant": body.Tenant})
 	return nil
 }
@@ -304,8 +307,14 @@ func (a *API) patchTenant(w http.ResponseWriter, r *http.Request) error {
 	if body.Enabled == nil {
 		return badRequest("enabled is required")
 	}
-	return a.control.SetTenantEnabled(r.Context(), r.PathValue("tenant"), *body.Enabled,
-		ActorFrom(r.Context()))
+	name := r.PathValue("tenant")
+	actor := ActorFrom(r.Context())
+	if err := a.control.SetTenantEnabled(r.Context(), name, *body.Enabled, actor); err != nil {
+		return err
+	}
+	// The operator's own words, alongside the action. An audit row that records only what
+	// changed is a row that answers the easy question.
+	return a.control.Audit(r.Context(), actor, "tenant_enablement_reason", name, body.Reason)
 }
 
 // repointTenant changes a coordination DSN, and refuses until the old schema is quiescent.
@@ -347,6 +356,39 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
+	// BOTH checks, not either. They cover different failures and neither subsumes the other.
+	//
+	// The schema scan says what is held RIGHT NOW. It cannot see an instance that has not yet
+	// polled the disable: such an instance still believes the tenant is enabled and can claim
+	// a moment after the scan returns empty.
+	//
+	// The acknowledgement check closes exactly that window — every live instance has applied
+	// the disable generation and reports holding nothing — and it in turn cannot see an
+	// instance partitioned from THIS database, which is why that instance self-fences and why
+	// the schema scan is still needed.
+	tenants, err := a.control.Tenants(r.Context())
+	if err != nil {
+		return err
+	}
+	var generation int64
+	for _, t := range tenants {
+		if t.Name == name {
+			generation = t.Generation
+		}
+	}
+	blockers, err := a.control.Blockers(r.Context(), name, generation, a.cfg.InstanceLiveness)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		names := make([]string, 0, len(blockers))
+		for _, b := range blockers {
+			names = append(names, b.InstanceID)
+		}
+		return fmt.Errorf("%w: %s has not been acknowledged as quiesced by %s",
+			control.ErrNotQuiesced, name, strings.Join(names, ", "))
+	}
+
 	// And the NEW schema must present the identity it is claimed to have, BEFORE the registry
 	// records it. Storing an unverified DSN moves the failure from this request — where an
 	// operator is watching and can fix it — to the next admission, where it surfaces as a
@@ -355,8 +397,11 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	return a.control.SetTenantDSN(r.Context(), name, body.DSN, body.SchemaUUID,
-		ActorFrom(r.Context()), quiet)
+	actor := ActorFrom(r.Context())
+	if err := a.control.SetTenantDSN(r.Context(), name, body.DSN, body.SchemaUUID, actor, quiet); err != nil {
+		return err
+	}
+	return a.control.Audit(r.Context(), actor, "tenant_dsn_reason", name, body.Reason)
 }
 
 // oldSchemaQuiescent opens the tenant's CURRENT coordination schema and asks it directly.

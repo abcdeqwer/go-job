@@ -43,7 +43,7 @@ type DueJob struct {
 //
 // `next_fire_at <= ?` takes the business clock: next_fire_at is a business column, computed
 // from the expression in the configured Location, and comparing it against the database's
-// NOW() is the mixed-clock bug this package exists to avoid.
+// UTC_TIMESTAMP() is the mixed-clock bug this package exists to avoid.
 //
 // Correctness never depends on this scan being prompt. A lost timer callback costs at most
 // one scan interval, because the state row still says the job is due; the in-process timer
@@ -68,7 +68,7 @@ func (s *Store) DuePoll(ctx context.Context, limit int) ([]DueJob, error) {
 //
 // The two queries are written out rather than generated from a column name. A statement
 // assembled with fmt.Sprintf reaches this package's static checks with `%s` where its columns
-// should be, so the check that business columns are never compared against NOW() would inspect
+// should be, so the check that business columns are never compared against UTC_TIMESTAMP() would inspect
 // `%s <= ?` and conclude nothing — the same blind spot as concatenation, one level quieter.
 func (s *Store) due(ctx context.Context, query string, limit int) ([]DueJob, error) {
 	rows, err := s.db.QueryContext(ctx, query, s.clock.Now(), limit)

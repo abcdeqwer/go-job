@@ -30,6 +30,11 @@ type Stale struct {
 	// reconciliation moves it, and that report is the evidence the execution is alive.
 	SilenceExpired bool
 
+	// LeaseLive is whether ownership has NOT yet lapsed. Once it has, the row belongs to
+	// recovery — the single path that clears an expired holder — and no other writer may act
+	// as its owner.
+	LeaseLive bool
+
 	// RemainingTimeout is what is LEFT of the runtime cap, measured by the database. It is
 	// what a dispatch must send, not the job's configured timeout: the cap starts at the
 	// claim, so a dispatch delayed by a re-send that hands over the full budget again leaves
@@ -52,7 +57,7 @@ type Stale struct {
 // there is one scan and one algorithm rather than a second mechanism for pollers that would
 // need its own correctness argument.
 //
-// `lease_until < NOW()` is an ownership comparison and uses the database clock. Comparing a
+// `lease_until < UTC_TIMESTAMP()` is an ownership comparison and uses the database clock. Comparing a
 // lease against a scheduler's own host clock would make ownership depend on skew between
 // machines, which is the one thing a distributed lease must not do.
 func (s *Store) StaleExecutions(ctx context.Context, limit int) ([]Stale, error) {
@@ -60,13 +65,14 @@ func (s *Store) StaleExecutions(ctx context.Context, limit int) ([]Stale, error)
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
 		       attempt_no, max_attempts, recovery_count, max_recoveries,
-		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, NOW(), timeout_at), 0), 0),
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
 		       scheduled_at, params_json,
-		       (timeout_at IS NOT NULL AND timeout_at < NOW()),
-		       (deadline_at IS NOT NULL AND deadline_at < NOW())
+		       (timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()),
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution
 		WHERE status IN ('dispatching', 'running', 'cancel_requested')
-		  AND lease_until < NOW()
+		  AND lease_until < UTC_TIMESTAMP()
 		ORDER BY lease_until, id LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, limit)
@@ -86,7 +92,7 @@ func (s *Store) StaleExecutions(ctx context.Context, limit int) ([]Stale, error)
 			&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
 			&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries,
 			&remainingSecs, &v.ScheduledAt, &params,
-			&v.TimeoutExpired, &v.SilenceExpired); err != nil {
+			&v.TimeoutExpired, &v.SilenceExpired, &v.LeaseLive); err != nil {
 			return nil, fmt.Errorf("scan stale execution: %w", err)
 		}
 		v.RemainingTimeout = time.Duration(remainingSecs) * time.Second
@@ -161,10 +167,10 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 			UPDATE job_state
 			SET write_seq = write_seq + 1,
 			    active_owner = ?, fence_epoch = ?,
-			    lease_until  = TIMESTAMPADD(SECOND, ?, NOW()),
-			    heartbeat_at = NOW(), updated_at = ?
+			    lease_until  = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
+			    heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?
-			  AND lease_until < NOW()`,
+			  AND lease_until < UTC_TIMESTAMP()`,
 			newOwner, epoch, leaseSeconds, now, v.JobName, v.RunToken, v.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("adopt job lock %q: %w", v.JobName, err)
@@ -177,8 +183,8 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
 			    owner_instance = ?, fence_epoch = ?,
-			    lease_until  = TIMESTAMPADD(SECOND, ?, NOW()),
-			    heartbeat_at = NOW(), updated_at = ?
+			    lease_until  = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
+			    heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?`,
 			newOwner, epoch, leaseSeconds, now, v.ID, v.RunToken, v.FenceEpoch)
@@ -250,7 +256,7 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 			    active_run_token = NULL, dispatched_to = NULL, lease_until = NULL,
 			    last_failure_at = ?, updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?
-			  AND lease_until < NOW()`,
+			  AND lease_until < UTC_TIMESTAMP()`,
 			now, now, v.JobName, v.RunToken, v.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("release stale job lock %q: %w", v.JobName, err)
@@ -341,10 +347,11 @@ func lockExecution(ctx context.Context, tx *sql.Tx, id int64) (Stale, error) {
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
 		       attempt_no, max_attempts, recovery_count, max_recoveries,
-		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, NOW(), timeout_at), 0), 0),
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
 		       scheduled_at, params_json,
-		       (timeout_at IS NOT NULL AND timeout_at < NOW()),
-		       (deadline_at IS NOT NULL AND deadline_at < NOW())
+		       (timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()),
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution WHERE id = ? FOR UPDATE`
 
 	var (
@@ -355,7 +362,7 @@ func lockExecution(ctx context.Context, tx *sql.Tx, id int64) (Stale, error) {
 	err := tx.QueryRowContext(ctx, q, id).Scan(&v.ID, &v.ExecutionKey, &v.JobName, &v.Status,
 		&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
 		&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries,
-		&remainingSecs, &v.ScheduledAt, &params, &v.TimeoutExpired, &v.SilenceExpired)
+		&remainingSecs, &v.ScheduledAt, &params, &v.TimeoutExpired, &v.SilenceExpired, &v.LeaseLive)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Stale{}, fmt.Errorf("%w: execution %d", ErrNoSuchExecution, id)
 	}
@@ -399,12 +406,13 @@ func (s *Store) TimedOut(ctx context.Context, limit int) ([]Stale, error) {
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
 		       attempt_no, max_attempts, recovery_count, max_recoveries,
-		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, NOW(), timeout_at), 0), 0),
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
 		       scheduled_at, params_json, TRUE,
-		       (deadline_at IS NOT NULL AND deadline_at < NOW())
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution
 		WHERE status IN ('dispatching', 'running', 'cancel_requested')
-		  AND timeout_at IS NOT NULL AND timeout_at < NOW()
+		  AND timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()
 		ORDER BY timeout_at, id LIMIT ?`
 
 	rows, err := s.db.QueryContext(ctx, q, limit)
@@ -424,7 +432,7 @@ func (s *Store) TimedOut(ctx context.Context, limit int) ([]Stale, error) {
 			&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
 			&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries,
 			&remainingSecs, &v.ScheduledAt, &params,
-			&v.TimeoutExpired, &v.SilenceExpired); err != nil {
+			&v.TimeoutExpired, &v.SilenceExpired, &v.LeaseLive); err != nil {
 			return nil, fmt.Errorf("scan timed-out execution: %w", err)
 		}
 		v.RemainingTimeout = time.Duration(remainingSecs) * time.Second
@@ -487,7 +495,7 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale) error {
 			return err
 		}
 
-		// The terminal CAS here must NOT carry Complete's `timeout_at >= NOW()` guard: this
+		// The terminal CAS here must NOT carry Complete's `timeout_at >= UTC_TIMESTAMP()` guard: this
 		// is the one writer whose whole purpose is to act after the cap has passed.
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_execution
@@ -535,10 +543,11 @@ func (s *Store) ExecutionByKey(ctx context.Context, key string) (Stale, error) {
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
 		       attempt_no, max_attempts, recovery_count, max_recoveries,
-		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, NOW(), timeout_at), 0), 0),
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
 		       scheduled_at, params_json,
-		       (timeout_at IS NOT NULL AND timeout_at < NOW()),
-		       (deadline_at IS NOT NULL AND deadline_at < NOW())
+		       (timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()),
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution WHERE execution_key = ?`
 
 	var (
@@ -549,7 +558,7 @@ func (s *Store) ExecutionByKey(ctx context.Context, key string) (Stale, error) {
 	err := s.db.QueryRowContext(ctx, q, key).Scan(&v.ID, &v.ExecutionKey, &v.JobName, &v.Status,
 		&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
 		&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries,
-		&remainingSecs, &v.ScheduledAt, &params, &v.TimeoutExpired, &v.SilenceExpired)
+		&remainingSecs, &v.ScheduledAt, &params, &v.TimeoutExpired, &v.SilenceExpired, &v.LeaseLive)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Stale{}, fmt.Errorf("%w: %s", ErrNoSuchExecution, key)
 	}
@@ -572,10 +581,11 @@ func (s *Store) CancelRequested(ctx context.Context, limit int) ([]Stale, error)
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
 		       attempt_no, max_attempts, recovery_count, max_recoveries,
-		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, NOW(), timeout_at), 0), 0),
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
 		       scheduled_at, params_json,
-		       (timeout_at IS NOT NULL AND timeout_at < NOW()),
-		       (deadline_at IS NOT NULL AND deadline_at < NOW())
+		       (timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()),
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution
 		WHERE status = 'cancel_requested' AND dispatched_to IS NOT NULL
 		ORDER BY id LIMIT ?`
@@ -594,13 +604,14 @@ func (s *Store) Silent(ctx context.Context, limit int) ([]Stale, error) {
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
 		       attempt_no, max_attempts, recovery_count, max_recoveries,
-		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, NOW(), timeout_at), 0), 0),
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
 		       scheduled_at, params_json,
-		       (timeout_at IS NOT NULL AND timeout_at < NOW()),
-		       (deadline_at IS NOT NULL AND deadline_at < NOW())
+		       (timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()),
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution
 		WHERE status IN ('running', 'cancel_requested')
-		  AND deadline_at IS NOT NULL AND deadline_at < NOW()
+		  AND deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()
 		ORDER BY deadline_at, id LIMIT ?`
 	return s.scanStale(ctx, q, limit)
 }
@@ -623,7 +634,7 @@ func (s *Store) scanStale(ctx context.Context, query string, limit int) ([]Stale
 		if err := rows.Scan(&v.ID, &v.ExecutionKey, &v.JobName, &v.Status,
 			&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
 			&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries,
-			&remainingSecs, &v.ScheduledAt, &params, &v.TimeoutExpired, &v.SilenceExpired); err != nil {
+			&remainingSecs, &v.ScheduledAt, &params, &v.TimeoutExpired, &v.SilenceExpired, &v.LeaseLive); err != nil {
 			return nil, fmt.Errorf("scan execution: %w", err)
 		}
 		v.RemainingTimeout = time.Duration(remainingSecs) * time.Second
@@ -708,6 +719,55 @@ func (s *Store) ExpireSilent(ctx context.Context, v Stale) error {
 	})
 }
 
+// OwnedByInstance lists every non-terminal execution this instance owns, from the database.
+//
+// The engine's tracked map is not sufficient for this, and the gap is not hypothetical: an
+// unknown-outcome dispatch that exhausts its re-send bound deliberately STOPS being tracked,
+// so recovery can take it — leaving a row that is held, `dispatching`, and invisible to any
+// in-memory scan. If the tenant is then disabled, the pool closes with that row still held and
+// nothing left to recover it, and the schema's quiescence is permanently false.
+func (s *Store) OwnedByInstance(ctx context.Context, owner string, limit int) ([]Stale, error) {
+	const q = `
+		SELECT id, execution_key, job_name, status,
+		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
+		       attempt_no, max_attempts, recovery_count, max_recoveries,
+		       COALESCE(GREATEST(TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), timeout_at), 0), 0),
+		       scheduled_at, params_json,
+		       (timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP()),
+		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
+		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
+		FROM job_execution
+		WHERE owner_instance = ?
+		  AND status IN ('dispatching', 'running', 'cancel_requested')
+		ORDER BY id LIMIT ?`
+
+	rows, err := s.db.QueryContext(ctx, q, owner, limit)
+	if err != nil {
+		return nil, fmt.Errorf("scan work owned by %q: %w", owner, err)
+	}
+	defer rows.Close()
+
+	var out []Stale
+	for rows.Next() {
+		var (
+			v             Stale
+			remainingSecs int64
+			params        []byte
+		)
+		if err := rows.Scan(&v.ID, &v.ExecutionKey, &v.JobName, &v.Status,
+			&v.DispatchedTo, &v.RunToken, &v.FenceEpoch,
+			&v.AttemptNo, &v.MaxAttempts, &v.RecoveryCount, &v.MaxRecoveries,
+			&remainingSecs, &v.ScheduledAt, &params,
+			&v.TimeoutExpired, &v.SilenceExpired, &v.LeaseLive); err != nil {
+			return nil, fmt.Errorf("scan owned execution: %w", err)
+		}
+		v.RemainingTimeout = time.Duration(remainingSecs) * time.Second
+		v.Params = params
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // ReleaseAsOwner resolves an execution this instance still legitimately owns.
 //
 // It is the shutdown counterpart of Resolve. Resolve requires an EXPIRED lease, because its
@@ -719,7 +779,7 @@ func (s *Store) ExpireSilent(ctx context.Context, v Stale) error {
 // The attempt is recorded `unknown`, not failed: the executor may well still be running, and
 // this instance is losing the ability to find out. `cancel_requested` still lands `cancelled`,
 // for the same reason it does in recovery.
-func (s *Store) ReleaseAsOwner(ctx context.Context, h Holder, backoffSeconds int) (gojob.Status, error) {
+func (s *Store) ReleaseAsOwner(ctx context.Context, h Holder) (gojob.Status, error) {
 	var landed gojob.Status
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		st, err := lockState(ctx, tx, h.JobName)
@@ -736,33 +796,43 @@ func (s *Store) ReleaseAsOwner(ctx context.Context, h Holder, backoffSeconds int
 		if cur.RunToken != h.RunToken || cur.FenceEpoch != h.FenceEpoch || cur.Status.Terminal() {
 			return fmt.Errorf("%w: execution %d moved on", gojob.ErrContended, h.ExecutionID)
 		}
+		// The lease must still be LIVE. Once it has lapsed the row belongs to recovery, which
+		// is the single path that clears an expired holder — and recovery may already hold a
+		// confirmed result from the executor, obtained outside its transaction. Letting a
+		// departing owner win that race would replace a known success with `unknown`.
+		if !cur.LeaseLive {
+			return fmt.Errorf("%w: execution %d has an expired lease and belongs to recovery",
+				gojob.ErrContended, h.ExecutionID)
+		}
 		now := s.clock.Now()
 
 		if err := releaseJobLock(ctx, tx, h, false, now); err != nil {
 			return err
 		}
 
-		landed = resolvedStatus(cur)
+		// TERMINAL, always. resolvedStatus would return `ready` while budgets remain, and a
+		// `ready` row in a schema nothing will schedule again is work that is silently
+		// abandoned by the cutover it was supposed to be counted by.
+		landed = gojob.StatusDead
+		if cur.Status == gojob.StatusCancelRequested {
+			landed = gojob.StatusCancelled
+		}
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_execution
-			SET write_seq      = write_seq + 1,
-			    status         = ?,
-			    terminal_reason = IF(? = 'ready', NULL, ?),
-			    finished_at    = IF(? = 'ready', NULL, ?),
-			    available_at   = IF(? = 'ready', TIMESTAMPADD(SECOND, ?, ?), available_at),
-			    timeout_at     = IF(? = 'ready', NULL, timeout_at),
-			    fence_epoch    = fence_epoch + 1,
-			    recovery_count = recovery_count + 1,
+			SET write_seq       = write_seq + 1,
+			    status          = ?,
+			    terminal_reason = ?,
+			    finished_at     = ?,
+			    failure_kind    = 'tenant_retired',
+			    error_message   = 'the tenant was disabled while this attempt was in flight',
+			    fence_epoch     = fence_epoch + 1,
+			    recovery_count  = recovery_count + 1,
 			    owner_instance = NULL, dispatched_to = NULL, run_token = NULL,
 			    lease_until = NULL, heartbeat_at = NULL, deadline_at = NULL,
 			    updated_at = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?`,
-			string(landed),
-			string(landed), string(gojob.ReasonFenced),
-			string(landed), now,
-			string(landed), backoffSeconds, now,
-			string(landed),
+			string(landed), string(gojob.ReasonFenced), now,
 			now, h.ExecutionID, h.RunToken, h.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("release execution %d as its owner: %w", h.ExecutionID, err)

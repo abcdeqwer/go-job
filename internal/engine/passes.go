@@ -357,8 +357,12 @@ func (e *Engine) dispatch(ctx context.Context, h store.Holder, def gojob.Definit
 					e.untrack(h.ExecutionID, h.FenceEpoch)
 					return
 				}
-				e.log.Error("recording a new dispatch target failed",
+				// No second Run was made, so the row is provably unstarted — but it is claimed
+				// and held, and returning here would leave the heartbeat renewing it until its
+				// runtime cap. Release it and let the next pass try again.
+				e.log.Error("recording a new dispatch target failed; releasing the claim",
 					"execution", h.ExecutionKey, "error", err)
+				e.releaseUndispatchable(ctx, p, h.FenceEpoch, "could not record the new target")
 				return
 			}
 		}
@@ -388,6 +392,13 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 	spec dispatch.RunSpec, target store.Executor, deadline time.Time) dispatch.Answer {
 
 	for attempt := 0; ; attempt++ {
+		// Before EVERY send, including the first. The claim's own fence check is separated
+		// from this one by a definition read and a routing decision, and at a fence age of
+		// 29.9 seconds that gap is enough to cross the limit and still hand work to an
+		// executor on behalf of an instance that no longer has the right to.
+		if e.stopping() {
+			return dispatch.Unknown
+		}
 		if attempt > 0 {
 			// The wall-clock bound is checked BEFORE the send, not after. Checked afterwards
 			// it does not bound anything: a call that returns just inside the window is
@@ -437,8 +448,15 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 					e.untrack(h.ExecutionID, h.FenceEpoch)
 					return dispatch.Unknown
 				}
-				e.log.Error("recording acceptance failed",
+				// The executor HAS the work, but this instance could not record it. Leaving the
+				// row `dispatching` while continuing to renew it means the silence scan cannot
+				// see it — that scan looks at `running` — so it would sit renewed until the
+				// hard cap. Stop renewing and let recovery reconcile with the executor, which
+				// is the path built for exactly this uncertainty.
+				e.log.Error("recording acceptance failed; leaving the row to recovery",
 					"execution", h.ExecutionKey, "error", err)
+				e.untrack(h.ExecutionID, h.FenceEpoch)
+				return dispatch.Unknown
 			}
 			e.log.Debug("dispatched", "job", def.JobName, "execution", h.ExecutionKey,
 				"executor", target.ExecutorID)
@@ -523,6 +541,13 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale) {
 		e.log.Warn("executor answered about a different attempt; treating as unknown",
 			"execution", v.ExecutionKey, "asked_about", v.RunToken, "answered_about", rec.RunToken)
 		rec = dispatch.Reconciliation{}
+	}
+
+	// Phase 2 was an RPC with its own deadline. Re-check before phase 3 writes: the fence can
+	// have lapsed during it, and adopting or resolving afterwards is precisely the invisible
+	// ownership the fence exists to stop.
+	if e.stopping() {
+		return
 	}
 
 	switch {
@@ -655,6 +680,9 @@ func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
 	}
 	if rec.Reachable && rec.RunToken != "" && rec.RunToken != v.RunToken {
 		rec = dispatch.Reconciliation{} // an answer about a different attempt
+	}
+	if e.stopping() {
+		return
 	}
 
 	switch {

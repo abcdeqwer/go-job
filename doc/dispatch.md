@@ -121,15 +121,30 @@ An OK response to `Run` is **a promise**: the executor has durably taken respons
 will eventually call `ReportResult`. An executor that cannot promise that must not answer
 OK.
 
-Refusals are error codes rather than a boolean in the response body, so no caller can ignore
-one by forgetting to read a field:
+**A refusal is `RunResponse.refused = true` with an OK status, not an error code.**
 
-| Code | Meaning | Scheduler does |
-| --- | --- | --- |
-| `ALREADY_EXISTS` | this `(tenant, execution_key)` is already held — the error names the token held | **depends on the token**, see below |
-| `RESOURCE_EXHAUSTED` | at capacity | try the next instance |
-| `UNAVAILABLE` | shutting down | try the next instance |
-| `FAILED_PRECONDITION` | unknown `handler_key` | log, alert; routing is wrong |
+An earlier revision of this document said the opposite — that refusals are error codes, so no
+caller can ignore one by forgetting to read a field — and that reasoning is appealing and
+wrong. A gRPC status cannot separate an application's refusal from a transport failure that
+occurred AFTER the request was delivered: `UNAVAILABLE` means "draining" when the executor
+sends it and "the connection broke" when the transport does, and the second can happen once
+the handler is already running. A scheduler that reads the second as the first releases the
+job and dispatches a successor beside a live handler.
+
+So an OK response is the only thing that can release a job, and `refused` defaults to false —
+an executor answering OK without setting anything is read as having taken the work, which is
+the conservative direction.
+
+| Reply | Scheduler does |
+| --- | --- |
+| OK, `refused = false` | accepted; charge the attempt |
+| OK, `refused = true` | provably declined; no attempt charged, try the next instance |
+| `ALREADY_EXISTS` **with** the held token | **depends on the token**, see below |
+| `ALREADY_EXISTS` without a token | UNKNOWN — which attempt is held cannot be established |
+| anything else, including `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `FAILED_PRECONDITION`, `DEADLINE_EXCEEDED`, `INTERNAL` | UNKNOWN: keep the lease, keep the recorded target, let the bounded re-send or recovery resolve it |
+
+An executor should still use a meaningful status when a call genuinely fails. It just cannot
+use one to decline work, because the scheduler cannot safely believe it.
 
 **`ALREADY_EXISTS` is the executor's half of at-most-once dispatch.** When a dispatch times
 out, the scheduler does not know whether it arrived, so it re-sends. An executor that starts
@@ -341,7 +356,7 @@ registered for several tenants advertises capacity separately in each isolated s
 the schedulers together can offer it more than it declared in any one. Neither is fixable
 with a counter, because the counters live in different databases by design.
 
-So the executor's own `RESOURCE_EXHAUSTED` is what actually bounds concurrency, and it must
+So the executor's own refusal is what actually bounds concurrency, and it must
 be returned against what the process can really run **across all tenants it serves** — not
 against the per-registration number. The scheduler's capacity accounting exists to spread
 load, not to enforce a limit, and a refusal is an ordinary outcome rather than an error. There is deliberately no routing-strategy
@@ -424,10 +439,10 @@ It must cover, at minimum:
   retrying;
 - `ReportProgress` returning `proceed=false` → the executor actually stops;
 - accepting a `Run` → a result eventually arrives;
-- dispatch beyond `capacity` → `RESOURCE_EXHAUSTED`, not silent queueing;
+- dispatch beyond `capacity` → `refused = true` with a reason, not silent queueing;
 - `GetExecution` for an unheld key → `NOT_FOUND`, not `UNIMPLEMENTED` and not an error;
 - `Cancel` for an unheld key → `acknowledged=false`, not an error;
-- an unknown `handler_key` → `FAILED_PRECONDITION`;
+- an unknown `handler_key` → `refused = true` naming it;
 - a result with `DISPOSITION_UNSPECIFIED` → rejected; the field is required;
 - a cancelled handler that stops → `DISPOSITION_STOPPED`, never `DISPOSITION_FAILED`, so the
   scheduler does not retry work an operator stopped;

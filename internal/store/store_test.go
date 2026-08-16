@@ -213,7 +213,8 @@ func TestEveryUpdateBumpsWriteSeq(t *testing.T) {
 	}
 }
 
-// Ownership columns must be written from the database clock, never from a Go time.
+// Ownership columns must be written from UTC_TIMESTAMP(), never from a Go time and never from
+// NOW().
 //
 // A scheduler comparing a lease against its own host clock makes ownership depend on skew
 // between machines, and the resulting double-execution appears only when two hosts drift —
@@ -263,8 +264,8 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 			rhs := balancedExpr(where[loc[1]:])
 			comparisons++
 			if !ownershipValueIsSafe(col, rhs) {
-				t.Errorf("ownership column %s compared against %q, which is not derived from NOW():\n  %s",
-					col, rhs, norm)
+				t.Errorf("ownership column %s compared against %q, which is not derived from "+
+					"UTC_TIMESTAMP():\n  %s", col, rhs, norm)
 			}
 		}
 	}
@@ -315,9 +316,9 @@ func TestBusinessColumnsDoNotCompareAgainstNow(t *testing.T) {
 			continue
 		}
 		for _, m := range cmp.FindAllStringSubmatch(norm[i:], -1) {
-			if strings.EqualFold(m[3], "NOW()") {
-				t.Errorf("business column %s compared against NOW(); it must take the business clock:\n  %s",
-					m[1], norm)
+			if strings.EqualFold(m[3], "NOW()") || strings.EqualFold(m[3], "UTC_TIMESTAMP()") {
+				t.Errorf("business column %s compared against the database clock; it must take "+
+					"the business clock:\n  %s", m[1], norm)
 			}
 		}
 	}
@@ -352,14 +353,20 @@ func ownershipValueIsSafe(col, value string) bool {
 	upper := strings.ToUpper(v)
 
 	switch {
-	case upper == "NULL", upper == "NOW()":
+	case upper == "NULL", upper == "UTC_TIMESTAMP()":
 		return true
+	case upper == "NOW()":
+		// Deliberately refused. NOW() is the SESSION's wall clock, so two instances whose
+		// sessions resolved the business zone to different offsets — one pool opened before a
+		// DST transition and one after — disagree about it by an hour, and one reads the
+		// other's live lease as expired.
+		return false
 	case unqualified(v) == col: // preserved unchanged
 		return true
 	}
 
 	if args, ok := callArgs(upper, "TIMESTAMPADD"); ok && len(args) == 3 {
-		return strings.TrimSpace(args[2]) == "NOW()"
+		return strings.TrimSpace(args[2]) == "UTC_TIMESTAMP()"
 	}
 	if args, ok := callArgs(upper, "COALESCE"); ok {
 		for _, a := range args {
@@ -457,8 +464,13 @@ func setAssignments(norm string) []assignment {
 // Checking individual statements cannot catch it: most locking in this package happens across
 // several statements, and the state row is taken by a helper the entry point merely calls. So
 // this walks each exported method, expands calls into other functions in the package in
-// source order, flattens the result into the sequence of tables that method touches, and
-// requires job_state to appear before job_execution in every method that touches both.
+// source order, flattens the result into the sequence of tables that method touches INSIDE A
+// TRANSACTION, and requires job_state to appear before job_execution in every method that
+// touches both.
+//
+// Transactional only, because the rule is about one transaction's row locks: a plain read
+// outside one takes no lock, and counting it produced a false positive that could only be
+// silenced by weakening the check it was supposed to strengthen.
 func TestCanonicalLockOrder(t *testing.T) {
 	fns := packageFunctions(t)
 
@@ -510,32 +522,12 @@ func packageFunctions(t *testing.T) map[string]packageFunc {
 		t.Fatalf("parse package: %v", err)
 	}
 
-	// Package-level SQL constants, so a statement held in one is attributed to the function
-	// that uses it rather than being invisible.
-	consts := map[string]string{}
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				gd, ok := decl.(*ast.GenDecl)
-				if !ok || gd.Tok != token.CONST {
-					continue
-				}
-				for _, spec := range gd.Specs {
-					vs, ok := spec.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					for i, n := range vs.Names {
-						if i < len(vs.Values) {
-							if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-								consts[n.Name] = strings.Trim(lit.Value, "`\"")
-							}
-						}
-					}
-				}
-			}
-		}
-	}
+	// Every string constant, package level AND function local.
+	//
+	// Package-level only was not enough, and the gap was invisible: lockExecution holds its
+	// statement in a function-local `const q`, so its job_execution touch was never recorded —
+	// and the lock-order check silently stopped seeing the one lock it exists to order.
+	consts := stringConsts(pkgs)
 
 	fns := map[string]packageFunc{}
 	for _, pkg := range pkgs {
@@ -547,21 +539,39 @@ func packageFunctions(t *testing.T) map[string]packageFunc {
 				}
 				pf := packageFunc{exported: fd.Name.IsExported()}
 				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					switch v := n.(type) {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					sel, isSel := call.Fun.(*ast.SelectorExpr)
+					if id, ok := call.Fun.(*ast.Ident); ok {
+						pf.events = append(pf.events, "call:"+id.Name)
+						return true
+					}
+					if !isSel {
+						return true
+					}
+					pf.events = append(pf.events, "call:"+sel.Sel.Name)
+
+					// Only statements run ON A TRANSACTION participate in lock ordering.
+					//
+					// The canonical order is a property of one transaction's row locks. A
+					// non-transactional read takes none — it is a consistent snapshot read —
+					// so including it made an ordinary lookup before a transaction look like a
+					// reversed order, which is a false positive that can only be silenced by
+					// weakening the real check.
+					recv, ok := sel.X.(*ast.Ident)
+					if !ok || recv.Name != "tx" || len(call.Args) < 2 {
+						return true
+					}
+					switch q := call.Args[1].(type) {
 					case *ast.BasicLit:
-						if v.Kind == token.STRING {
-							pf.events = append(pf.events, tableEvents(strings.Trim(v.Value, "`\""))...)
+						if q.Kind == token.STRING {
+							pf.events = append(pf.events, tableEvents(strings.Trim(q.Value, "`\""))...)
 						}
 					case *ast.Ident:
-						if sql, ok := consts[v.Name]; ok {
+						if sql, ok := consts[q.Name]; ok {
 							pf.events = append(pf.events, tableEvents(sql)...)
-						}
-					case *ast.CallExpr:
-						if id, ok := v.Fun.(*ast.Ident); ok {
-							pf.events = append(pf.events, "call:"+id.Name)
-						}
-						if sel, ok := v.Fun.(*ast.SelectorExpr); ok {
-							pf.events = append(pf.events, "call:"+sel.Sel.Name)
 						}
 					}
 					return true
@@ -674,10 +684,15 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 	consts := stringConsts(pkgs)
 	params := sqlParameterNames(pkgs)
 	var checked int
+	var enclosing string
 
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			ast.Inspect(file, func(n ast.Node) bool {
+				if fd, ok := n.(*ast.FuncDecl); ok {
+					enclosing = fd.Name.Name
+					return true
+				}
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
@@ -704,11 +719,16 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 					}
 				case *ast.Ident:
 					// A resolvable constant is fine — the extractor reads those too. So is a
-					// parameter: a helper that takes a statement is passed one from a call
-					// site, and THAT literal is what gets inspected. What is not fine is a
-					// name holding something this file cannot follow to a statement.
+					// parameter OF THE ENCLOSING FUNCTION: a helper that takes a statement is
+					// passed one from a call site, and TestHelperCallSitesPassLiterals checks
+					// that the literal handed in is itself inspectable.
+					//
+					// Per function, not package-wide. A package-wide set means any local
+					// variable that happens to share a name with some other function's string
+					// parameter is accepted, which is a hole shaped exactly like the one this
+					// rule exists to close.
 					_, isConst := consts[q.Name]
-					if !isConst && !params[q.Name] {
+					if !isConst && !params[enclosing+"."+q.Name] {
 						t.Errorf("%s: SQL comes from %q, which this file cannot resolve to a "+
 							"statement — the fence, clock and write_seq checks cannot see it",
 							fset.Position(q.Pos()), q.Name)
@@ -773,10 +793,10 @@ func sqlParameterNames(pkgs map[string]*ast.Package) map[string]bool {
 	out := map[string]bool{}
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				fd, ok := n.(*ast.FuncDecl)
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
 				if !ok || fd.Type.Params == nil {
-					return true
+					continue
 				}
 				for _, f := range fd.Type.Params.List {
 					id, ok := f.Type.(*ast.Ident)
@@ -784,11 +804,12 @@ func sqlParameterNames(pkgs map[string]*ast.Package) map[string]bool {
 						continue
 					}
 					for _, name := range f.Names {
-						out[name.Name] = true
+						// Qualified by function, so one helper's parameter name does not
+						// whitelist an identically-named local somewhere else.
+						out[fd.Name.Name+"."+name.Name] = true
 					}
 				}
-				return true
-			})
+			}
 		}
 	}
 	return out
@@ -820,11 +841,15 @@ func TestHelperCallSitesPassLiterals(t *testing.T) {
 				if !ok || fd.Type.Params == nil || !runsSQLFromParameter(fd) {
 					continue
 				}
+				// Whichever parameter the body actually runs, whatever it is called.
+				// Recognising only `query` and `q` left the rule trivially avoidable by
+				// renaming the parameter.
+				ran := sqlParameterRunBy(fd)
 				pos := 0
 				for _, f := range fd.Type.Params.List {
 					for _, name := range f.Names {
 						if id, ok := f.Type.(*ast.Ident); ok && id.Name == "string" &&
-							(name.Name == "query" || name.Name == "q") {
+							name.Name == ran {
 							sqlArg[fd.Name.Name] = pos
 						}
 						pos++
@@ -882,8 +907,22 @@ func TestHelperCallSitesPassLiterals(t *testing.T) {
 
 // runsSQLFromParameter reports whether a function passes one of its own parameters to a
 // database call.
-func runsSQLFromParameter(fd *ast.FuncDecl) bool {
-	found := false
+func runsSQLFromParameter(fd *ast.FuncDecl) bool { return sqlParameterRunBy(fd) != "" }
+
+// sqlParameterRunBy names the parameter a function hands to a database call, if any.
+func sqlParameterRunBy(fd *ast.FuncDecl) string {
+	params := map[string]bool{}
+	if fd.Type.Params != nil {
+		for _, f := range fd.Type.Params.List {
+			if id, ok := f.Type.(*ast.Ident); ok && id.Name == "string" {
+				for _, n := range f.Names {
+					params[n.Name] = true
+				}
+			}
+		}
+	}
+
+	var found string
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || len(call.Args) < 2 {
@@ -898,8 +937,8 @@ func runsSQLFromParameter(fd *ast.FuncDecl) bool {
 		default:
 			return true
 		}
-		if id, ok := call.Args[1].(*ast.Ident); ok && (id.Name == "query" || id.Name == "q") {
-			found = true
+		if id, ok := call.Args[1].(*ast.Ident); ok && params[id.Name] {
+			found = id.Name
 		}
 		return true
 	})
@@ -909,7 +948,9 @@ func runsSQLFromParameter(fd *ast.FuncDecl) bool {
 func looksLikeSQL(v string) bool {
 	head := strings.ToUpper(strings.TrimSpace(v))
 	var keyword bool
-	for _, kw := range []string{"SELECT ", "UPDATE ", "INSERT ", "DELETE "} {
+	// WITH included: a CTE-led statement is still a statement, and one that the extractor
+	// skipped would be invisible to every check in this file while looking perfectly ordinary.
+	for _, kw := range []string{"SELECT ", "UPDATE ", "INSERT ", "DELETE ", "WITH ", "REPLACE "} {
 		if strings.HasPrefix(head, kw) {
 			keyword = true
 			break

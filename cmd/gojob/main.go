@@ -265,7 +265,7 @@ func run() error {
 		RegistrationTTL:   c.executorLiveness,
 		ProgressInterval:  30 * time.Second,
 		SilenceDeadline:   c.executorLiveness,
-	}, reg, disp, fence, clock, func() int { return 30 }, log))
+	}, runtime.SchedulerTenants{R: reg}, disp, fence, clock, func() int { return 30 }, log))
 
 	lis, err := net.Listen("tcp", c.grpcAddr)
 	if err != nil {

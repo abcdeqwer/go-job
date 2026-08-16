@@ -355,7 +355,7 @@ func TestCancelIsTwoSteps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.RequestCancel(context.Background(), row.ID, "test"); err != nil {
+	if err := h.store.RequestCancel(context.Background(), row.ID, "test", "the test cancels it"); err != nil {
 		t.Fatal(err)
 	}
 

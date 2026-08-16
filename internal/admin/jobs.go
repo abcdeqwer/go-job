@@ -115,13 +115,77 @@ func (b jobBody) toDefinition() (gojob.Definition, error) {
 			return d, badRequest("%v", err)
 		}
 	}
+	if d.ScheduleKind == gojob.ScheduleFixedDelay {
+		delay, err := d.Delay()
+		if err != nil {
+			return d, badRequest("%v", err)
+		}
+		// A poller whose pause exceeds a day is a cron job with extra steps, and one that long
+		// hides a mistyped unit — 86400000 meant as seconds is eleven days.
+		if delay > 24*time.Hour {
+			return d, badRequest("a fixed delay of %s is longer than a day; use a CRON schedule", delay)
+		}
+	}
+
+	// The silence budget is the lease, so a lease longer than the timeout means an execution
+	// can outlive its own runtime cap without ever looking silent.
+	if d.Lease > d.Timeout {
+		return d, badRequest("lease_seconds (%d) must not exceed timeout_seconds (%d)",
+			int(d.Lease/time.Second), int(d.Timeout/time.Second))
+	}
+
+	if err := checkIdentifier("job_name", d.JobName, 128); err != nil {
+		return d, err
+	}
+	if err := checkIdentifier("handler_key", d.HandlerKey, 128); err != nil {
+		return d, err
+	}
+	if d.ExecutorGroup != "" {
+		if err := checkIdentifier("executor_group", d.ExecutorGroup, 64); err != nil {
+			return d, err
+		}
+	}
+	if len(d.Description) > 512 {
+		return d, badRequest("description must be at most 512 characters")
+	}
+
 	if len(d.Params) > 0 {
+		// A cap, because these are copied onto every execution row and sent on every dispatch.
+		// A megabyte of parameters is a megabyte per run, for ever.
+		if len(d.Params) > 64<<10 {
+			return d, badRequest("params must be at most 64 KiB; they are copied onto every " +
+				"execution and sent on every dispatch")
+		}
 		var probe map[string]any
 		if err := json.Unmarshal(d.Params, &probe); err != nil {
 			return d, badRequest("params must be a JSON object")
 		}
 	}
 	return d, nil
+}
+
+// checkIdentifier bounds a name and restricts it to characters that survive a log line, a URL
+// path and an execution key without escaping.
+//
+// The length bound matters beyond tidiness: job names go into execution keys, and a name at
+// the column's limit is what pushed keys past theirs.
+func checkIdentifier(field, value string, max int) error {
+	if value == "" {
+		return badRequest("%s is required", field)
+	}
+	if len(value) > max {
+		return badRequest("%s must be at most %d characters", field, max)
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_', r == ':':
+		default:
+			return badRequest("%s may contain only letters, digits and . - _ :  (found %q)",
+				field, string(r))
+		}
+	}
+	return nil
 }
 
 func jobJSON(v store.JobView) map[string]any {
@@ -217,7 +281,7 @@ func (a *API) createJob(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := st.CreateJob(r.Context(), def, next, ActorFrom(r.Context())); err != nil {
+	if err := st.CreateJob(r.Context(), def, next, ActorFrom(r.Context()), body.Reason); err != nil {
 		return err
 	}
 

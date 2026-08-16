@@ -196,7 +196,7 @@ func (a *API) cancelExecution(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := st.RequestCancel(r.Context(), row.ID, ActorFrom(r.Context())); err != nil {
+	if err := st.RequestCancel(r.Context(), row.ID, ActorFrom(r.Context()), body.Reason); err != nil {
 		return err
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

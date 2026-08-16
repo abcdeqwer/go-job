@@ -28,7 +28,7 @@ type Candidate struct {
 // never discovered however old it gets. Each class getting its own bounded share starves
 // neither.
 //
-// `available_at <= ?` takes the business clock, not NOW(): available_at is a business column,
+// `available_at <= ?` takes the business clock, not UTC_TIMESTAMP(): available_at is a business column,
 // and comparing it against the database's clock would be the mixed-clock bug this package
 // exists to avoid.
 func (s *Store) ReadyCandidates(ctx context.Context, manualFirst bool, limit int) ([]Candidate, error) {
@@ -345,8 +345,8 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 			    active_run_token = ?,
 			    dispatched_to    = ?,
 			    fence_epoch      = ?,
-			    lease_until      = TIMESTAMPADD(SECOND, ?, NOW()),
-			    heartbeat_at     = NOW(),
+			    lease_until      = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
+			    heartbeat_at     = UTC_TIMESTAMP(),
 			    updated_at       = ?
 			WHERE job_name = ? AND ops_paused = 0 AND active_kind IS NULL`,
 			p.ExecutionKey, p.Owner, p.RunToken, nullString(p.ExecutorID),
@@ -370,9 +370,9 @@ func (s *Store) Claim(ctx context.Context, p ClaimParams, runnable Runnable) (Cl
 			    dispatched_to  = ?,
 			    run_token      = ?,
 			    fence_epoch    = ?,
-			    lease_until    = TIMESTAMPADD(SECOND, ?, NOW()),
-			    heartbeat_at   = NOW(),
-			    timeout_at     = COALESCE(timeout_at, TIMESTAMPADD(SECOND, ?, NOW())),
+			    lease_until    = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
+			    heartbeat_at   = UTC_TIMESTAMP(),
+			    timeout_at     = COALESCE(timeout_at, TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())),
 			    updated_at     = ?
 			WHERE id = ? AND job_name = ? AND status = 'ready' AND attempt_no < max_attempts`,
 			p.Owner, nullString(p.ExecutorID), p.RunToken, epoch,
@@ -500,7 +500,7 @@ func isManual(ctx context.Context, tx *sql.Tx, id int64) (bool, error) {
 // was refused, or never answered, did not start one.
 //
 // started_at uses COALESCE so a re-send answered with ALREADY_EXISTS does not rewrite the
-// first start, and deadline_at — the silence budget — is set from NOW() because it is an
+// first start, and deadline_at — the silence budget — is set from UTC_TIMESTAMP() because it is an
 // ownership column extended by progress reports.
 func (s *Store) Accept(ctx context.Context, id int64, runToken string, epoch int64, silenceSeconds int) error {
 	now := s.clock.Now()
@@ -510,7 +510,7 @@ func (s *Store) Accept(ctx context.Context, id int64, runToken string, epoch int
 			    status      = 'running',
 		    attempt_no  = attempt_no + 1,
 		    started_at  = COALESCE(started_at, ?),
-		    deadline_at = TIMESTAMPADD(SECOND, ?, NOW()),
+		    deadline_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
 		    updated_at  = ?
 		WHERE id = ? AND status = 'dispatching'
 		  AND run_token = ? AND fence_epoch = ?`,
@@ -571,11 +571,11 @@ func (s *Store) Refuse(ctx context.Context, p ClaimParams, epoch int64) error {
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
-			    status          = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), 'dead', 'ready'),
-			    terminal_reason = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), ?, NULL),
-			    failure_kind    = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), 'timeout', failure_kind),
-			    finished_at     = IF(timeout_at IS NOT NULL AND timeout_at < NOW(), ?, NULL),
-			    available_at    = IF(timeout_at IS NOT NULL AND timeout_at < NOW(),
+			    status          = IF(timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP(), 'dead', 'ready'),
+			    terminal_reason = IF(timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP(), ?, NULL),
+			    failure_kind    = IF(timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP(), 'timeout', failure_kind),
+			    finished_at     = IF(timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP(), ?, NULL),
+			    available_at    = IF(timeout_at IS NOT NULL AND timeout_at < UTC_TIMESTAMP(),
 			                         available_at, TIMESTAMPADD(SECOND, ?, ?)),
 			    owner_instance = NULL, dispatched_to = NULL, run_token = NULL,
 			    lease_until = NULL, heartbeat_at = NULL, updated_at = ?

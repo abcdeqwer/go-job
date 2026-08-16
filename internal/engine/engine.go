@@ -359,11 +359,23 @@ func (e *Engine) holders() []store.Holder {
 // So the owner resolves its own holdings. It asks each executor to stop on the way out, and
 // records the attempt as unknown, because it genuinely is.
 func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
-	for _, h := range e.holders() {
-		if v, err := e.store.ExecutionByKey(ctx, h.ExecutionKey); err == nil {
-			e.requestStop(ctx, v, "the tenant was disabled")
+	// From the DATABASE, not from the tracked map. An unknown-outcome dispatch that exhausted
+	// its re-send bound deliberately stops being tracked so recovery can take it — leaving a
+	// held, `dispatching` row that no in-memory scan can see. If the tenant is then disabled,
+	// the pool closes with that row still held and nothing left to recover it.
+	owned, err := e.store.OwnedByInstance(ctx, e.cfg.InstanceID, 1000)
+	if err != nil {
+		e.log.Error("listing owned work on retirement failed", "error", err)
+		return
+	}
+	for _, v := range owned {
+		e.requestStop(ctx, v, "the tenant was disabled")
+
+		h := store.Holder{
+			JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
+			Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: v.FenceEpoch,
 		}
-		landed, err := e.store.ReleaseAsOwner(ctx, h, e.backoff(0))
+		landed, err := e.store.ReleaseAsOwner(ctx, h)
 		if err != nil {
 			if !errors.Is(err, gojob.ErrContended) {
 				e.log.Error("releasing owned work on retirement failed",
@@ -372,7 +384,7 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 			continue
 		}
 		e.untrack(h.ExecutionID, h.FenceEpoch)
-		e.log.Warn("released an in-flight execution because the tenant was disabled",
+		e.log.Warn("ended an in-flight execution because the tenant was disabled",
 			"execution", h.ExecutionKey, "job", h.JobName, "landed", landed)
 	}
 }

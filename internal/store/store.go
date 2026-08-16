@@ -8,9 +8,13 @@
 //
 // Two rules hold everywhere in this package, and every deviation is a defect:
 //
-//   - Ownership columns — lease_until, heartbeat_at, deadline_at, timeout_at — are written
-//     and compared using the database's NOW() and never a Go time. Ownership must not depend
-//     on clock skew between scheduler hosts.
+//   - Ownership columns — lease_until, heartbeat_at, deadline_at, timeout_at — are written and
+//     compared using UTC_TIMESTAMP(), never a Go time and never NOW(). Ownership must not
+//     depend on clock skew between hosts, and NOW() is not sufficient for that: it returns the
+//     SESSION's wall clock, so two instances whose sessions resolved the business zone to
+//     different offsets — one pool opened before a DST transition and one after — read NOW()
+//     an hour apart, and one sees the other's live lease as expired. UTC_TIMESTAMP() is the
+//     same instant in every session, always.
 //   - Business columns — scheduled_at, available_at, started_at, finished_at, created_at,
 //     updated_at — are written from the caller's business Clock. Admission asserts that every
 //     connection's session time zone equals the configured business Location, so the two are

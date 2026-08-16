@@ -26,7 +26,7 @@ type Outcome struct {
 // Complete moves an execution to a terminal state and releases the job lock, in one
 // transaction in the canonical order.
 //
-// Every terminal transition additionally guards `timeout_at >= NOW()`. Without it the outcome
+// Every terminal transition additionally guards `timeout_at >= UTC_TIMESTAMP()`. Without it the outcome
 // would depend on which writer reached the database first: a non-conforming executor still
 // running past the cap could report success moments before the timeout scanner fenced it, and
 // the execution would record success for a run the scheduler had already decided to stop. A
@@ -63,7 +63,7 @@ func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 			    updated_at      = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?
-			  AND (timeout_at IS NULL OR timeout_at >= NOW())`,
+			  AND (timeout_at IS NULL OR timeout_at >= UTC_TIMESTAMP())`,
 			string(o.Status), string(o.TerminalReason), now,
 			nullString(o.FailureKind), nullString(o.ErrorMessage), nullString(o.ResultSummary),
 			now, h.ExecutionID, h.RunToken, h.FenceEpoch)
@@ -137,7 +137,7 @@ func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds i
 			    updated_at      = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?
-			  AND (timeout_at IS NULL OR timeout_at >= NOW())`,
+			  AND (timeout_at IS NULL OR timeout_at >= UTC_TIMESTAMP())`,
 			string(gojob.ReasonBudgetExhausted), now,
 			backoffSeconds, now,
 			nullString(o.FailureKind), nullString(o.ErrorMessage), now,
@@ -401,9 +401,9 @@ func nullTime(t time.Time) any {
 // The request and its audit row are written in one transaction. The audit trail is what makes
 // "we asked, but it had already finished" visible after the real outcome wins, so it must not
 // be able to go missing while the request itself commits.
-func (s *Store) RequestCancel(ctx context.Context, id int64, actor string) error {
-	if actor == "" {
-		return fmt.Errorf("%w: cancel with no actor", gojob.ErrProtocol)
+func (s *Store) RequestCancel(ctx context.Context, id int64, actor, reason string) error {
+	if actor == "" || reason == "" {
+		return fmt.Errorf("%w: a cancel needs an actor and a reason", gojob.ErrProtocol)
 	}
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
@@ -441,7 +441,7 @@ func (s *Store) RequestCancel(ctx context.Context, id int64, actor string) error
 			return fmt.Errorf("%w: execution %d is not in a cancellable state", gojob.ErrContended, id)
 		}
 		return audit(ctx, tx, now, actor, "cancel_requested", jobName, executionKey,
-			"cancel requested; execution keeps its lease until it stops or is fenced")
+			reason+" (the execution keeps its lease until it stops or is fenced)")
 	})
 }
 

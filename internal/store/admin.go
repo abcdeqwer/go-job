@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -113,9 +114,9 @@ func (s *Store) Job(ctx context.Context, name string) (JobView, error) {
 // nextFire is the job's first fire instant, computed by the caller from the schedule it just
 // validated; for a fixed-delay job it is ignored and the poll clock starts at `now`, because
 // the delay is the gap BETWEEN passes and there is no previous pass to measure from.
-func (s *Store) CreateJob(ctx context.Context, d gojob.Definition, nextFire time.Time, actor string) error {
-	if actor == "" {
-		return fmt.Errorf("%w: creating a job with no actor", gojob.ErrProtocol)
+func (s *Store) CreateJob(ctx context.Context, d gojob.Definition, nextFire time.Time, actor, reason string) error {
+	if actor == "" || reason == "" {
+		return fmt.Errorf("%w: creating a job needs an actor and a reason", gojob.ErrProtocol)
 	}
 	now := s.clock.Now()
 
@@ -152,8 +153,11 @@ func (s *Store) CreateJob(ctx context.Context, d gojob.Definition, nextFire time
 			d.JobName, fireArg, pollArg, now); err != nil {
 			return fmt.Errorf("create state row for %q: %w", d.JobName, err)
 		}
+		// The operator's OWN words, not a rendering of the row they just created. The row is
+		// already in job_definition; what the audit log is for is why.
 		return audit(ctx, tx, now, actor, "job_created", d.JobName, "",
-			fmt.Sprintf("handler=%s schedule=%s %s", d.HandlerKey, d.ScheduleKind, d.ScheduleExpr))
+			fmt.Sprintf("%s (handler=%s schedule=%s %s)",
+				reason, d.HandlerKey, d.ScheduleKind, d.ScheduleExpr))
 	})
 }
 
@@ -337,6 +341,13 @@ func (s *Store) Trigger(ctx context.Context, jobName, requestID, actor, reason s
 	key := ExecutionKey("m", jobName, requestID)
 
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		// The state row first, so this serialises with Retire. Reading the definition without
+		// it lets a trigger see `retired = false`, pause, and insert its row after retirement
+		// has already cancelled everything it could see — leaving a `ready` execution on a
+		// retired job that no claim will ever run and that blocks the schema's quiescence.
+		if _, err := lockState(ctx, tx, jobName); err != nil {
+			return err
+		}
 		def, err := readDefinition(ctx, tx, jobName)
 		if err != nil {
 			return err
@@ -344,9 +355,13 @@ func (s *Store) Trigger(ctx context.Context, jobName, requestID, actor, reason s
 		if def.Retired {
 			return fmt.Errorf("%w: job %q is retired", gojob.ErrNotRunnable, jobName)
 		}
-		merged := def.Params
-		if len(params) > 0 {
-			merged = params
+		// MERGED, not replaced. An operator overriding one field expects the rest of the job's
+		// configuration to stand: defaults {"region":"PH","batch":500} with an override
+		// {"batch":100} must dispatch both fields, or a manual run silently loses the region
+		// and does something different from every scheduled one.
+		merged, err := mergeParams(def.Params, params)
+		if err != nil {
+			return err
 		}
 		created, err := insertExecution(ctx, tx, executionRow{
 			Key:           key,
@@ -373,6 +388,39 @@ func (s *Store) Trigger(ctx context.Context, jobName, requestID, actor, reason s
 		return "", err
 	}
 	return key, nil
+}
+
+// mergeParams overlays an override on a job's defaults, one level deep.
+//
+// One level, not recursive: a nested object in an override replaces the nested object in the
+// defaults. Deep-merging reads as more helpful and is not — there would be no way to REMOVE a
+// nested field, and "why is this key still here" is a worse afternoon than "I had to write the
+// whole object".
+func mergeParams(defaults, override []byte) ([]byte, error) {
+	if len(override) == 0 {
+		return defaults, nil
+	}
+	if len(defaults) == 0 {
+		return override, nil
+	}
+	var base, top map[string]json.RawMessage
+	if err := json.Unmarshal(defaults, &base); err != nil {
+		return nil, fmt.Errorf("%w: the job's stored parameters are not a JSON object", gojob.ErrProtocol)
+	}
+	if err := json.Unmarshal(override, &top); err != nil {
+		return nil, fmt.Errorf("%w: the override is not a JSON object", gojob.ErrProtocol)
+	}
+	if base == nil {
+		base = map[string]json.RawMessage{}
+	}
+	for k, v := range top {
+		base[k] = v
+	}
+	out, err := json.Marshal(base)
+	if err != nil {
+		return nil, fmt.Errorf("encode merged parameters: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) executionByRequest(ctx context.Context, requestID string) (string, bool, error) {
@@ -402,7 +450,33 @@ func (s *Store) AuthorizedRetry(ctx context.Context, key, actor, reason string) 
 	}
 	now := s.clock.Now()
 
+	// Which job this execution belongs to is read BEFORE the transaction, not inside it.
+	//
+	// Inside, it would touch job_execution before job_state, which is the canonical order
+	// reversed — and a transaction taking the two rows in the opposite order to completion is
+	// the deadlock that order exists to prevent. Reading it outside can be stale, so the
+	// transaction re-verifies it under the lock.
+	jobName, err := s.jobOf(ctx, key)
+	if err != nil {
+		return err
+	}
+
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		// Under the job's lock, for the same reason a trigger is: reviving a dead execution
+		// after its job was retired produces exactly the stranded `ready` row retirement exists
+		// to prevent.
+		if _, err := lockState(ctx, tx, jobName); err != nil {
+			return err
+		}
+		def, err := readDefinition(ctx, tx, jobName)
+		if err != nil {
+			return err
+		}
+		if def.Retired {
+			return fmt.Errorf("%w: job %q is retired; its executions cannot be revived",
+				gojob.ErrNotRunnable, jobName)
+		}
+
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq       = write_seq + 1,
@@ -413,8 +487,8 @@ func (s *Store) AuthorizedRetry(ctx context.Context, key, actor, reason string) 
 			    finished_at     = NULL,
 			    timeout_at      = NULL,
 			    updated_at      = ?
-			WHERE execution_key = ? AND status = 'dead'`,
-			now, now, key)
+			WHERE execution_key = ? AND job_name = ? AND status = 'dead'`,
+			now, now, key, jobName)
 		if err != nil {
 			return fmt.Errorf("retry execution %q: %w", key, err)
 		}
@@ -427,6 +501,24 @@ func (s *Store) AuthorizedRetry(ctx context.Context, key, actor, reason string) 
 		}
 		return audit(ctx, tx, now, actor, "execution_retried", "", key, reason)
 	})
+}
+
+// jobOf names the job an execution belongs to, outside any transaction.
+//
+// Outside, because reading job_execution inside a transaction that then locks job_state takes
+// the two in the reverse of the canonical order. The caller re-verifies under the lock, so a
+// stale answer costs a refused action rather than a wrong one.
+func (s *Store) jobOf(ctx context.Context, key string) (string, error) {
+	var jobName string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT job_name FROM job_execution WHERE execution_key = ?`, key).Scan(&jobName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: %s", ErrNoSuchExecution, key)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read execution %q: %w", key, err)
+	}
+	return jobName, nil
 }
 
 // ExecutionView is one row of the execution list.
@@ -643,7 +735,7 @@ func (s *Store) DeclaredHandlers(ctx context.Context, liveness time.Duration) ([
 		SELECT DISTINCT h.handler_key
 		FROM job_executor_handler h
 		JOIN job_executor e ON e.executor_id = h.executor_id
-		WHERE e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, NOW())
+		WHERE e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
 		ORDER BY h.handler_key`, -seconds(liveness))
 	if err != nil {
 		return nil, fmt.Errorf("list declared handlers: %w", err)

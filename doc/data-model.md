@@ -143,9 +143,18 @@ stranded: its leases expire, and every other instance can still reach the tenant
 and recover them normally. What renewal would preserve is precisely the thing being ruled
 out — an owner nobody can see, still holding work, while the API concludes it is gone.
 
-**Quiescence is then proven by looking at the tenant's own schema, not by counting
-acknowledgements.** Acknowledgement can only ever say who *replied*; the question is whether
-anything is still held:
+**Quiescence is proven by BOTH, and neither one alone.** An earlier revision of this document
+said acknowledgements were diagnostic only and the schema scan authoritative, which contradicts
+the paragraph above and is unsafe in one direction:
+
+- the **schema scan** says what is held right now. It cannot see an instance that has not yet
+  polled the disable — that instance still believes the tenant is enabled, and can claim a
+  moment after the scan returns empty;
+- the **acknowledgement check** closes exactly that window. It cannot see an instance
+  partitioned from the control database, which is why such an instance self-fences and why the
+  scan is still required.
+
+Acknowledgement can only ever say who *replied*; the scan says whether anything is held:
 
 ```sql
 -- quiescent when both return zero, in the OLD coordination schema

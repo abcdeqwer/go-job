@@ -41,7 +41,7 @@ func (s *Store) Renew(ctx context.Context, h Holder, leaseSeconds int) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE job_state
 			SET write_seq = write_seq + 1,
-			    lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+			    lease_until = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 			WHERE job_name = ? AND active_run_token = ? AND fence_epoch = ?`,
 			leaseSeconds, now, h.JobName, h.RunToken, h.FenceEpoch)
 		if err != nil {
@@ -60,17 +60,17 @@ func (s *Store) Renew(ctx context.Context, h Holder, leaseSeconds int) error {
 		// not-yet-stopped handler must keep renewing: releasing its slot before it has
 		// actually stopped is exactly the overlap this protocol exists to prevent.
 		//
-		// `lease_until >= NOW()` refuses to resurrect an already-expired lease. Once it has
+		// `lease_until >= UTC_TIMESTAMP()` refuses to resurrect an already-expired lease. Once it has
 		// lapsed the row belongs to recovery, and letting a slow scheduler renew its way back
 		// in would give ownership transfer two implementations that can disagree.
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
-			    lease_until = TIMESTAMPADD(SECOND, ?, NOW()), heartbeat_at = NOW(), updated_at = ?
+			    lease_until = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 			WHERE id = ?
 			  AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND owner_instance = ? AND run_token = ? AND fence_epoch = ?
-			  AND lease_until >= NOW()`,
+			  AND lease_until >= UTC_TIMESTAMP()`,
 			leaseSeconds, now, h.ExecutionID, h.Owner, h.RunToken, h.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("renew execution %d: %w", h.ExecutionID, err)
@@ -97,11 +97,11 @@ func (s *Store) ExtendDeadline(ctx context.Context, h Holder, silenceSeconds int
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE job_execution
 		SET write_seq = write_seq + 1,
-			    deadline_at = TIMESTAMPADD(SECOND, ?, NOW()), updated_at = ?
+			    deadline_at = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), updated_at = ?
 		WHERE id = ?
 		  AND status IN ('dispatching', 'running', 'cancel_requested')
 		  AND run_token = ? AND fence_epoch = ?
-		  AND (timeout_at IS NULL OR timeout_at >= NOW())`,
+		  AND (timeout_at IS NULL OR timeout_at >= UTC_TIMESTAMP())`,
 		silenceSeconds, s.clock.Now(), h.ExecutionID, h.RunToken, h.FenceEpoch)
 	if err != nil {
 		return fmt.Errorf("extend deadline on execution %d: %w", h.ExecutionID, err)

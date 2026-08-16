@@ -64,7 +64,7 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 			INSERT INTO job_executor
 			    (executor_id, executor_group, address, contract_version, revision,
 			     capacity, running, capabilities, identity, started_at, heartbeat_at)
-			VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NOW(), NOW())
+			VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())
 			ON DUPLICATE KEY UPDATE
 			    executor_group   = VALUES(executor_group),
 			    address          = VALUES(address),
@@ -73,7 +73,7 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 			    capacity         = VALUES(capacity),
 			    capabilities     = VALUES(capabilities),
 			    identity         = VALUES(identity),
-			    heartbeat_at     = NOW()`,
+			    heartbeat_at     = UTC_TIMESTAMP()`,
 			e.ExecutorID, e.Group, e.Address, e.ContractVersion, e.Revision,
 			e.Capacity, nullString(e.Capabilities), e.Identity)
 		if err != nil {
@@ -116,7 +116,7 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 func (s *Store) ExecutorHeartbeat(ctx context.Context, executorID, identity string, running int) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE job_executor
-		SET write_seq = write_seq + 1, heartbeat_at = NOW(), running = ?
+		SET write_seq = write_seq + 1, heartbeat_at = UTC_TIMESTAMP(), running = ?
 		WHERE executor_id = ? AND identity = ?`,
 		running, executorID, identity)
 	if err != nil {
@@ -164,7 +164,7 @@ func (s *Store) LiveExecutors(ctx context.Context, handlerKey, group string, liv
 		FROM job_executor e
 		JOIN job_executor_handler h ON h.executor_id = e.executor_id
 		WHERE h.handler_key = ?
-		  AND e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, NOW())
+		  AND e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
 		  AND (? = '' OR e.executor_group = ?)
 		ORDER BY e.heartbeat_at DESC, e.executor_id`
 
@@ -248,7 +248,7 @@ func (s *Store) Orphans(ctx context.Context, liveness time.Duration) ([]Orphan, 
 		      SELECT 1 FROM job_executor_handler h
 		      JOIN job_executor e ON e.executor_id = h.executor_id
 		      WHERE h.handler_key = d.handler_key
-		        AND e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, NOW())
+		        AND e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
 		        AND (d.executor_group IS NULL OR e.executor_group = d.executor_group))
 		ORDER BY d.job_name`
 
@@ -278,7 +278,7 @@ func (s *Store) Orphans(ctx context.Context, liveness time.Duration) ([]Orphan, 
 // never appears.
 func (s *Store) ReapExecutors(ctx context.Context, retention time.Duration) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM job_executor WHERE heartbeat_at < TIMESTAMPADD(SECOND, ?, NOW())`,
+		`DELETE FROM job_executor WHERE heartbeat_at < TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())`,
 		-seconds(retention))
 	if err != nil {
 		return 0, fmt.Errorf("reap dead executors: %w", err)
@@ -298,7 +298,7 @@ func HandlerIsServed(ctx context.Context, tx *sql.Tx, def gojob.Definition, live
 		SELECT 1 FROM job_executor_handler h
 		JOIN job_executor e ON e.executor_id = h.executor_id
 		WHERE h.handler_key = ?
-		  AND e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, NOW())
+		  AND e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
 		  AND (? = '' OR e.executor_group = ?)
 		LIMIT 1`,
 		def.HandlerKey, -seconds(liveness), def.ExecutorGroup, def.ExecutorGroup).Scan(&one)

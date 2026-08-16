@@ -21,6 +21,7 @@ import (
 	"github.com/abcdeqwer/go-job/internal/control"
 	"github.com/abcdeqwer/go-job/internal/dispatch"
 	"github.com/abcdeqwer/go-job/internal/engine"
+	"github.com/abcdeqwer/go-job/internal/server"
 	"github.com/abcdeqwer/go-job/internal/store"
 )
 
@@ -54,6 +55,16 @@ type tenant struct {
 	store      *store.Store
 	engine     *engine.Engine
 	cancel     context.CancelFunc
+
+	// draining means claiming has stopped but callbacks are still served.
+	//
+	// Retiring a tenant is THREE things, and they cannot happen at the same moment: stop
+	// claiming, stop serving callbacks, close the pool. Doing them together removed the
+	// routing an executor needs to report a result at the instant the drain began — so every
+	// progress report and every result during the drain answered NOT_FOUND, which an executor
+	// treats as terminal and discards. The drain could not complete by its own definition, and
+	// a success arriving during a disable was lost and later recorded as unknown.
+	draining bool
 }
 
 // Registry owns the admitted tenants.
@@ -91,15 +102,43 @@ func NewRegistry(opts Options, ctl *control.Store, fence *control.Fence,
 	}
 }
 
+// Availability says why a tenant lookup did not produce a store.
+type Availability int
+
+const (
+	// Available: admitted here, and serving.
+	Available Availability = iota
+
+	// Pending: the registry knows this tenant but THIS instance has not admitted it yet, or
+	// its admission failed. The distinction matters at the gRPC boundary: NOT_FOUND tells an
+	// executor to discard a result, and discarding a real result because one instance happened
+	// to be mid-admission loses completed work. UNAVAILABLE tells it to retry.
+	Pending
+
+	// Unknown: no such tenant in the registry.
+	Unknown
+)
+
 // Store implements the lookup both the gRPC server and the admin API use.
+//
+// A DRAINING tenant is still returned. Its engine has stopped claiming, but the executors it
+// dispatched to are still reporting, and those reports are what the drain is waiting for.
 func (r *Registry) Store(name string) (*store.Store, bool) {
+	st, avail := r.Lookup(name)
+	return st, avail == Available
+}
+
+// Lookup resolves a tenant and says why, when it cannot.
+func (r *Registry) Lookup(name string) (*store.Store, Availability) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	t, ok := r.tenants[name]
-	if !ok {
-		return nil, false
+	if t, ok := r.tenants[name]; ok {
+		return t.store, Available
 	}
-	return t.store, true
+	if _, known := r.seen[name]; known {
+		return nil, Pending
+	}
+	return nil, Unknown
 }
 
 // Names lists admitted tenants.
@@ -213,7 +252,13 @@ func (r *Registry) reconcile(ctx context.Context) {
 		w, keep := want[name]
 		if !keep || w.Generation != t.generation {
 			r.mu.Lock()
-			delete(r.tenants, name)
+			if t.draining {
+				// Already being drained by an earlier pass.
+				r.mu.Unlock()
+				delete(have, name)
+				continue
+			}
+			t.draining = true
 			r.mu.Unlock()
 			reason := "disabled"
 			if keep {
@@ -231,6 +276,16 @@ func (r *Registry) reconcile(ctx context.Context) {
 	for name, w := range want {
 		if _, running := have[name]; running {
 			r.observe(ctx, name, w.Generation)
+			continue
+		}
+		// A tenant still draining is NOT re-admitted yet. Starting a new engine beside a drain
+		// that is about to release the old engine's held work would let the new one dispatch a
+		// row the old one has just returned to `ready`, while the executor that had it may
+		// still be running. The next pass admits it, once the drain has finished.
+		r.mu.RLock()
+		_, stillDraining := r.tenants[name]
+		r.mu.RUnlock()
+		if stillDraining {
 			continue
 		}
 		// Admission runs OFF the poll loop.
@@ -388,7 +443,15 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 		}
 	}
 
-	if left := t.engine.Tracking(); left > 0 {
+	// Owned rows in the DATABASE, not just tracked ones — an exhausted unknown dispatch is
+	// held and untracked, and is exactly what would otherwise be left behind.
+	left := t.engine.Tracking()
+	if releaseHeld {
+		if owned, err := t.store.OwnedByInstance(ctx, r.opts.InstanceID, 1); err == nil && len(owned) > 0 {
+			left = len(owned)
+		}
+	}
+	if left > 0 {
 		if releaseHeld {
 			// The tenant is going away from EVERY instance, so nothing will be left to recover
 			// what this one holds. Leaving it would hold the rows for ever and make the
@@ -403,6 +466,14 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 		}
 	}
 
+	// Only now is routing removed and the pool closed. Everything above needed the store to
+	// still resolve, because callbacks were the point of the drain.
+	r.mu.Lock()
+	if cur, ok := r.tenants[t.name]; ok && cur == t {
+		delete(r.tenants, t.name)
+	}
+	r.mu.Unlock()
+
 	t.cancel()
 	if err := t.db.Close(); err != nil {
 		r.log.Warn("closing a tenant pool failed", "tenant", t.name, "error", err)
@@ -412,9 +483,29 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 // Healthy reports readiness, which is exactly "this instance may act".
 func (r *Registry) Healthy() bool { return r.fence.Healthy() }
 
+// SchedulerTenants adapts the registry to the gRPC server's narrower view.
+//
+// Two enums rather than one shared type, because the alternative is the server package
+// importing runtime — and runtime already imports the engine, the store and the dispatch
+// client. A dependency edge added for an integer constant is a dependency edge.
+type SchedulerTenants struct{ R *Registry }
+
+func (s SchedulerTenants) Lookup(name string) (*store.Store, server.Availability) {
+	st, avail := s.R.Lookup(name)
+	switch avail {
+	case Available:
+		return st, server.Available
+	case Pending:
+		return nil, server.Pending
+	default:
+		return nil, server.Unknown
+	}
+}
+
 var (
-	_ admin.Tenants = (*Registry)(nil)
-	_ admin.Health  = (*Registry)(nil)
+	_ admin.Tenants  = (*Registry)(nil)
+	_ admin.Health   = (*Registry)(nil)
+	_ server.Tenants = SchedulerTenants{}
 )
 
 // ErrNoTenants is returned by a startup check when the registry is empty, so a fresh

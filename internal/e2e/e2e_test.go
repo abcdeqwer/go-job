@@ -187,6 +187,10 @@ type staticTenants struct{ st *store.Store }
 func (s staticTenants) Store(string) (*store.Store, bool) { return s.st, true }
 func (s staticTenants) Names() []string                   { return []string{tenantName} }
 
+func (s staticTenants) Lookup(string) (*store.Store, server.Availability) {
+	return s.st, server.Available
+}
+
 type alwaysUnfenced struct{}
 
 func (alwaysUnfenced) Check() error { return nil }
@@ -242,7 +246,7 @@ func eventually(t *testing.T, what string, timeout time.Duration, cond func() bo
 
 func (h *harness) createJob(d gojob.Definition, nextFire time.Time) {
 	h.t.Helper()
-	if err := h.store.CreateJob(context.Background(), d, nextFire, "test"); err != nil {
+	if err := h.store.CreateJob(context.Background(), d, nextFire, "test", "a test fixture"); err != nil {
 		h.t.Fatalf("create job %q: %v", d.JobName, err)
 	}
 }
