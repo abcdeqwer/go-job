@@ -274,6 +274,13 @@ CREATE TABLE job_executor (
     capabilities     VARCHAR(255) NULL,
     started_at       DATETIME     NOT NULL,
     heartbeat_at     DATETIME     NOT NULL,
+
+    -- Same purpose as job_execution.write_seq, for the same reason. A heartbeat repeated
+    -- inside one database second, from an executor whose running count has not changed,
+    -- rewrites every column identically and MySQL reports zero rows changed. The heartbeat
+    -- reads zero as "your registration has lapsed, call Register again", so without a column
+    -- that always moves, a healthy idle executor would be told to re-register once a second.
+    write_seq        BIGINT       NOT NULL DEFAULT 0,
     PRIMARY KEY (executor_id),
     KEY idx_job_executor_alive (heartbeat_at),
     KEY idx_job_executor_group (executor_group, heartbeat_at)

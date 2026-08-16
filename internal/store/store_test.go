@@ -118,6 +118,12 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 		if !strings.HasPrefix(strings.ToUpper(norm), "UPDATE ") {
 			continue
 		}
+		// Scoped to the two tables that carry the ownership protocol. job_executor is a
+		// registration table: it has no owner, no token and no epoch, and an executor's
+		// heartbeat is authenticated by the id it presents rather than fenced.
+		if !touchesProtocolTable(norm) {
+			continue
+		}
 		where := whereClause(norm)
 		if where == "" {
 			t.Errorf("UPDATE with no WHERE clause:\n  %s", norm)
@@ -233,8 +239,11 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 		t.Fatalf("checked only %d ownership assignments; the extractor is probably broken", assignments)
 	}
 
-	// And the comparisons: an ownership column may only be compared against NOW().
-	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(lease_until|heartbeat_at|deadline_at|timeout_at)\s*(<=|>=|<|>|=)\s*([A-Za-z0-9_?]+\(?\)?)`)
+	// And the comparisons, by the same rule as the assignments: whatever an ownership column
+	// is measured against must derive from NOW() and nothing else. `heartbeat_at >=
+	// TIMESTAMPADD(SECOND, ?, NOW())` is how every liveness window is expressed, so the check
+	// has to understand expressions rather than match a single token.
+	cmp := regexp.MustCompile(`(?i)(?:\w+\.)?\b(lease_until|heartbeat_at|deadline_at|timeout_at)\s*(<=|>=|<|>|=)\s*`)
 	var comparisons int
 	for _, s := range sqlStatementsInPackage(t) {
 		norm := strings.Join(strings.Fields(s), " ")
@@ -242,16 +251,51 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 		if i < 0 {
 			continue
 		}
-		for _, m := range cmp.FindAllStringSubmatch(norm[i:], -1) {
+		where := norm[i:]
+		for _, loc := range cmp.FindAllStringSubmatchIndex(where, -1) {
+			col := strings.ToLower(where[loc[2]:loc[3]])
+			rhs := balancedExpr(where[loc[1]:])
 			comparisons++
-			if !strings.EqualFold(m[3], "NOW()") {
-				t.Errorf("ownership column %s compared against %q rather than NOW():\n  %s", m[1], m[3], norm)
+			if !ownershipValueIsSafe(col, rhs) {
+				t.Errorf("ownership column %s compared against %q, which is not derived from NOW():\n  %s",
+					col, rhs, norm)
 			}
 		}
 	}
 	if comparisons < 4 {
 		t.Fatalf("checked only %d ownership comparisons; the extractor is probably broken", comparisons)
 	}
+}
+
+// balancedExpr reads one SQL expression from the front of s, stopping at the first top-level
+// boundary — a closing paren that was never opened here, or a keyword that ends the term.
+func balancedExpr(s string) string {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				return strings.TrimSpace(s[:i])
+			}
+			depth--
+		case ' ':
+			if depth == 0 {
+				rest := strings.ToUpper(s[i+1:])
+				for _, kw := range []string{"AND ", "OR ", "ORDER ", "LIMIT ", "GROUP "} {
+					if strings.HasPrefix(rest, kw) {
+						return strings.TrimSpace(s[:i])
+					}
+				}
+			}
+		case ',':
+			if depth == 0 {
+				return strings.TrimSpace(s[:i])
+			}
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 // Business columns must never be compared against the database clock — the mirror of the rule
@@ -580,6 +624,17 @@ func flattenTouches(fns map[string]packageFunc, name string, seen map[string]boo
 		out = append(out, ev)
 	}
 	return out
+}
+
+// touchesProtocolTable reports whether a statement writes one of the two tables that carry
+// the ownership protocol.
+func touchesProtocolTable(norm string) bool {
+	for _, t := range tableEvents(norm) {
+		if t == "job_state" || t == "job_execution" {
+			return true
+		}
+	}
+	return false
 }
 
 func whereClause(norm string) string {
