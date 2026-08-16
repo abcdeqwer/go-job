@@ -352,17 +352,30 @@ func recordAttempt(ctx context.Context, tx *sql.Tx, h Holder, o Outcome, now tim
 	if o.FinishedAt.IsZero() {
 		o.FinishedAt = now
 	}
+
+	// The ordinal is read first and the insert is a plain VALUES, rather than one
+	// INSERT ... SELECT ... ON DUPLICATE KEY UPDATE.
+	//
+	// With the SELECT in scope, job_execution and job_execution_attempt both have an
+	// execution_key, and MySQL rejects the duplicate-key clause as ambiguous — a failure that
+	// no amount of reading the statement makes obvious and that only a real database reports.
+	// Two plain statements inside one transaction cost a round trip and are impossible to get
+	// wrong that way.
+	var attemptNo int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT attempt_no FROM job_execution WHERE id = ?`, h.ExecutionID).Scan(&attemptNo); err != nil {
+		return fmt.Errorf("read attempt ordinal of execution %d: %w", h.ExecutionID, err)
+	}
+
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO job_execution_attempt
 		    (execution_key, run_token, attempt_no, executor_id,
 		     started_at, finished_at, outcome, failure_kind, summary)
-		SELECT ?, ?, attempt_no, ?, ?, ?, ?, ?, ?
-		FROM job_execution WHERE id = ?
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE execution_key = execution_key`,
-		h.ExecutionKey, h.RunToken, nullString(o.ExecutorID),
+		h.ExecutionKey, h.RunToken, attemptNo, nullString(o.ExecutorID),
 		nullTime(o.StartedAt), nullTime(o.FinishedAt),
-		string(o.AttemptOutcome), nullString(o.FailureKind), nullString(o.ResultSummary),
-		h.ExecutionID)
+		string(o.AttemptOutcome), nullString(o.FailureKind), nullString(o.ResultSummary))
 	if err != nil {
 		return fmt.Errorf("record attempt %s of execution %d: %w", h.RunToken, h.ExecutionID, err)
 	}

@@ -1,0 +1,37 @@
+# A running go-job, for trying it out.
+#
+# Not a production deployment: it runs one scheduler instance against a MySQL with a password
+# in this file, over plaintext gRPC. What it IS good for is seeing the thing work end to end,
+# and having something concrete to compare a real deployment against.
+services:
+  mysql:
+    image: mysql:8.4
+    command: --default-time-zone=+00:00
+    environment:
+      MYSQL_ROOT_PASSWORD: gojob
+      MYSQL_DATABASE: gojob_control
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-uroot", "-pgojob"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes:
+      # Applied in name order. go-job never runs DDL itself: apply these with whatever
+      # migration tool you already run.
+      - ./schema/mysql/control/001_control.sql:/docker-entrypoint-initdb.d/01-control.sql:ro
+
+  gojob:
+    build: .
+    depends_on:
+      mysql: {condition: service_healthy}
+    environment:
+      GOJOB_CONTROL_DSN: "root:gojob@tcp(mysql:3306)/gojob_control"
+      # Demo key. Generate a real one with: openssl rand -hex 32
+      # It must be identical across every instance and every restart: it decrypts the DSNs in
+      # the registry, and a key that changes makes every tenant unreadable.
+      GOJOB_DSN_KEY: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      GOJOB_LOCATION: "UTC"
+    ports:
+      - "8080:8080"   # operator API and UI
+      - "9090:9090"   # executor-facing gRPC
