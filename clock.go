@@ -1,6 +1,9 @@
 package gojob
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // Clock supplies business time: the clock cron expressions are evaluated in and business
 // windows are measured by.
@@ -36,12 +39,53 @@ type SystemClock struct{ Loc *time.Location }
 func (c SystemClock) Now() time.Time           { return time.Now().In(c.Loc).Truncate(time.Second) }
 func (c SystemClock) Location() *time.Location { return c.Loc }
 
-// FixedClock pins business time. The differential replay harness uses it to run a handler
-// as of an arbitrary historical instant; tests use it to make scheduling deterministic.
+// FixedClock pins business time and can be moved deliberately. The differential replay
+// harness uses it to run a handler as of an arbitrary historical instant; tests use it to make
+// scheduling deterministic without sleeping.
+//
+// It is safe for concurrent use because the thing reading it is usually a scheduler loop in
+// another goroutine while the thing moving it is a test — the exact shape that makes an
+// unguarded field a flake nobody can reproduce.
+//
+// Moving a business clock is not free: every cron next_fire_at computed under the old one is
+// wrong, so a shift must be followed by recomputing every cron state row for the tenant. That
+// is why this is a testing and replay facility, and why production uses SystemClock.
 type FixedClock struct {
-	At  time.Time
-	Loc *time.Location
+	mu  sync.RWMutex
+	at  time.Time
+	loc *time.Location
 }
 
-func (c FixedClock) Now() time.Time           { return c.At.In(c.Loc).Truncate(time.Second) }
-func (c FixedClock) Location() *time.Location { return c.Loc }
+// NewFixedClock pins business time at `at`, rendered in `loc`.
+func NewFixedClock(at time.Time, loc *time.Location) *FixedClock {
+	if loc == nil {
+		loc = time.UTC
+	}
+	return &FixedClock{at: at, loc: loc}
+}
+
+func (c *FixedClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.at.In(c.loc).Truncate(time.Second)
+}
+
+func (c *FixedClock) Location() *time.Location {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.loc
+}
+
+// Set moves business time to an absolute instant.
+func (c *FixedClock) Set(t time.Time) {
+	c.mu.Lock()
+	c.at = t
+	c.mu.Unlock()
+}
+
+// Advance moves business time forward by d.
+func (c *FixedClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.at = c.at.Add(d)
+	c.mu.Unlock()
+}
