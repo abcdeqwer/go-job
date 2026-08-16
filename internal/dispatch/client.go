@@ -1,0 +1,404 @@
+// Package dispatch is the scheduler's side of the executor contract: connections to executor
+// processes, the Run/Cancel/GetExecution calls, and the translation of gRPC status codes into
+// the transitions doc/protocol.md §2 specifies.
+//
+// The translation is the part worth care. Every code an executor can return means something
+// different for the retry budget, and getting one wrong is expensive in a way that does not
+// show up in testing: charging an attempt for RESOURCE_EXHAUSTED marches a job to `dead`
+// without a line of business code having run, and NOT charging one for a genuine failure
+// makes max_attempts unbounded.
+package dispatch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
+)
+
+// Answer is how an executor responded to a dispatch, reduced to the three outcomes the
+// protocol distinguishes. Anything finer belongs in the log, not in the control flow.
+type Answer int
+
+const (
+	// Accepted: the executor has the work and will report a result. The attempt is charged.
+	Accepted Answer = iota
+
+	// Refused: the executor provably did not take it — busy, shutting down, or it does not
+	// have the handler. No attempt is charged, and the scheduler tries another instance.
+	Refused
+
+	// Unknown: the call failed in a way that does not say whether the executor took it.
+	// The execution stays `dispatching` with its target recorded, and a bounded re-send to
+	// the SAME executor resolves it; recovery resolves it if the re-send bound is exhausted.
+	Unknown
+)
+
+func (a Answer) String() string {
+	switch a {
+	case Accepted:
+		return "accepted"
+	case Refused:
+		return "refused"
+	default:
+		return "unknown"
+	}
+}
+
+// Result of one dispatch attempt.
+type Result struct {
+	Answer Answer
+
+	// HeldToken is set when the executor answered ALREADY_EXISTS, naming the token it
+	// actually holds. It is the difference between two situations that look identical:
+	// a re-send of THIS attempt after a lost reply, which is an acceptance, and a new
+	// attempt colliding with an older one the scheduler already fenced, which is not —
+	// the old handler is still running and this attempt never started.
+	HeldToken string
+
+	// Code is the gRPC code, kept for metrics and logs. Never branched on outside this
+	// package; the Answer is the decision.
+	Code codes.Code
+
+	Err error
+}
+
+// Client dispatches to executors and reuses one connection per address.
+//
+// Connections are cached by address rather than by executor id: a restarted executor mints a
+// new id but usually keeps its address, and a fresh connection per dispatch would pay a
+// handshake on every job in a fleet where handshakes are the expensive part.
+type Client struct {
+	dialTimeout time.Duration
+	callTimeout time.Duration
+
+	mu    sync.Mutex
+	conns map[string]*grpc.ClientConn
+
+	// dialer is overridable so tests can supply an in-process connection. Production passes
+	// nil and gets grpc.NewClient.
+	dialer func(target string) (*grpc.ClientConn, error)
+}
+
+// NewClient builds a dispatch client. callTimeout bounds Run, Cancel and Describe; recovery's
+// GetExecution passes its own, shorter deadline, because that one is made while a job's
+// recovery is waiting on it.
+func NewClient(dialTimeout, callTimeout time.Duration) *Client {
+	return &Client{
+		dialTimeout: dialTimeout,
+		callTimeout: callTimeout,
+		conns:       make(map[string]*grpc.ClientConn),
+	}
+}
+
+// SetDialer replaces connection establishment, for tests.
+func (c *Client) SetDialer(d func(target string) (*grpc.ClientConn, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dialer = d
+}
+
+func (c *Client) conn(address string) (*grpc.ClientConn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if cc, ok := c.conns[address]; ok {
+		return cc, nil
+	}
+	dial := c.dialer
+	if dial == nil {
+		dial = func(target string) (*grpc.ClientConn, error) {
+			// Credentials are the deployment's business. go-job does not invent a TLS story
+			// for a link that is usually inside one network and, when it is not, needs the
+			// operator's own certificates rather than a default nobody audited.
+			return grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		}
+	}
+	cc, err := dial(address)
+	if err != nil {
+		return nil, fmt.Errorf("connect to executor at %s: %w", address, err)
+	}
+	c.conns[address] = cc
+	return cc, nil
+}
+
+// Forget drops a cached connection, so an executor that was deregistered or reaped does not
+// hold one open for the life of the process.
+func (c *Client) Forget(address string) {
+	c.mu.Lock()
+	cc, ok := c.conns[address]
+	delete(c.conns, address)
+	c.mu.Unlock()
+	if ok {
+		_ = cc.Close()
+	}
+}
+
+// Close releases every connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	conns := c.conns
+	c.conns = make(map[string]*grpc.ClientConn)
+	c.mu.Unlock()
+
+	var firstErr error
+	for _, cc := range conns {
+		if err := cc.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// RunSpec is one dispatch.
+type RunSpec struct {
+	Address      string
+	Tenant       string
+	ExecutionKey string
+	RunToken     string
+	JobName      string
+	HandlerKey   string
+	Attempt      int
+	ScheduledAt  time.Time
+
+	// SilenceDeadline is how long the executor may say nothing before the scheduler treats it
+	// as lost; RemainingTimeout is how long the work itself may take.
+	//
+	// Both are sent as DURATIONS rather than instants. An executor's clock is not the
+	// scheduler's, and an instant would be interpreted against whatever the executor's host
+	// believes the time is — which for a cap measured in seconds is the difference between a
+	// budget and a coin flip.
+	SilenceDeadline  time.Duration
+	RemainingTimeout time.Duration
+
+	Params map[string]any
+}
+
+// Run hands one execution to an executor and classifies the answer.
+func (c *Client) Run(ctx context.Context, spec RunSpec) Result {
+	cc, err := c.conn(spec.Address)
+	if err != nil {
+		// Never reaching the executor is the one connection failure that IS provably a
+		// non-delivery: no request was sent.
+		return Result{Answer: Refused, Code: codes.Unavailable, Err: err}
+	}
+
+	params, err := structpb.NewStruct(spec.Params)
+	if err != nil {
+		// The scheduler built these from the job's stored JSON, so this is a broken
+		// definition rather than an executor problem, and retrying it would fail identically.
+		return Result{Answer: Refused, Code: codes.InvalidArgument,
+			Err: fmt.Errorf("encode params for %s: %w", spec.ExecutionKey, err)}
+	}
+
+	req := &gojobv1.RunRequest{
+		ExecutionKey:            spec.ExecutionKey,
+		RunToken:                spec.RunToken,
+		Tenant:                  spec.Tenant,
+		JobName:                 spec.JobName,
+		HandlerKey:              spec.HandlerKey,
+		Attempt:                 int32(spec.Attempt),
+		ScheduledAt:             spec.ScheduledAt.Format(time.RFC3339),
+		SilenceDeadlineSeconds:  int32(roundUpSeconds(spec.SilenceDeadline)),
+		RemainingTimeoutSeconds: int32(roundUpSeconds(spec.RemainingTimeout)),
+		Params:                  &gojobv1.JobParams{Values: params},
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
+
+	_, err = gojobv1.NewJobExecutorClient(cc).Run(callCtx, req)
+	return classifyRun(err)
+}
+
+// classifyRun maps a Run reply onto the three outcomes.
+//
+// The mapping is exhaustive by construction: anything not named is Unknown, which is the safe
+// default because Unknown never loses work — it keeps the execution `dispatching` with its
+// target recorded, so either the re-send or recovery resolves it. Guessing Refused for an
+// unrecognised code would be the dangerous default: it releases the job while an executor may
+// be running it.
+func classifyRun(err error) Result {
+	if err == nil {
+		return Result{Answer: Accepted, Code: codes.OK}
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		return Result{Answer: Unknown, Code: codes.Unknown, Err: err}
+	}
+
+	switch st.Code() {
+	case codes.OK:
+		return Result{Answer: Accepted, Code: codes.OK}
+
+	case codes.AlreadyExists:
+		// The executor already holds this execution key. Whether that is an acceptance
+		// depends on WHICH token it holds, which the caller decides — it is the only party
+		// that knows the token it just sent.
+		return Result{Answer: Accepted, Code: st.Code(), HeldToken: heldToken(st), Err: err}
+
+	case codes.ResourceExhausted, codes.Unavailable, codes.FailedPrecondition:
+		// Provable non-delivery. RESOURCE_EXHAUSTED is capacity, UNAVAILABLE is a shutting-down
+		// or unreachable process, FAILED_PRECONDITION is an unknown handler — routing is wrong
+		// and the caller alerts on it. None is a handler start.
+		return Result{Answer: Refused, Code: st.Code(), Err: err}
+
+	case codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
+		// The executor rejected the request itself. Retrying it against the same fleet will
+		// fail the same way, so it is refused rather than retried into a loop — but it is a
+		// configuration fault and the caller must alert, not quietly back off.
+		return Result{Answer: Refused, Code: st.Code(), Err: err}
+
+	default:
+		// DEADLINE_EXCEEDED, CANCELED, INTERNAL, UNKNOWN, ABORTED and anything new: the
+		// request may or may not have arrived.
+		return Result{Answer: Unknown, Code: st.Code(), Err: err}
+	}
+}
+
+// heldToken pulls the run token out of an ALREADY_EXISTS status detail.
+func heldToken(st *status.Status) string {
+	for _, d := range st.Details() {
+		if held, ok := d.(*gojobv1.ExecutionHeld); ok {
+			return held.GetHeldRunToken()
+		}
+	}
+	return ""
+}
+
+// Cancel asks an executor to stop. Acknowledgement means the stop was SIGNALLED, not that
+// work has ceased — the executor still reports a result when the work actually ends, and the
+// execution keeps its lease until it does.
+func (c *Client) Cancel(ctx context.Context, address, tenant, executionKey, runToken, reason string) error {
+	cc, err := c.conn(address)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
+
+	_, err = gojobv1.NewJobExecutorClient(cc).Cancel(callCtx, &gojobv1.CancelRequest{
+		Tenant:       tenant,
+		ExecutionKey: executionKey,
+		RunToken:     runToken,
+		Reason:       reason,
+	})
+	if err != nil && status.Code(err) == codes.NotFound {
+		// The executor does not have it. Nothing to stop, and not an error worth surfacing:
+		// the row is fenced either way.
+		return nil
+	}
+	return err
+}
+
+// Reconciliation is what recovery phase 2 learned.
+type Reconciliation struct {
+	// State is RUNNING, FINISHED, or unset when the executor could not answer.
+	State gojobv1.ExecutionState
+
+	// RunToken is the attempt the executor is describing. An answer about a DIFFERENT token
+	// describes a different attempt and must be discarded.
+	RunToken string
+
+	Outcome *gojobv1.ExecutionOutcome
+	Message string
+
+	// Reachable is false when the deadline elapsed, the call failed, or the executor said
+	// NOT_FOUND. All three mean the same thing to the protocol: the attempt is unknown, and
+	// nobody can say whether the handler ran.
+	Reachable bool
+}
+
+// GetExecution asks an executor what happened to work the scheduler lost track of.
+//
+// The deadline is explicit and short, and the call happens OUTSIDE any transaction. An RPC to
+// a process that may be wedged must never be made while holding a row lock: a connection that
+// stays open and never answers would pin job_state and job_execution indefinitely, blocking
+// completion, cancellation and every other recovery for that job.
+func (c *Client) GetExecution(ctx context.Context, address, tenant, executionKey string, deadline time.Duration) Reconciliation {
+	cc, err := c.conn(address)
+	if err != nil {
+		return Reconciliation{}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	resp, err := gojobv1.NewJobExecutorClient(cc).GetExecution(callCtx, &gojobv1.GetExecutionRequest{
+		Tenant:       tenant,
+		ExecutionKey: executionKey,
+	})
+	if err != nil {
+		return Reconciliation{}
+	}
+	return Reconciliation{
+		State:     resp.GetState(),
+		RunToken:  resp.GetRunToken(),
+		Outcome:   resp.GetOutcome(),
+		Message:   resp.GetMessage(),
+		Reachable: true,
+	}
+}
+
+// ErrContractProbe means an executor failed the registration-time probe.
+var ErrContractProbe = errors.New("gojob: executor failed the contract probe")
+
+// Describe probes an executor at registration, before any work is routed to it.
+//
+// This is the third of the contract's four enforcement layers, and the only one that runs
+// against the process actually deployed rather than against the code that was built. The
+// distinction it exists to draw is between two failures that a hand-written HTTP executor
+// cannot tell apart:
+//
+//   - UNIMPLEMENTED means the method is missing — the executor was generated from the
+//     contract but did not implement it, so nothing it declares can be trusted;
+//   - NOT_FOUND from a LATER call means the method exists and the thing asked about does not,
+//     which is an ordinary answer.
+//
+// Registering an executor that fails this probe would put a process in the routing pool that
+// cannot be reconciled with, which is precisely the state recovery has no answer for.
+func (c *Client) Describe(ctx context.Context, address string) (*gojobv1.DescribeResponse, error) {
+	cc, err := c.conn(address)
+	if err != nil {
+		return nil, err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
+
+	resp, err := gojobv1.NewJobExecutorClient(cc).Describe(callCtx, &gojobv1.DescribeRequest{})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return nil, fmt.Errorf("%w: %s does not implement Describe", ErrContractProbe, address)
+		}
+		return nil, fmt.Errorf("%w: Describe at %s: %v", ErrContractProbe, address, err)
+	}
+	if resp.GetContractVersion() == "" {
+		return nil, fmt.Errorf("%w: %s reports no contract version", ErrContractProbe, address)
+	}
+	if len(resp.GetHandlerKeys()) == 0 {
+		return nil, fmt.Errorf("%w: %s declares no handlers", ErrContractProbe, address)
+	}
+	return resp, nil
+}
+
+// roundUpSeconds never rounds a positive duration down to zero, because zero means "no budget"
+// on the wire and would be read by the executor as an instruction to give up immediately.
+func roundUpSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	s := int((d + time.Second - 1) / time.Second)
+	if s < 1 {
+		return 1
+	}
+	return s
+}
