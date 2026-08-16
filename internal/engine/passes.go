@@ -13,6 +13,7 @@ import (
 	gojob "github.com/abcdeqwer/go-job"
 	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
 	"github.com/abcdeqwer/go-job/internal/dispatch"
+	"github.com/abcdeqwer/go-job/internal/outcome"
 	"github.com/abcdeqwer/go-job/internal/store"
 )
 
@@ -459,28 +460,10 @@ func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Re
 	e.applyOutcome(ctx, h, rec.Outcome, v.DispatchedTo)
 }
 
-// applyOutcome writes a reported result, choosing between completion and retry.
+// applyOutcome writes a reported result through the shared classification, so a result
+// recovered from a surviving executor lands identically to one reported normally.
 func (e *Engine) applyOutcome(ctx context.Context, h store.Holder, oc *gojobv1.ExecutionOutcome, executorID string) {
-	status, reason, attempt, retryable := dispositionToOutcome(oc.GetDisposition(), oc.GetFailureKind())
-	now := e.clock.Now()
-
-	o := store.Outcome{
-		Status:         status,
-		TerminalReason: reason,
-		AttemptOutcome: attempt,
-		FailureKind:    oc.GetFailureKind(),
-		ErrorMessage:   oc.GetErrorDetail(),
-		ResultSummary:  oc.GetSummary(),
-		ExecutorID:     executorID,
-		FinishedAt:     now,
-	}
-
-	var err error
-	if retryable {
-		err = e.store.Retry(ctx, h, o, e.backoff(0))
-	} else {
-		err = e.store.Complete(ctx, h, o)
-	}
+	err := outcome.Apply(ctx, e.store, h, oc, executorID, e.backoff(0))
 	if err != nil && !errors.Is(err, gojob.ErrFenced) {
 		e.log.Error("recording an outcome failed", "execution", h.ExecutionKey, "error", err)
 	}

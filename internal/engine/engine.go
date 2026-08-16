@@ -13,12 +13,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"strings"
 	"sync"
 	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
-	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
 	"github.com/abcdeqwer/go-job/internal/cron"
 	"github.com/abcdeqwer/go-job/internal/dispatch"
 	"github.com/abcdeqwer/go-job/internal/store"
@@ -335,49 +333,4 @@ func (e *Engine) reapPass(ctx context.Context) {
 		e.log.Warn("job has no live executor",
 			"job", o.JobName, "handler", o.HandlerKey, "group", o.Group)
 	}
-}
-
-// dispositionToOutcome maps a conforming executor's reported disposition onto the scheduler's
-// terminal vocabulary. The bool is whether the attempt may be retried.
-//
-// DISPOSITION_UNSPECIFIED is treated as a failure rather than as a success. An executor that
-// does not say what happened has not said it worked, and the expensive mistake is the other
-// one: recording success for a run whose outcome nobody stated.
-func dispositionToOutcome(d gojobv1.Disposition, failureKind string) (gojob.Status, gojob.TerminalReason, gojob.AttemptOutcome, bool) {
-	switch d {
-	case gojobv1.Disposition_DISPOSITION_SUCCESS:
-		return gojob.StatusSuccess, gojob.ReasonHandlerConfirmed, gojob.AttemptSuccess, false
-
-	case gojobv1.Disposition_DISPOSITION_STOPPED:
-		// The handler confirmed it stopped, which is the only way `cancelled` is reached with
-		// side effects actually accounted for.
-		return gojob.StatusCancelled, gojob.ReasonHandlerConfirmed, gojob.AttemptFailed, false
-
-	case gojobv1.Disposition_DISPOSITION_TIMED_OUT:
-		// Deliberately not retryable: a job that exhausted its entire runtime budget will most
-		// likely exhaust it again, and retrying is how one slow run becomes an afternoon of
-		// them. An operator who disagrees can retry it explicitly, which is exactly the
-		// judgement a human should make and the scheduler should not.
-		return gojob.StatusDead, gojob.ReasonTimeout, gojob.AttemptFailed, false
-
-	default:
-		if permanentFailure(failureKind) {
-			return gojob.StatusDead, gojob.ReasonPermanentFailure, gojob.AttemptFailed, false
-		}
-		return gojob.StatusDead, "", gojob.AttemptFailed, true
-	}
-}
-
-// permanentFailure decides whether a reported failure kind is worth retrying.
-//
-// The contract is a naming convention rather than an enum, because failure kinds are the
-// executor's vocabulary and an enum here would mean every new kind of permanent failure needs
-// a scheduler release. A kind is permanent if it is exactly "permanent" or is namespaced
-// under "permanent." — so `permanent.validation` and `permanent.not_found` need no change here.
-//
-// Retrying a validation failure is not merely wasteful: it burns the attempt budget on an
-// input that cannot become valid, so the row reaches `dead` with a budget-exhausted reason
-// that hides the actual cause.
-func permanentFailure(kind string) bool {
-	return kind == "permanent" || strings.HasPrefix(kind, "permanent.")
 }

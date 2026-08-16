@@ -286,7 +286,7 @@ func (s *Store) Resolve(ctx context.Context, v Stale, backoffSeconds int) (gojob
 			FinishedAt:     now,
 			FailureKind:    "lease_expired",
 			ResultSummary:  "scheduler lost ownership; executor could not confirm the outcome",
-		}); err != nil {
+		}, now); err != nil {
 			return err
 		}
 
@@ -461,7 +461,7 @@ func (s *Store) FenceTimedOut(ctx context.Context, v Stale) error {
 			FinishedAt:     now,
 			FailureKind:    "timeout",
 			ResultSummary:  summary,
-		}); err != nil {
+		}, now); err != nil {
 			return err
 		}
 		return settlePollClock(ctx, tx, h, now)

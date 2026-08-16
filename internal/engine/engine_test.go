@@ -4,70 +4,8 @@ import (
 	"testing"
 	"time"
 
-	gojob "github.com/abcdeqwer/go-job"
-	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
 	"github.com/abcdeqwer/go-job/internal/store"
 )
-
-// What an executor reports decides whether the row is terminal or comes back for another
-// attempt, and two of the four dispositions are deliberately NOT retried. Getting either
-// wrong is quiet: a non-retried failure looks like a scheduler that gave up, and a retried
-// timeout turns one slow run into an afternoon of them.
-func TestDispositionToOutcome(t *testing.T) {
-	cases := []struct {
-		name        string
-		disposition gojobv1.Disposition
-		failureKind string
-		wantStatus  gojob.Status
-		wantRetry   bool
-	}{
-		{"success", gojobv1.Disposition_DISPOSITION_SUCCESS, "", gojob.StatusSuccess, false},
-
-		// The handler confirmed it stopped — the only path to `cancelled` with side effects
-		// actually accounted for.
-		{"stopped", gojobv1.Disposition_DISPOSITION_STOPPED, "", gojob.StatusCancelled, false},
-
-		// A job that burned its whole runtime budget will most likely burn it again.
-		{"timed out", gojobv1.Disposition_DISPOSITION_TIMED_OUT, "", gojob.StatusDead, false},
-
-		{"plain failure retries", gojobv1.Disposition_DISPOSITION_FAILED, "io", gojob.StatusDead, true},
-		{"failure with no kind retries", gojobv1.Disposition_DISPOSITION_FAILED, "", gojob.StatusDead, true},
-
-		// An executor that does not say what happened has not said it worked.
-		{"unspecified is a failure", gojobv1.Disposition_DISPOSITION_UNSPECIFIED, "", gojob.StatusDead, true},
-
-		// Retrying a validation failure burns the budget on an input that cannot become valid,
-		// so the row reaches dead with a budget-exhausted reason that hides the real cause.
-		{"permanent", gojobv1.Disposition_DISPOSITION_FAILED, "permanent", gojob.StatusDead, false},
-		{"namespaced permanent", gojobv1.Disposition_DISPOSITION_FAILED, "permanent.validation", gojob.StatusDead, false},
-
-		// The convention is a prefix with a dot, not a substring: a kind that merely starts
-		// with the letters must not be swept in.
-		{"permanently_slow is not permanent", gojobv1.Disposition_DISPOSITION_FAILED, "permanently_slow", gojob.StatusDead, true},
-	}
-
-	for _, c := range cases {
-		status, _, _, retry := dispositionToOutcome(c.disposition, c.failureKind)
-		if status != c.wantStatus {
-			t.Errorf("%s: status = %q, want %q", c.name, status, c.wantStatus)
-		}
-		if retry != c.wantRetry {
-			t.Errorf("%s: retryable = %v, want %v", c.name, retry, c.wantRetry)
-		}
-	}
-}
-
-// Success must never be retryable, whatever an executor puts in failure_kind. A conforming
-// executor would not set one, and a non-conforming one must not be able to turn a completed
-// run into a second run.
-func TestSuccessIsNeverRetried(t *testing.T) {
-	for _, kind := range []string{"", "io", "permanent", "permanent.validation"} {
-		status, _, _, retry := dispositionToOutcome(gojobv1.Disposition_DISPOSITION_SUCCESS, kind)
-		if retry || status != gojob.StatusSuccess {
-			t.Errorf("failure_kind %q turned a success into %v/retry=%v", kind, status, retry)
-		}
-	}
-}
 
 // Backoff must be bounded and must never be zero. A zero backoff makes a rejected candidate
 // due again immediately, which is the spin the backoff exists to prevent.

@@ -78,7 +78,7 @@ func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 			return fmt.Errorf("%w: execution %d result refused under token %s epoch %d",
 				gojob.ErrFenced, h.ExecutionID, h.RunToken, h.FenceEpoch)
 		}
-		if err := recordAttempt(ctx, tx, h, o); err != nil {
+		if err := recordAttempt(ctx, tx, h, o, now); err != nil {
 			return err
 		}
 		return settlePollClock(ctx, tx, h, now)
@@ -153,7 +153,7 @@ func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds i
 			return fmt.Errorf("%w: execution %d retry refused under token %s epoch %d",
 				gojob.ErrFenced, h.ExecutionID, h.RunToken, h.FenceEpoch)
 		}
-		if err := recordAttempt(ctx, tx, h, o); err != nil {
+		if err := recordAttempt(ctx, tx, h, o, now); err != nil {
 			return err
 		}
 		return settlePollClock(ctx, tx, h, now)
@@ -345,7 +345,13 @@ func (s *Store) Attempt(ctx context.Context, executionKey, runToken string) (Att
 // history is used to explain — an attempt resolved `unknown` by recovery, whose executor
 // surfaces hours later with a real result, must still read `unknown`, because `unknown` is
 // what the scheduler acted on.
-func recordAttempt(ctx context.Context, tx *sql.Tx, h Holder, o Outcome) error {
+func recordAttempt(ctx context.Context, tx *sql.Tx, h Holder, o Outcome, now time.Time) error {
+	// A caller that leaves FinishedAt zero gets the transaction's own instant rather than a
+	// NULL. An attempt row with no finish time is the one field an incident review always
+	// wants and the easiest for a caller to forget.
+	if o.FinishedAt.IsZero() {
+		o.FinishedAt = now
+	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO job_execution_attempt
 		    (execution_key, run_token, attempt_no, executor_id,
