@@ -18,9 +18,18 @@ admin UI ships with the scheduler.
                    ▼                                └────────────────┘
 ```
 
-> **Status: design.** This repository contains the design, the schema and the gRPC
-> contract. No engine code is written yet. `doc/` is the specification implementation
-> follows.
+> **Status: implemented.** The scheduler runs. `doc/` is the specification and the code
+> follows it; where they disagreed during review, the document won unless it was itself
+> incoherent, and the commit says which.
+>
+> Built: the cron engine, the full execution protocol against MySQL, materialization and
+> misfire, the executor registry, the gRPC contract in both directions, the scheduler loops,
+> the tenant registry with hot add, the operator API and UI, and a runnable binary. Ten
+> end-to-end scenarios run the whole thing against a real MySQL over real gRPC.
+>
+> Not built: metrics exposition, the differential-replay harness `doc/verification.md`
+> describes, and executor SDKs for languages other than Go — the contract is the SDK, and
+> `internal/testexec` is a complete Go executor to read.
 
 ---
 

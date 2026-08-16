@@ -164,8 +164,22 @@ Each was argued and settled; a reviewer should treat re-opening one as needing n
 | `doc/admin.md` | UI, API surface, auth |
 | `doc/verification.md` | 68 tests an implementation must pass, each naming its mechanism |
 | `schema/mysql/` | the DDL, exported and versioned: `control/001_control.sql` (one per installation), `tenant/001_tenant.sql` (one per tenant) |
+| `internal/cron/` | the six-field engine: parsing, `Next`, `Latest`, `CountBetween` |
+| `internal/store/` | every statement that touches a tenant's schema, plus static checks that read this package's own source |
+| `internal/dispatch/` | the outbound half of the contract, and the status-code classification |
+| `internal/server/` | the inbound half: `Register`, `Heartbeat`, `ReportProgress`, `ReportResult` |
+| `internal/outcome/` | one classification of an executor's disposition, shared by the reporting and recovery paths |
+| `internal/engine/` | the seven loops, per tenant |
+| `internal/control/` | tenant registry, admission, and the operate-lease fence |
+| `internal/admin/` | operator API and the embedded UI |
+| `internal/runtime/` | registry polling, hot add, per-tenant engine lifecycle |
+| `internal/testexec/` | a complete conforming executor — the shortest readable description of what implementing the contract means |
+| `internal/e2e/` | ten scenarios against a real MySQL over real gRPC |
+| `cmd/gojob/` | the binary |
 
-Status: **design only.** No engine code exists. Nothing has been pushed to a remote.
+Status: **implemented.** The scheduler runs, and the end-to-end tests exercise it against a
+real database. Still missing: metrics exposition, the differential-replay harness described
+in `doc/verification.md`, and executor SDKs for languages other than Go.
 
 ---
 
