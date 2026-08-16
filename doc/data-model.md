@@ -160,8 +160,25 @@ Acknowledgement can only ever say who *replied*; the scan says whether anything 
 -- quiescent when both return zero, in the OLD coordination schema
 SELECT COUNT(*) FROM job_state     WHERE active_kind IS NOT NULL;
 SELECT COUNT(*) FROM job_execution
- WHERE status IN ('ready','dispatching','running','cancel_requested');
+ WHERE status IN ('dispatching','running','cancel_requested');
+
+-- counted, reported, and acknowledged — but NOT gated on. See below.
+SELECT COUNT(*) FROM job_execution WHERE status = 'ready';
 ```
+
+**`ready` is deliberately not in the gate**, and an earlier revision of this document had it
+there, which is unimplementable. A cutover requires the tenant to be disabled; a disabled
+tenant has no scheduler claiming anything; so the queued count cannot fall on its own. Gating
+on it is not a strict safety property, it is a cutover that can never be performed — after
+which the actual outcome is somebody deleting rows by hand.
+
+Held and in-flight work is different in exactly the way that matters: it drains by itself, so
+waiting for it to reach zero terminates.
+
+Abandoning queued work silently is not acceptable either — those rows stop existing as far as
+the new schema is concerned, and a missed nightly run surfaces days later. So the API reports
+the count and refuses until the request acknowledges it (`"abandon_queued": true`), and the
+audit entry records how many were left behind.
 
 That is direct evidence about the thing that matters, and it is unaffected by which
 instances happen to be reachable. The acknowledgement table remains useful — it tells an

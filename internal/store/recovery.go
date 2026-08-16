@@ -599,6 +599,13 @@ func (s *Store) CancelRequested(ctx context.Context, limit int) ([]Stale, error)
 // healthy scheduler tracking an executor whose progress loop died keeps the lease fresh for
 // ever, so without this scan the row is owned until its runtime cap — which for a job capped
 // in hours means nobody learns for hours.
+//
+// The live-lease predicate is what keeps the two scans disjoint, and it is load-bearing. The
+// doc comment claimed it from the start while the SQL did not have it, so a row whose lease
+// AND silence budget had both elapsed was visible to both passes — and they disagree about
+// what to do with it. Silence, finding the executor unreachable, makes it terminally `dead`;
+// recovery, with budget remaining, returns it to `ready` for another attempt. Which one a job
+// got depended on which loop ticked first.
 func (s *Store) Silent(ctx context.Context, limit int) ([]Stale, error) {
 	const q = `
 		SELECT id, execution_key, job_name, status,
@@ -612,6 +619,7 @@ func (s *Store) Silent(ctx context.Context, limit int) ([]Stale, error) {
 		FROM job_execution
 		WHERE status IN ('running', 'cancel_requested')
 		  AND deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()
+		  AND lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP()
 		ORDER BY deadline_at, id LIMIT ?`
 	return s.scanStale(ctx, q, limit)
 }

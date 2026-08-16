@@ -942,15 +942,19 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 // not become used — but a rule that simply does not mention them is not a rule against them,
 // it is a gap, and the gap is invisible because everything it lets through is also invisible.
 //
+// Prepare and PrepareContext are here for the same reason: a prepared statement runs SQL that
+// no other rule in this file would ever see, because the Exec that follows carries arguments
+// only.
+//
 // They also take the statement in a DIFFERENT POSITION: `ExecContext(ctx, q, args...)` puts it
 // second, `Exec(q, args...)` puts it first. A first attempt at this rule recognised the names
 // but kept the index — so `tx.Exec(q)` was skipped by an arity check expecting a context
 // argument, and the bypass survived being "fixed". The position is part of the answer.
 func statementArg(name string) (int, bool) {
 	switch name {
-	case "ExecContext", "QueryContext", "QueryRowContext":
+	case "ExecContext", "QueryContext", "QueryRowContext", "PrepareContext":
 		return 1, true
-	case "Exec", "Query", "QueryRow":
+	case "Exec", "Query", "QueryRow", "Prepare":
 		return 0, true
 	}
 	return 0, false
@@ -1166,19 +1170,24 @@ func sqlParameterRunBy(fd *ast.FuncDecl) string {
 	var found string
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if !ok || len(call.Args) < 2 {
+		if !ok {
 			return true
 		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
 		if !ok {
 			return true
 		}
-		switch sel.Sel.Name {
-		case "ExecContext", "QueryContext", "QueryRowContext":
-		default:
+		// The same set the inspectability audit uses. Recognising only the Context variants
+		// here left a two-step bypass fully intact: a helper running `tx.Exec(query)` passed
+		// the inspectability audit (its SQL is a string parameter, which is allowed precisely
+		// BECAUSE this rule audits the call sites), and then was not recognised as a helper —
+		// so its call sites were never audited, and a concatenated statement handed to it was
+		// invisible to every check in this file.
+		at, runs := statementArg(sel.Sel.Name)
+		if !runs || len(call.Args) <= at {
 			return true
 		}
-		if id, ok := call.Args[1].(*ast.Ident); ok && params[id.Name] {
+		if id, ok := call.Args[at].(*ast.Ident); ok && params[id.Name] {
 			found = id.Name
 		}
 		return true

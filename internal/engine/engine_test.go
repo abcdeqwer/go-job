@@ -1,6 +1,11 @@
 package engine
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,35 +137,35 @@ func TestJitter(t *testing.T) {
 // and re-dispatched. Its control fence is fine — its last registry read was seconds ago by
 // the clock it kept — so nothing else stops it handing the same work to an executor. The
 // Accept that follows is correctly refused, long after two handlers are running.
-func TestHoldFreshnessGatesDispatch(t *testing.T) {
+func TestHoldRemainingGatesDispatch(t *testing.T) {
 	e := &Engine{tracked: map[int64]held{}}
 	h := store.Holder{ExecutionID: 7, FenceEpoch: 3, ExecutionKey: "job:1"}
 
 	const lease = 50 * time.Millisecond
 	e.track(h)
-	if !e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) <= 0 {
 		t.Fatal("a claim made a moment ago is not considered fresh")
 	}
 
 	// An execution this instance does not track, or tracks at another epoch, is never fresh:
 	// both mean the proof belongs to somebody else.
-	if e.holdIsFresh(999, h.FenceEpoch, lease) {
+	if e.holdRemaining(999, h.FenceEpoch, lease) > 0 {
 		t.Error("an untracked execution reported a live hold")
 	}
-	if e.holdIsFresh(h.ExecutionID, h.FenceEpoch+1, lease) {
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch+1, lease) > 0 {
 		t.Error("a hold at a different epoch reported live; that entry belongs to another attempt")
 	}
 
 	// Past the lease, with no renewal in between.
 	time.Sleep(lease)
-	if e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) > 0 {
 		t.Fatal("a claim older than its lease is still considered dispatchable; a frozen " +
 			"process would hand out work another instance has already recovered")
 	}
 
 	// A successful renewal is what makes it fresh again — that is the heartbeat's other job.
 	e.confirmHold(h.ExecutionID, h.FenceEpoch)
-	if !e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) <= 0 {
 		t.Fatal("a renewed lease did not restore the hold; a slow routing decision would be " +
 			"refused even while its lease is being renewed normally")
 	}
@@ -168,7 +173,55 @@ func TestHoldFreshnessGatesDispatch(t *testing.T) {
 	// And a renewal for a DIFFERENT epoch must not refresh this entry.
 	time.Sleep(lease)
 	e.confirmHold(h.ExecutionID, h.FenceEpoch+1)
-	if e.holdIsFresh(h.ExecutionID, h.FenceEpoch, lease) {
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) > 0 {
 		t.Fatal("a renewal at another epoch refreshed this hold")
+	}
+}
+
+// The heartbeat must refresh the ownership proof the dispatch gate reads.
+//
+// This is a source-reading test because nothing else can reach the seam. The renewal path
+// needs a live store, and the gate's dependence on it only shows up when a routing decision
+// outlives four fifths of a lease — a case no functional test provokes. So the one thing that
+// would make the gate wrong stays invisible: a gate refreshed only at claim time passes every
+// test in this repository and then refuses healthy work in production.
+//
+// It exists because that is exactly what happened. The refresh was written into a patch aimed
+// at the wrong file, applied to nothing, and shipped in a commit that described it — leaving
+// holdRemaining measuring from the claim alone.
+func TestHeartbeatRefreshesTheOwnershipProof(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	found := false
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Name.Name != "heartbeatPass" || fd.Body == nil {
+					continue
+				}
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "confirmHold" {
+						found = true
+					}
+					return true
+				})
+			}
+		}
+	}
+	if !found {
+		t.Fatal("heartbeatPass does not call confirmHold; the dispatch gate would then measure " +
+			"only from the claim, and a routing decision slower than four fifths of a lease " +
+			"would be refused while that lease is being renewed normally")
 	}
 }

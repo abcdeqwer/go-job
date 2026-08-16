@@ -845,10 +845,21 @@ func (x *GetExecutionRequest) GetExecutionKey() string {
 type GetExecutionResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	State ExecutionState         `protobuf:"varint,1,opt,name=state,proto3,enum=gojob.v1.ExecutionState" json:"state,omitempty"`
-	// Which attempt the executor is reporting on. A scheduler that asked about token T2 and
-	// is told about T1 must not adopt the answer: it describes a different attempt.
+	// Which attempt the executor is reporting on.
+	//
+	// REQUIRED whenever state is RUNNING or FINISHED. A scheduler that asked about token T2 and
+	// is told about T1 must not adopt the answer — it describes a different attempt — and an
+	// answer that names NO attempt proves nothing either, so it is treated the same way: as
+	// unknown. Omitting it does not make the scheduler trust you, it makes recovery fall back
+	// to the unreachable path and spend a recovery on work you could have accounted for.
 	RunToken string `protobuf:"bytes,6,opt,name=run_token,json=runToken,proto3" json:"run_token,omitempty"`
-	// Set when state is EXECUTION_STATE_FINISHED.
+	// REQUIRED when state is EXECUTION_STATE_FINISHED, with a disposition other than
+	// DISPOSITION_UNSPECIFIED.
+	//
+	// "Finished" without saying how is not an outcome, and the scheduler will not invent one:
+	// reading a missing disposition as a failure would return the execution to ready, spend an
+	// ATTEMPT rather than a recovery, and rerun work that may well have succeeded. An answer
+	// like that is treated as unknown.
 	Outcome *ExecutionOutcome `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
 	// Last handler-supplied progress message, if any.
 	Message string `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`

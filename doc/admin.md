@@ -138,7 +138,9 @@ resolve it differently — or worse, consistently but not as the operator expect
 GET    /api/tenants                                    registry, admission state, last_error
 POST   /api/tenants                                    add a site; body includes DSNs
 PATCH  /api/tenants/{tenant}                           enable/disable
-PUT    /api/tenants/{tenant}/dsn                       re-point; 409 until quiesced
+PUT    /api/tenants/{tenant}/dsn                       re-point; 409 until quiesced, and
+                                                       409 with a count until the request
+                                                       sets abandon_queued for `ready` work
 GET    /api/tenants/{tenant}/quiescence                per-instance observed generation
 GET    /api/tenants/{tenant}/handlers                  handler_keys live executors declare
 

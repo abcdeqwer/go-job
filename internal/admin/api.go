@@ -323,6 +323,18 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 		DSN        string `json:"dsn"`
 		SchemaUUID string `json:"schema_uuid"`
 		Reason     string `json:"reason"`
+
+		// AbandonQueued acknowledges that `ready` work in the old schema will be left behind.
+		//
+		// Queued work cannot GATE a cutover: the tenant must be disabled first, a disabled
+		// tenant has no scheduler claiming, and so the count can never fall on its own — a
+		// gate on it is a cutover that is permanently unreachable. But abandoning it silently
+		// is worse, because the rows simply stop existing as far as the new schema is
+		// concerned, and a missed nightly run is discovered days later.
+		//
+		// So it is neither: the operator is told the number and has to say the number is
+		// acceptable.
+		AbandonQueued bool `json:"abandon_queued"`
 	}
 	if err := decode(r, &body); err != nil {
 		return err
@@ -346,9 +358,15 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 	// partitioned from the control database stops replying while remaining perfectly able to
 	// reach the tenant's database, and its held rows are visible there even though its
 	// acknowledgements are not.
-	quiet, err := a.oldSchemaQuiescent(r.Context(), name)
+	quiet, queued, err := a.oldSchemaQuiescent(r.Context(), name)
 	if err != nil {
 		return err
+	}
+	if queued > 0 && !body.AbandonQueued {
+		return fmt.Errorf("%w: %s has %d queued execution(s) that this cutover would leave in "+
+			"the old schema, where nothing will ever claim them; re-send with "+
+			"\"abandon_queued\": true to accept that",
+			control.ErrNotQuiesced, name, queued)
 	}
 
 	// BOTH checks, not either. They cover different failures and neither subsumes the other.
@@ -392,43 +410,53 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
+	reason := body.Reason
+	if queued > 0 {
+		reason = fmt.Sprintf("%s (abandoning %d queued execution(s) in the old schema)",
+			reason, queued)
+	}
 	return a.control.SetTenantDSN(r.Context(), name, body.DSN, body.SchemaUUID,
-		ActorFrom(r.Context()), body.Reason, quiet)
+		ActorFrom(r.Context()), reason, quiet)
 }
 
 // oldSchemaQuiescent opens the tenant's CURRENT coordination schema and asks it directly.
-func (a *API) oldSchemaQuiescent(ctx context.Context, name string) (bool, error) {
+// It returns whether the schema is quiet AND how much queued work it still holds, because
+// those are two different questions with two different answers. Held and in-flight work
+// BLOCKS a cutover — it drains by itself, so waiting works. Queued work does not drain,
+// because the tenant is disabled; it is returned so the caller can require the operator to
+// acknowledge losing it rather than gating on a number that will never move.
+func (a *API) oldSchemaQuiescent(ctx context.Context, name string) (bool, int, error) {
 	tenants, err := a.control.Tenants(ctx)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	for _, t := range tenants {
 		if t.Name != name {
 			continue
 		}
 		if t.Enabled {
-			return false, fmt.Errorf("%w: %s must be disabled before its DSN can change",
+			return false, 0, fmt.Errorf("%w: %s must be disabled before its DSN can change",
 				control.ErrNotQuiesced, name)
 		}
 		db, err := a.cfg.OpenDB(t.DSN)
 		if err != nil {
-			return false, fmt.Errorf("%w: cannot open %s to prove it is quiescent: %v",
+			return false, 0, fmt.Errorf("%w: cannot open %s to prove it is quiescent: %v",
 				control.ErrNotQuiesced, name, err)
 		}
 		defer db.Close()
 
 		q, err := store.New(db, a.cfg.Clock).Quiescent(ctx)
 		if err != nil {
-			return false, fmt.Errorf("%w: cannot read %s to prove it is quiescent: %v",
+			return false, 0, fmt.Errorf("%w: cannot read %s to prove it is quiescent: %v",
 				control.ErrNotQuiesced, name, err)
 		}
 		if !q.Quiet() {
-			return false, fmt.Errorf("%w: %s still holds %d job(s) with %d execution(s) in flight",
+			return false, q.Queued, fmt.Errorf("%w: %s still holds %d job(s) with %d execution(s) in flight",
 				control.ErrNotQuiesced, name, q.Held, q.InFlight)
 		}
-		return true, nil
+		return true, q.Queued, nil
 	}
-	return false, fmt.Errorf("%w: tenant %q", errNotFound, name)
+	return false, 0, fmt.Errorf("%w: tenant %q", errNotFound, name)
 }
 
 // verifyNewSchema refuses a DSN whose schema is not the one it is claimed to be.

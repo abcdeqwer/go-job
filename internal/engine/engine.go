@@ -388,8 +388,8 @@ func (e *Engine) confirmHold(id int64, epoch int64) {
 	e.mu.Unlock()
 }
 
-// holdIsFresh reports whether this instance's proof of ownership is recent enough to act on
-// IRREVERSIBLY — which, in this system, means handing the work to an executor.
+// holdRemaining reports how much longer this instance's proof of ownership is good enough to
+// act on IRREVERSIBLY — which, in this system, means handing the work to an executor.
 //
 // Every database write is fenced, so a stale instance cannot corrupt state. `Run` is the one
 // thing fencing cannot undo: a process frozen past its lease (a stop-the-world pause, a
@@ -403,7 +403,12 @@ func (e *Engine) confirmHold(id int64, epoch int64) {
 // it had one, and a send is not instantaneous. In healthy operation this is never close — the
 // heartbeat renews several times per lease — so the margin costs nothing and only bites in
 // the case it exists for.
-func (e *Engine) holdIsFresh(id int64, epoch int64, lease time.Duration) bool {
+// It returns the REMAINING time rather than a yes/no, because the answer is needed twice: to
+// decide whether to send at all, and to bound the send itself. A boolean left a window between
+// the check and the call — a pause there resumes with a satisfied check and an unbounded call
+// context, and sends anyway. A deadline carried into the context is already expired when the
+// process wakes.
+func (e *Engine) holdRemaining(id int64, epoch int64, lease time.Duration) time.Duration {
 	if lease <= 0 {
 		// Same fallback the renewal uses, and it must be the same: a gate stricter than the
 		// lease it is gating would refuse every dispatch for a job whose definition carries no
@@ -414,9 +419,13 @@ func (e *Engine) holdIsFresh(id int64, epoch int64, lease time.Duration) bool {
 	defer e.mu.Unlock()
 	cur, ok := e.tracked[id]
 	if !ok || cur.h.FenceEpoch != epoch {
-		return false
+		return 0
 	}
-	return time.Since(cur.confirmed) < lease-lease/5
+	left := (lease - lease/5) - time.Since(cur.confirmed)
+	if left < 0 {
+		return 0
+	}
+	return left
 }
 
 // untrack stops renewing an execution, but ONLY if the holder currently tracked is the one
@@ -531,6 +540,12 @@ func (e *Engine) heartbeatPass(ctx context.Context) {
 		err := e.store.Renew(ctx, h, lease)
 		switch {
 		case err == nil:
+			// Ownership proved again, so the dispatch gate may go on trusting this claim.
+			// Without this the gate measures only from the CLAIM, and a routing decision that
+			// takes longer than four fifths of the lease is refused while the lease under it
+			// is being renewed perfectly well — an unnecessary expiry and recovery cycle for
+			// a healthy execution.
+			e.confirmHold(h.ExecutionID, h.FenceEpoch)
 
 		case errors.Is(err, gojob.ErrFenced):
 			// Ownership is provably gone. Abandon the handler context and make no further
@@ -557,7 +572,7 @@ func (e *Engine) heartbeatPass(ctx context.Context) {
 func (e *Engine) leaseSecondsFor(ctx context.Context, jobName string) int {
 	def, err := e.store.Definition(ctx, jobName)
 	if err != nil || def.Lease <= 0 {
-		return 30
+		return int(defaultLease / time.Second)
 	}
 	return int(def.Lease / time.Second)
 }

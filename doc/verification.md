@@ -101,6 +101,12 @@ static analysis for everything else.
     instance has already recovered, which is the one failure fencing cannot undo;
 28b. the control-plane fence expires on elapsed monotonic time, so a backward host-clock step
     cannot make an old registry read look fresh and let a written-off instance keep claiming;
+28c. the ownership bound is carried INTO the dispatch call's context, not only checked before
+    it, so a process suspended between the check and the send wakes with an expired context
+    rather than a satisfied check;
+28d. a reconciliation answer that does not name the attempt it describes, or reports FINISHED
+    without a disposition, is treated as unknown — spending a recovery rather than an attempt,
+    and never adopting a state that belongs to another run;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

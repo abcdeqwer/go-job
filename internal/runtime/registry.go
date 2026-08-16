@@ -85,9 +85,13 @@ type Registry struct {
 	// already moved the tenant to a new schema, or both would dispatch the same job.
 	seen map[string]int64
 
-	wg   sync.WaitGroup
-	stop chan struct{}
-	once sync.Once
+	wg sync.WaitGroup
+
+	// stopped is read under mu by admission, so a tenant cannot be published into a registry
+	// that has already retired everything it knew about.
+	stopped bool
+	stop    chan struct{}
+	once    sync.Once
 }
 
 // NewRegistry builds the registry. It admits nothing until Run.
@@ -152,6 +156,21 @@ func (r *Registry) Names() []string {
 	return out
 }
 
+// goTracked is the ONLY way this type starts a goroutine.
+//
+// Stop's wait is worth exactly as much as the registration behind it, and a bare `go func`
+// here is not a small omission: an untracked admission publishes a tenant into the map Stop
+// has already emptied, and an untracked retire lets the pool close under work that is still
+// draining. Neither shows up in a test that spawns its own goroutine to stand in for the real
+// one — TestEveryGoroutineIsTracked reads the source instead.
+func (r *Registry) goTracked(fn func()) {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		fn()
+	}()
+}
+
 // Run polls the registry until the context ends.
 //
 // The first pass is synchronous, so a process that cannot reach the control database fails
@@ -159,9 +178,7 @@ func (r *Registry) Names() []string {
 func (r *Registry) Run(ctx context.Context) {
 	r.reconcile(ctx)
 
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
+	r.goTracked(func() {
 		t := time.NewTicker(r.opts.PollInterval)
 		defer t.Stop()
 		for {
@@ -174,12 +191,20 @@ func (r *Registry) Run(ctx context.Context) {
 				r.reconcile(ctx)
 			}
 		}
-	}()
+	})
 }
 
 // Stop drains every tenant.
 func (r *Registry) Stop() {
 	r.once.Do(func() { close(r.stop) })
+
+	// Set BEFORE waiting. An admission that is already past its schema check refuses to
+	// publish once it sees this, so the wait below is bounded by work that is finishing
+	// rather than by work that is still starting engines.
+	r.mu.Lock()
+	r.stopped = true
+	r.mu.Unlock()
+
 	r.wg.Wait()
 
 	r.mu.Lock()
@@ -264,11 +289,8 @@ func (r *Registry) reconcile(ctx context.Context) {
 			if keep {
 				reason = fmt.Sprintf("generation moved %d -> %d", t.generation, w.Generation)
 			}
-			r.wg.Add(1)
-			go func(t *tenant, why string) {
-				defer r.wg.Done()
-				r.retire(ctx, t, why, true)
-			}(t, reason)
+			retiring, why := t, reason
+			r.goTracked(func() { r.retire(ctx, retiring, why, true) })
 			delete(have, name)
 		}
 	}
@@ -298,16 +320,21 @@ func (r *Registry) reconcile(ctx context.Context) {
 		if !r.beginAdmit(name) {
 			continue // already being admitted by an earlier pass
 		}
-		go func(t control.Tenant) {
-			defer r.endAdmit(t.Name)
-			if err := r.admit(ctx, t); err != nil {
-				r.log.Error("admitting a tenant failed", "tenant", t.Name, "error", err)
-				_ = r.control.RecordAdmission(ctx, t.Name, "", err)
+		// Tracked, so Stop waits for it. Untracked, an admission still in flight when Stop
+		// ran would publish its tenant into the map Stop had just emptied and start its
+		// engine: a "stopped" registry claiming and dispatching, with a pool nothing will
+		// ever close, against a dispatch client Stop has already closed.
+		admitting := w
+		r.goTracked(func() {
+			defer r.endAdmit(admitting.Name)
+			if err := r.admit(ctx, admitting); err != nil {
+				r.log.Error("admitting a tenant failed", "tenant", admitting.Name, "error", err)
+				_ = r.control.RecordAdmission(ctx, admitting.Name, "", err)
 				return
 			}
-			_ = r.control.RecordAdmission(ctx, t.Name, control.SchemaVersion, nil)
-			r.observe(ctx, t.Name, t.Generation)
-		}(w)
+			_ = r.control.RecordAdmission(ctx, admitting.Name, control.SchemaVersion, nil)
+			r.observe(ctx, admitting.Name, admitting.Generation)
+		})
 	}
 }
 
@@ -395,7 +422,11 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	// only itself, dispatching the same logical job twice — the exact split brain the whole
 	// cutover procedure exists to prevent.
 	r.mu.Lock()
-	stale := r.seen[t.Name] != t.Generation
+	// Superseded, or stopping. Both mean "do not install this engine", and both are decided
+	// here under the same lock that Stop takes, so there is no window between the decision
+	// and the publication.
+	stopping := r.stopped
+	stale := r.seen[t.Name] != t.Generation || stopping
 	if !stale {
 		r.tenants[t.Name] = &tenant{
 			name: t.Name, generation: t.Generation,
@@ -406,6 +437,10 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 
 	if stale {
 		_ = db.Close()
+		if stopping {
+			return fmt.Errorf("admission for %s abandoned: the registry stopped while it ran",
+				t.Name)
+		}
 		return fmt.Errorf("admission for %s generation %d was superseded before it completed",
 			t.Name, t.Generation)
 	}

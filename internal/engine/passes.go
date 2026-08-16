@@ -443,7 +443,8 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 		// execution. A process frozen past its lease passes the control fence the moment it
 		// resumes — its last registry read was seconds ago by the wall clock it kept — while
 		// another instance has already recovered and re-dispatched the work.
-		if !e.holdIsFresh(h.ExecutionID, h.FenceEpoch, def.Lease) {
+		ownership := e.holdRemaining(h.ExecutionID, h.FenceEpoch, def.Lease)
+		if ownership <= 0 {
 			e.log.Warn("not dispatching: this instance has not proved it still owns the "+
 				"execution within its lease; leaving the row to recovery",
 				"execution", h.ExecutionKey, "executor", target.ExecutorID)
@@ -480,15 +481,28 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 			spec.RemainingTimeout = cur.RemainingTimeout
 		}
 
-		// The call itself is capped by the re-send deadline. A pre-send check bounds when the
-		// LAST attempt starts, not when it ends — a send beginning at 59.9s with a ten-second
-		// RPC timeout finishes near 70s, and the window said sixty.
-		callCtx := ctx
-		if until := time.Until(deadline); until > 0 {
-			var cancel context.CancelFunc
-			callCtx, cancel = context.WithTimeout(ctx, until)
-			defer cancel()
+		// The call is capped by the re-send deadline AND by what is left of the ownership
+		// proof, whichever is nearer. A pre-send check bounds when the LAST attempt starts,
+		// not when it ends — a send beginning at 59.9s with a ten-second RPC timeout finishes
+		// near 70s, and the window said sixty.
+		//
+		// Carrying the ownership bound into the context is what closes the gap between the
+		// check above and this call. A process suspended in between resumes with a check it
+		// already passed; if the bound lives only in that check, it sends. If it lives in the
+		// context, the context is already expired and the call fails before it reaches the
+		// wire. The unconditional bound matters too: leaving callCtx as the long-lived parent
+		// whenever the deadline had already passed meant the pause case ended with NO cap at
+		// all.
+		cap := ownership
+		if until := time.Until(deadline); until < cap {
+			cap = until
 		}
+		if cap <= 0 {
+			e.untrack(h.ExecutionID, h.FenceEpoch)
+			return dispatch.Unknown
+		}
+		callCtx, cancel := context.WithTimeout(ctx, cap)
+		defer cancel()
 		res := e.disp.Run(callCtx, spec)
 
 		switch res.Answer {
@@ -595,10 +609,17 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale) {
 		}
 	}
 
-	// An answer about a DIFFERENT run_token describes another attempt entirely. Discard it
-	// rather than adopting a state that belongs to someone else.
-	if rec.Reachable && rec.RunToken != "" && rec.RunToken != v.RunToken {
-		e.log.Warn("executor answered about a different attempt; treating as unknown",
+	// An answer must be about THIS attempt, and must say which. A different run_token
+	// describes another attempt entirely; an ABSENT one proves nothing at all, and treating
+	// absence as agreement is how an answer about somebody else gets adopted. An executor
+	// still running token T1 that omits its token, against a row now holding T2, would have
+	// its "running" adopted as T2's — after which T2's real result is refused and a further
+	// attempt may be dispatched while T1 is still running.
+	//
+	// The response is non-conforming either way. Failing closed on it costs one recovery
+	// cycle; accepting it costs a concurrent handler.
+	if rec.Reachable && rec.RunToken != v.RunToken {
+		e.log.Warn("executor's answer does not identify this attempt; treating as unknown",
 			"execution", v.ExecutionKey, "asked_about", v.RunToken, "answered_about", rec.RunToken)
 		rec = dispatch.Reconciliation{}
 	}
@@ -631,10 +652,15 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale) {
 				"execution", v.ExecutionKey, "epoch", epoch)
 		}
 
-	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED:
+	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED &&
+		finishedOutcomeIsUsable(rec.Outcome):
 		e.adoptResult(ctx, v, rec)
 
 	default:
+		if rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED {
+			e.log.Warn("executor reported finished without a disposition; treating as unknown",
+				"execution", v.ExecutionKey, "executor", v.DispatchedTo)
+		}
 		landed, err := e.store.Resolve(ctx, v, e.backoff(v.RecoveryCount))
 		if errors.Is(err, gojob.ErrContended) {
 			return
@@ -671,6 +697,21 @@ func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Re
 		Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: epoch,
 	}
 	e.applyOutcome(ctx, h, rec.Outcome, v.DispatchedTo)
+}
+
+// finishedOutcomeIsUsable reports whether a FINISHED reconciliation actually carries a result.
+//
+// ReportResult refuses a missing outcome and an unspecified disposition, and recovery has to
+// refuse them too, for a stronger reason: nothing is asking the executor to try again. The
+// protobuf getters turn both into DISPOSITION_UNSPECIFIED, which Classify reads as a
+// retryable failure — so an executor answering "finished" without saying how would put the
+// execution back to ready, spend an ATTEMPT rather than a recovery, and rerun work whose
+// actual result was never established and may well have succeeded.
+//
+// Treated as unusable, the answer falls through to the unknown path, which spends a RECOVERY
+// and is exactly what "the executor could not tell us what happened" means.
+func finishedOutcomeIsUsable(o *gojobv1.ExecutionOutcome) bool {
+	return o != nil && o.GetDisposition() != gojobv1.Disposition_DISPOSITION_UNSPECIFIED
 }
 
 // applyOutcome writes a reported result through the shared classification, so a result
@@ -738,8 +779,10 @@ func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
 			rec = e.disp.GetExecution(ctx, addr, e.cfg.Tenant, v.ExecutionKey, e.cfg.ReconcileDeadline)
 		}
 	}
-	if rec.Reachable && rec.RunToken != "" && rec.RunToken != v.RunToken {
-		rec = dispatch.Reconciliation{} // an answer about a different attempt
+	if rec.Reachable && rec.RunToken != v.RunToken {
+		// Same rule as recovery: an answer that does not name THIS attempt proves nothing,
+		// whether it names another one or names none.
+		rec = dispatch.Reconciliation{}
 	}
 	if e.stopping() {
 		return
@@ -762,7 +805,8 @@ func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
 		e.log.Info("executor was late, not lost; silence budget extended",
 			"execution", v.ExecutionKey, "executor", v.DispatchedTo)
 
-	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED:
+	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED &&
+		finishedOutcomeIsUsable(rec.Outcome):
 		// Completed under the CURRENT holder, not through Adopt. Adopt requires an expired
 		// lease — its job is taking work from an owner that is gone — and this instance is
 		// still renewing perfectly well. Routing a silent-but-finished executor through it
