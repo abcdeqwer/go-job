@@ -272,6 +272,15 @@ CREATE TABLE job_executor (
     capacity         INT          NOT NULL,   -- advisory; the executor's refusal is authoritative
     running          INT          NOT NULL DEFAULT 0,
     capabilities     VARCHAR(255) NULL,
+
+    -- The authenticated identity that registered this process.
+    --
+    -- Callbacks carry an execution or an executor id, not a group, so without this a
+    -- group-restricted identity could heartbeat any executor id it knew — keeping a dead
+    -- process's address routable indefinitely, which produces unknown dispatches and consumes
+    -- recovery budget on jobs that were never going to run.
+    identity         VARCHAR(255) NOT NULL DEFAULT '',
+
     started_at       DATETIME     NOT NULL,
     heartbeat_at     DATETIME     NOT NULL,
 

@@ -148,8 +148,11 @@ func (r *Registry) Stop() {
 	r.tenants = make(map[string]*tenant)
 	r.mu.Unlock()
 
+	// Shutdown does NOT release what is still held: another instance is running and will
+	// recover it, and releasing early guarantees a second executor may start beside a handler
+	// that has not proved it stopped.
 	for _, t := range tenants {
-		r.retire(t, "shutdown")
+		r.retire(context.Background(), t, "shutdown", false)
 	}
 	_ = r.disp.Close()
 }
@@ -199,6 +202,13 @@ func (r *Registry) reconcile(ctx context.Context) {
 
 	// Retire first, so a disable followed by a re-enable in one pass does not leave two
 	// engines briefly running against the same schema.
+	//
+	// The removal from r.tenants is synchronous — from that moment nothing routes to it — but
+	// the DRAIN is not. Draining on this goroutine would block the only registry poll for as
+	// long as one tenant's in-flight work takes, and the poll is what refreshes the fence: a
+	// one-minute drain under a thirty-second staleness limit self-fences every other tenant on
+	// this instance. Admission was moved off the loop for exactly this reason; retirement has
+	// the same problem.
 	for name, t := range have {
 		w, keep := want[name]
 		if !keep || w.Generation != t.generation {
@@ -209,7 +219,11 @@ func (r *Registry) reconcile(ctx context.Context) {
 			if keep {
 				reason = fmt.Sprintf("generation moved %d -> %d", t.generation, w.Generation)
 			}
-			r.retire(t, reason)
+			r.wg.Add(1)
+			go func(t *tenant, why string) {
+				defer r.wg.Done()
+				r.retire(ctx, t, why, true)
+			}(t, reason)
 			delete(have, name)
 		}
 	}
@@ -360,22 +374,32 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 // handler that has not proved it stopped keeps its lease until it expires: expiry is not proof
 // a handler stopped, but releasing early is a guarantee that a second executor may start while
 // the first is still writing.
-func (r *Registry) retire(t *tenant, why string) {
+func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHeld bool) {
 	r.log.Info("retiring tenant", "tenant", t.name, "reason", why,
 		"still_tracking", t.engine.Tracking())
 
 	// Stop() drops the loops, so nothing new is claimed from here on.
 	t.engine.Stop()
 
-	if n := t.engine.Tracking(); n > 0 {
+	if t.engine.Tracking() > 0 {
 		deadline := time.Now().Add(r.opts.DrainTimeout)
 		for time.Now().Before(deadline) && t.engine.Tracking() > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
-		if left := t.engine.Tracking(); left > 0 {
-			r.log.Warn("tenant retired with work still in flight; those leases will expire "+
-				"and another instance will recover them",
+	}
+
+	if left := t.engine.Tracking(); left > 0 {
+		if releaseHeld {
+			// The tenant is going away from EVERY instance, so nothing will be left to recover
+			// what this one holds. Leaving it would hold the rows for ever and make the
+			// tenant's quiescence permanently false — and quiescence is exactly what a DSN
+			// cutover waits on.
+			r.log.Warn("releasing work still in flight; no scheduler will remain to recover it",
 				"tenant", t.name, "in_flight", left)
+			t.engine.ReleaseOwnedWork(ctx)
+		} else {
+			r.log.Warn("shutting down with work still in flight; those leases will expire and "+
+				"another instance will recover them", "tenant", t.name, "in_flight", left)
 		}
 	}
 

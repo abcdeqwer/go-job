@@ -156,6 +156,13 @@ func (e *Engine) claimAndDispatch(ctx context.Context, c store.Candidate) {
 		p.ExecutorID = targets[0].ExecutorID
 	}
 
+	// Re-checked immediately before the claim. Reading the definition and choosing an executor
+	// take time, and an instance that lost its right to operate during them must not go on to
+	// commit a claim and start new work.
+	if e.stopping() {
+		return
+	}
+
 	res, err := e.store.Claim(ctx, p, e.runnableFor(targets))
 	if errors.Is(err, gojob.ErrContended) || errors.Is(err, gojob.ErrMissingState) {
 		return
@@ -382,6 +389,19 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
+			// The wall-clock bound is checked BEFORE the send, not after. Checked afterwards
+			// it does not bound anything: a call that returns just inside the window is
+			// followed by a backoff and then another send that leaves it entirely.
+			if time.Now().After(deadline) {
+				e.markUnhealthy(target.ExecutorID)
+				e.log.Warn("dispatch outcome unknown and the re-send window has closed; "+
+					"leaving the row to recovery",
+					"execution", h.ExecutionKey, "executor", target.ExecutorID)
+				return dispatch.Unknown
+			}
+			if e.stopping() {
+				return dispatch.Unknown
+			}
 			// Re-read the cap before every re-send. A first call can consume most of what was
 			// left, and re-sending the ORIGINAL budget would tell the executor it may run for
 			// longer than the scheduler will wait — after which the timeout pass fences and
@@ -433,7 +453,7 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 			// execution's own runtime budget. Without the bound the row sits `dispatching` for
 			// good: the executor stays registration-live so it keeps being chosen, the leases
 			// keep being renewed, and no budget is ever consumed.
-			if attempt+1 >= e.cfg.DispatchResendLimit || time.Now().After(deadline) {
+			if attempt+1 >= e.cfg.DispatchResendLimit {
 				// Mark the path unhealthy. An executor that heartbeats but never answers Run
 				// stays registration-live, so without this it is chosen again on the next
 				// claim, exhausts the bound again, and marches the job to dead through its
@@ -655,7 +675,16 @@ func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
 			"execution", v.ExecutionKey, "executor", v.DispatchedTo)
 
 	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED:
-		e.adoptResult(ctx, v, rec)
+		// Completed under the CURRENT holder, not through Adopt. Adopt requires an expired
+		// lease — its job is taking work from an owner that is gone — and this instance is
+		// still renewing perfectly well. Routing a silent-but-finished executor through it
+		// affected zero rows, and when the executor's own result retries ran out, a genuine
+		// success was eventually recorded as a timeout.
+		h := store.Holder{
+			JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
+			Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: v.FenceEpoch,
+		}
+		e.applyOutcome(ctx, h, rec.Outcome, v.DispatchedTo)
 
 	default:
 		// Unreachable, NOT_FOUND, or an answer about someone else. Only now is the attempt

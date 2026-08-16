@@ -28,6 +28,7 @@ func seconds(d time.Duration) int {
 // instances could disagree about whether a job is even runnable.
 type Executor struct {
 	ExecutorID      string
+	Identity        string
 	Group           string
 	Address         string
 	ContractVersion string
@@ -62,8 +63,8 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO job_executor
 			    (executor_id, executor_group, address, contract_version, revision,
-			     capacity, running, capabilities, started_at, heartbeat_at)
-			VALUES (?, ?, ?, ?, ?, ?, 0, ?, NOW(), NOW())
+			     capacity, running, capabilities, identity, started_at, heartbeat_at)
+			VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NOW(), NOW())
 			ON DUPLICATE KEY UPDATE
 			    executor_group   = VALUES(executor_group),
 			    address          = VALUES(address),
@@ -71,9 +72,10 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 			    revision         = VALUES(revision),
 			    capacity         = VALUES(capacity),
 			    capabilities     = VALUES(capabilities),
+			    identity         = VALUES(identity),
 			    heartbeat_at     = NOW()`,
 			e.ExecutorID, e.Group, e.Address, e.ContractVersion, e.Revision,
-			e.Capacity, nullString(e.Capabilities))
+			e.Capacity, nullString(e.Capabilities), e.Identity)
 		if err != nil {
 			return fmt.Errorf("register executor %q: %w", e.ExecutorID, err)
 		}
@@ -107,12 +109,16 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 // That is the only recovery path, and it is deliberate: an executor whose row was reaped has
 // no handlers declared, so silently re-creating the row here would leave it registered and
 // unroutable.
-func (s *Store) ExecutorHeartbeat(ctx context.Context, executorID string, running int) (bool, error) {
+// identity must match what registered the process. A registration is bound to the credential
+// that created it, so knowing an executor id is not enough to keep it alive: otherwise a
+// group-restricted identity could heartbeat a dead process's id indefinitely, holding its
+// address routable and consuming other jobs' recovery budgets on dispatches that go nowhere.
+func (s *Store) ExecutorHeartbeat(ctx context.Context, executorID, identity string, running int) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE job_executor
 		SET write_seq = write_seq + 1, heartbeat_at = NOW(), running = ?
-		WHERE executor_id = ?`,
-		running, executorID)
+		WHERE executor_id = ? AND identity = ?`,
+		running, executorID, identity)
 	if err != nil {
 		return false, fmt.Errorf("heartbeat executor %q: %w", executorID, err)
 	}
@@ -153,7 +159,8 @@ func (s *Store) Deregister(ctx context.Context, executorID string) error {
 func (s *Store) LiveExecutors(ctx context.Context, handlerKey, group string, liveness time.Duration) ([]Executor, error) {
 	const q = `
 		SELECT e.executor_id, e.executor_group, e.address, e.contract_version, e.revision,
-		       e.capacity, e.running, COALESCE(e.capabilities, ''), e.started_at, e.heartbeat_at
+		       e.capacity, e.running, COALESCE(e.capabilities, ''), e.identity,
+		       e.started_at, e.heartbeat_at
 		FROM job_executor e
 		JOIN job_executor_handler h ON h.executor_id = e.executor_id
 		WHERE h.handler_key = ?
@@ -171,7 +178,8 @@ func (s *Store) LiveExecutors(ctx context.Context, handlerKey, group string, liv
 	for rows.Next() {
 		var e Executor
 		if err := rows.Scan(&e.ExecutorID, &e.Group, &e.Address, &e.ContractVersion, &e.Revision,
-			&e.Capacity, &e.Running, &e.Capabilities, &e.StartedAt, &e.HeartbeatAt); err != nil {
+			&e.Capacity, &e.Running, &e.Capabilities, &e.Identity,
+			&e.StartedAt, &e.HeartbeatAt); err != nil {
 			return nil, fmt.Errorf("scan executor: %w", err)
 		}
 		out = append(out, e)
@@ -184,12 +192,13 @@ func (s *Store) LiveExecutors(ctx context.Context, handlerKey, group string, liv
 func (s *Store) AllExecutors(ctx context.Context) ([]Executor, error) {
 	const q = `
 		SELECT e.executor_id, e.executor_group, e.address, e.contract_version, e.revision,
-		       e.capacity, e.running, COALESCE(e.capabilities, ''), e.started_at, e.heartbeat_at,
+		       e.capacity, e.running, COALESCE(e.capabilities, ''), e.identity,
+		       e.started_at, e.heartbeat_at,
 		       COALESCE(GROUP_CONCAT(h.handler_key ORDER BY h.handler_key SEPARATOR ','), '')
 		FROM job_executor e
 		LEFT JOIN job_executor_handler h ON h.executor_id = e.executor_id
 		GROUP BY e.executor_id, e.executor_group, e.address, e.contract_version, e.revision,
-		         e.capacity, e.running, e.capabilities, e.started_at, e.heartbeat_at
+		         e.capacity, e.running, e.capabilities, e.identity, e.started_at, e.heartbeat_at
 		ORDER BY e.executor_group, e.executor_id`
 
 	rows, err := s.db.QueryContext(ctx, q)
@@ -205,7 +214,8 @@ func (s *Store) AllExecutors(ctx context.Context) ([]Executor, error) {
 			handlers string
 		)
 		if err := rows.Scan(&e.ExecutorID, &e.Group, &e.Address, &e.ContractVersion, &e.Revision,
-			&e.Capacity, &e.Running, &e.Capabilities, &e.StartedAt, &e.HeartbeatAt, &handlers); err != nil {
+			&e.Capacity, &e.Running, &e.Capabilities, &e.Identity,
+			&e.StartedAt, &e.HeartbeatAt, &handlers); err != nil {
 			return nil, fmt.Errorf("scan executor: %w", err)
 		}
 		if handlers != "" {

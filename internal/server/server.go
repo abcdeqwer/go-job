@@ -134,6 +134,9 @@ func (s *Server) Register(ctx context.Context, req *gojobv1.RegisterRequest) (*g
 		ExecutorID: req.GetExecutorId(),
 		Group:      req.GetGroup(),
 		Address:    req.GetAddress(),
+		// Recorded so every later callback can be bound to the credential that registered
+		// this process, rather than to whoever happens to know its id.
+		Identity: IdentityFrom(ctx).Subject,
 	}
 	if e.Group == "" {
 		e.Group = "default"
@@ -211,7 +214,15 @@ func (s *Server) Heartbeat(ctx context.Context, req *gojobv1.HeartbeatRequest) (
 	if err != nil {
 		return nil, err
 	}
-	known, err := st.ExecutorHeartbeat(ctx, req.GetExecutorId(), int(req.GetRunning()))
+	// The identity is part of the predicate, not merely logged. A heartbeat is what keeps an
+	// address routable, so an identity able to heartbeat any id it knows could keep a dead
+	// process in the routing pool indefinitely — every dispatch to it returns unknown, and the
+	// job burns its recovery budget without ever running.
+	//
+	// A false answer here is "re-register", which is exactly the right instruction for both an
+	// executor whose registration was reaped and one whose credential no longer matches.
+	known, err := st.ExecutorHeartbeat(ctx, req.GetExecutorId(), IdentityFrom(ctx).Subject,
+		int(req.GetRunning()))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "heartbeat: %v", err)
 	}

@@ -46,7 +46,7 @@ type Executor struct {
 
 	mu      sync.Mutex
 	running map[string]*execution // by execution_key
-	done    map[string]*finished  // remembered outcomes
+	done    map[string]*finished  // remembered outcomes, by (execution_key, run_token)
 
 	sched gojobv1.JobSchedulerClient
 	// Sent is a hook the test uses to observe reported results.
@@ -126,6 +126,22 @@ func (e *Executor) Run(ctx context.Context, req *gojobv1.RunRequest) (*gojobv1.R
 	}
 
 	e.mu.Lock()
+	// A finished ATTEMPT is checked as well as a running one, and the distinction is the whole
+	// point: at-most-once is a promise about an (execution_key, run_token) pair, not about the
+	// key.
+	//
+	// A handler that finishes quickly and whose result report is lost leaves its record in
+	// `done` and NOT in `running`. The scheduler's re-send of the SAME token then arrives, and
+	// an executor that looked only at `running` would start the handler a second time.
+	//
+	// A DIFFERENT token for the same key is the opposite situation — a retry the scheduler
+	// deliberately created after the first attempt failed — and must run.
+	if fin, finished := e.done[attemptKey(req.GetExecutionKey(), req.GetRunToken())]; finished {
+		e.mu.Unlock()
+		st, _ := status.New(codes.AlreadyExists, "this attempt already finished here").
+			WithDetails(&gojobv1.ExecutionHeld{HeldRunToken: fin.runToken})
+		return nil, st.Err()
+	}
 	if cur, held := e.running[req.GetExecutionKey()]; held {
 		e.mu.Unlock()
 		// ALREADY_EXISTS carries the token actually held, because "already held" is two
@@ -211,12 +227,33 @@ func (e *Executor) execute(ctx context.Context, req *gojobv1.RunRequest, h Handl
 
 	e.mu.Lock()
 	delete(e.running, req.GetExecutionKey())
-	e.done[req.GetExecutionKey()] = &finished{
+	e.done[attemptKey(req.GetExecutionKey(), req.GetRunToken())] = &finished{
 		runToken: req.GetRunToken(), outcome: oc, at: time.Now(),
 	}
+	e.forgetOldLocked()
 	e.mu.Unlock()
 
 	e.report(req, oc)
+}
+
+// attemptKey identifies one attempt. The pair, not the execution: a retry is a different
+// attempt of the same execution and must be allowed to run.
+func attemptKey(executionKey, runToken string) string { return executionKey + "\x00" + runToken }
+
+// forgetOldLocked bounds the remembered outcomes.
+//
+// They exist to answer GetExecution and to refuse a re-send, both of which matter for seconds
+// or minutes, not for the life of the process. An unbounded map is a memory leak proportional
+// to throughput, which for a three-second poller is a leak measured in tens of thousands of
+// entries a day.
+func (e *Executor) forgetOldLocked() {
+	const keep = 10 * time.Minute
+	cutoff := time.Now().Add(-keep)
+	for k, f := range e.done {
+		if f.at.Before(cutoff) {
+			delete(e.done, k)
+		}
+	}
 }
 
 // report delivers the result, retrying until the scheduler acknowledges it.
@@ -319,11 +356,23 @@ func (e *Executor) GetExecution(ctx context.Context, req *gojobv1.GetExecutionRe
 			StartedAt: cur.startedAt.Format(time.RFC3339),
 		}, nil
 	}
-	if fin, ok := e.done[req.GetExecutionKey()]; ok {
+	// The newest remembered attempt for this key. GetExecution asks about an EXECUTION, and
+	// the scheduler discards an answer whose token is not the one it asked about — so
+	// answering with the most recent is correct, and answering with an arbitrary one is not.
+	var newest *finished
+	for k, f := range e.done {
+		if k[:len(k)-len(f.runToken)-1] != req.GetExecutionKey() {
+			continue
+		}
+		if newest == nil || f.at.After(newest.at) {
+			newest = f
+		}
+	}
+	if newest != nil {
 		return &gojobv1.GetExecutionResponse{
 			State:    gojobv1.ExecutionState_EXECUTION_STATE_FINISHED,
-			RunToken: fin.runToken,
-			Outcome:  fin.outcome,
+			RunToken: newest.runToken,
+			Outcome:  newest.outcome,
 		}, nil
 	}
 	return nil, status.Error(codes.NotFound, "unknown execution")

@@ -344,6 +344,39 @@ func (e *Engine) holders() []store.Holder {
 	return out
 }
 
+// ReleaseOwnedWork resolves everything this instance still holds, for a tenant that is being
+// taken away from it.
+//
+// It is deliberately NOT what process shutdown does. On shutdown, leaving a lease to expire is
+// right: another instance is still running and will recover it, and releasing early guarantees
+// a second executor may start while the first is still writing.
+//
+// A tenant being DISABLED is the opposite situation. Every instance retires it, so no engine
+// and no pool remain — nothing will ever recover what is left held, the rows stay held for
+// ever, and the tenant's quiescence never becomes true. Since quiescence is exactly what a DSN
+// cutover waits on, "leave it for recovery" means "the cutover can never proceed".
+//
+// So the owner resolves its own holdings. It asks each executor to stop on the way out, and
+// records the attempt as unknown, because it genuinely is.
+func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
+	for _, h := range e.holders() {
+		if v, err := e.store.ExecutionByKey(ctx, h.ExecutionKey); err == nil {
+			e.requestStop(ctx, v, "the tenant was disabled")
+		}
+		landed, err := e.store.ReleaseAsOwner(ctx, h, e.backoff(0))
+		if err != nil {
+			if !errors.Is(err, gojob.ErrContended) {
+				e.log.Error("releasing owned work on retirement failed",
+					"execution", h.ExecutionKey, "error", err)
+			}
+			continue
+		}
+		e.untrack(h.ExecutionID, h.FenceEpoch)
+		e.log.Warn("released an in-flight execution because the tenant was disabled",
+			"execution", h.ExecutionKey, "job", h.JobName, "landed", landed)
+	}
+}
+
 // Tracking reports how many executions this instance owns. Graceful shutdown and the
 // quiescence check both need it, and so does the admin UI.
 func (e *Engine) Tracking() int {
