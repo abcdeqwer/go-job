@@ -378,6 +378,18 @@ func (s *Server) ReportResult(ctx context.Context, req *gojobv1.ReportResultRequ
 	}
 	if err := s.retryPastAdoption(ctx, st, h, apply); err != nil {
 		if errors.Is(err, gojob.ErrFenced) {
+			// Before calling it fenced, ask whether the result LANDED.
+			//
+			// Recovery can adopt this very attempt and record the outcome it obtained from the
+			// executor while this callback is between its history check and its write. The
+			// work is safe either way — but answering ABORTED tells the executor its attempt
+			// was superseded, when in fact its result was accepted, by someone else, moments
+			// earlier. That contradicts the idempotency this call advertises, and an executor
+			// that logs an aborted result as a lost one sends an operator looking for a
+			// failure that did not happen.
+			if _, aErr := st.Attempt(ctx, req.GetExecutionKey(), req.GetRunToken()); aErr == nil {
+				return &gojobv1.ReportResultResponse{AlreadyRecorded: true}, nil
+			}
 			return nil, status.Error(codes.Aborted, "this attempt has been fenced")
 		}
 		return nil, status.Errorf(codes.Internal, "record result: %v", err)

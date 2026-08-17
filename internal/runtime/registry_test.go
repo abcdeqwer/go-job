@@ -144,3 +144,28 @@ func TestEveryGoroutineIsTracked(t *testing.T) {
 		}
 	}
 }
+
+// A retirement that could not finish must be retried, not skipped for ever.
+//
+// The release refuses to end an execution whose executor still reports RUNNING — a delivered
+// cancel is not a stopped handler. If retirement then completed anyway it would take away the
+// only route that handler has to report, and the only process holding the old DSN that could
+// recover it; the row would stay held for ever and old-schema quiescence, which the cutover
+// gates on, would be unreachable by construction.
+//
+// So it defers, and reconciliation has to come back. A `draining` tenant is otherwise skipped
+// as "already being drained", which for a deferred one means never again.
+func TestDeferredRetirementIsRetried(t *testing.T) {
+	skip := skipRetirement
+
+	if !skip(true, false) {
+		t.Error("a retirement actually in progress must not be started a second time")
+	}
+	if skip(true, true) {
+		t.Error("a DEFERRED retirement is being skipped as though it were in progress; it " +
+			"ended because a handler was still running, and only another attempt can finish it")
+	}
+	if skip(false, false) {
+		t.Error("a tenant that is not draining must be retired")
+	}
+}

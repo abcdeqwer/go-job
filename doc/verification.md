@@ -135,6 +135,15 @@ static analysis for everything else.
     started it — as its last act before publishing an engine;
 28o. a manual trigger's request_id identifies one job: reused against another it is a
     conflict, and the loser of a race reads back the row that was actually created;
+28p. an admission's generation proof expires: past the staleness limit it is abandoned rather
+    than acted on, and a superseded engine stops CLAIMING before the pass that refreshes the
+    right to operate;
+28q. retirement DEFERS while a handler is still running — the engine, its routing and its pool
+    stay alive so that handler can still report and something is left to recover it — and the
+    next reconciliation retries;
+28r. retirement applies a confirmed FINISHED outcome rather than recording `dead`/unknown over
+    a success the executor was still holding;
+28s. a result another writer recorded concurrently is answered already_recorded, not ABORTED;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

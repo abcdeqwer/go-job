@@ -499,7 +499,11 @@ func (e *Engine) holders() []store.Holder {
 //
 // So the owner resolves its own holdings. It asks each executor to stop on the way out, and
 // records the attempt as unknown, because it genuinely is.
-func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
+// It returns whether anything was left held BECAUSE A HANDLER IS STILL RUNNING. That is not a
+// failure and not an error: it is the tenant honestly reporting that it is not quiescent yet,
+// and the caller has to keep the engine and the pool alive so that handler can still report,
+// and so something is left to recover it when it does.
+func (e *Engine) ReleaseOwnedWork(ctx context.Context) (deferred bool) {
 	// From the DATABASE, not from the tracked map. An unknown-outcome dispatch that exhausted
 	// its re-send bound deliberately stops being tracked so recovery can take it — leaving a
 	// held, `dispatching` row that no in-memory scan can see. If the tenant is then disabled,
@@ -508,14 +512,16 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 		owned, err := e.store.OwnedByInstance(ctx, e.cfg.InstanceID, 200)
 		if err != nil {
 			e.log.Error("listing owned work on retirement failed", "error", err)
-			return
+			return deferred
 		}
 		if len(owned) == 0 {
-			return
+			break
 		}
-		if !e.releasePage(ctx, owned) {
-			// Nothing in the page could be released — every row was contended or failing.
-			// Looping again would spin on the same rows.
+		progress, held := e.releasePage(ctx, owned)
+		deferred = deferred || held
+		if !progress {
+			// Nothing in the page could be released — every row was contended, failing, or
+			// deliberately held. Looping again would spin on the same rows.
 			break
 		}
 	}
@@ -532,30 +538,46 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 	// while somebody else's expired work has to go through reconciliation, which is slower and
 	// may not reach a conclusion at all.
 	e.recoverStale(ctx, false)
+	return deferred
 }
 
 // releasePage releases one page, reporting whether it made any progress.
-// stillRunning asks the executor whether a handler for this execution is running now.
+// askExecutor reconciles one execution during retirement, and returns the WHOLE answer.
+//
+// Reducing it to "is it running" threw away the one case worth most: an executor that has
+// FINISHED the work and whose ReportResult failed just as retirement began still holds the
+// authoritative outcome. Answering only true/false meant releasePage then recorded that
+// attempt as `dead` with "outcome unknown" — overwriting a known success that was sitting one
+// RPC away.
 //
 // Unreachable is NOT treated as running. That looks like the unsafe direction and is the
 // deliberate one: an executor nobody can reach is exactly the case where waiting is unbounded,
 // and holding for ever on a process that may have died turns every crashed executor into a
 // tenant that can never be re-pointed. Unknown work is ended rather than assumed complete,
 // which is the same judgement recovery makes.
-func (e *Engine) stillRunning(ctx context.Context, v store.Stale) bool {
+func (e *Engine) askExecutor(ctx context.Context, v store.Stale) dispatch.Reconciliation {
 	if v.DispatchedTo == "" {
-		return false
+		return dispatch.Reconciliation{}
 	}
 	addr, ok := e.addressOf(ctx, v.DispatchedTo)
 	if !ok {
-		return false
+		return dispatch.Reconciliation{}
 	}
 	rec := e.disp.GetExecution(ctx, addr, e.cfg.Tenant, v.ExecutionKey, e.cfg.ReconcileDeadline)
-	return rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING
+	if rec.Reachable && rec.RunToken != v.RunToken {
+		// An answer about another attempt, or about none. Same rule as everywhere else: it
+		// proves nothing about this one — except that a RUNNING answer still says a handler
+		// holds the KEY, which releasePage reads below.
+		if rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING {
+			return dispatch.Reconciliation{Reachable: true,
+				State: gojobv1.ExecutionState_EXECUTION_STATE_RUNNING}
+		}
+		return dispatch.Reconciliation{}
+	}
+	return rec
 }
 
-func (e *Engine) releasePage(ctx context.Context, owned []store.Stale) bool {
-	progress := false
+func (e *Engine) releasePage(ctx context.Context, owned []store.Stale) (progress, deferred bool) {
 	for _, v := range owned {
 		e.requestStop(ctx, v, "the tenant was disabled")
 
@@ -572,16 +594,31 @@ func (e *Engine) releasePage(ctx context.Context, owned []store.Stale) bool {
 		// means no handler is running. It is the same rule the retirement recovery sweep
 		// applies to another instance's work — the two were inconsistent, and this was the
 		// unsafe side.
-		if e.stillRunning(ctx, v) {
+		rec := e.askExecutor(ctx, v)
+		if rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING {
 			e.log.Warn("not releasing an execution whose handler is still running; the tenant "+
 				"cannot be certified quiescent until it stops",
 				"execution", v.ExecutionKey, "job", v.JobName, "executor", v.DispatchedTo)
+			deferred = true
 			continue
 		}
 
 		h := store.Holder{
 			JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
 			Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: v.FenceEpoch,
+		}
+
+		// A real outcome beats a manufactured one. The executor finished and its own
+		// ReportResult did not get through; recording `dead` / "outcome unknown" over a
+		// success that is one RPC away is a loss this instance is choosing, not suffering.
+		if rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED &&
+			finishedOutcomeIsUsable(rec.Outcome) {
+			e.applyOutcome(ctx, h, rec.Outcome, v.DispatchedTo)
+			progress = true
+			e.untrack(h.ExecutionID, h.FenceEpoch)
+			e.log.Info("adopted the executor's result while retiring the tenant",
+				"execution", h.ExecutionKey, "job", h.JobName)
+			continue
 		}
 		landed, err := e.store.ReleaseAsOwner(ctx, h)
 		if err != nil {
@@ -596,7 +633,7 @@ func (e *Engine) releasePage(ctx context.Context, owned []store.Stale) bool {
 		e.log.Warn("ended an in-flight execution because the tenant was disabled",
 			"execution", h.ExecutionKey, "job", h.JobName, "landed", landed)
 	}
-	return progress
+	return progress, deferred
 }
 
 // Tracking reports how many executions this instance owns. Graceful shutdown and the

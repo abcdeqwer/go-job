@@ -673,6 +673,29 @@ func TestTransactionHandlesAreNamedTx(t *testing.T) {
 		pkg, ok := sel.X.(*ast.Ident)
 		return ok && pkg.Name == "sql" && sel.Sel.Name == "Tx"
 	}
+
+	// An ALIAS defeats the shape test entirely: `type txAlias = sql.Tx` and a parameter typed
+	// `*txAlias` is a transaction this rule cannot see, and the lock-order walker then ignores
+	// its statements too. Nothing here needs to rename a database type, so the rename itself
+	// is the thing forbidden — one rule instead of chasing every spelling it could produce.
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				ts, ok := n.(*ast.TypeSpec)
+				if !ok {
+					return true
+				}
+				if sel, ok := ts.Type.(*ast.SelectorExpr); ok {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "sql" {
+						t.Errorf("%s: %q renames database/sql.%s; the transaction rules here "+
+							"match on the written type, so a second name for it is a hole",
+							fset.Position(ts.Pos()), ts.Name.Name, sel.Sel.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
 	complain := func(pos token.Pos, name string) {
 		if name != "tx" && name != "_" {
 			t.Errorf("%s: a *sql.Tx named %q; the lock-order walker recognises transactional "+

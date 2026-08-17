@@ -104,3 +104,27 @@ func TestRetryPastAdoption(t *testing.T) {
 		}
 	})
 }
+
+// A result that another writer already recorded is "already recorded", not "aborted".
+//
+// Recovery can adopt this very attempt and write the outcome it obtained from the executor
+// while a callback is between its history check and its own write. The work is safe either
+// way — but ABORTED tells the executor its attempt was superseded when its result was in fact
+// accepted moments earlier by someone else, which contradicts the idempotency this call
+// advertises and sends an operator looking for a failure that did not happen.
+func TestRetryPastAdoptionDoesNotMaskARecordedResult(t *testing.T) {
+	// The shape is checked here at the seam that decides it; the full path is exercised by
+	// ReportResult, which needs a store.
+	base := store.Holder{ExecutionKey: "job:1", RunToken: "tok-a", FenceEpoch: 4}
+
+	// A fence that stays a fence: the row moved to a different attempt.
+	calls := 0
+	write := func(store.Holder) error { calls++; return gojob.ErrFenced }
+	r := fakeReader{row: store.Stale{RunToken: "tok-b", FenceEpoch: 5}}
+	if err := (&Server{}).retryPastAdoption(context.Background(), r, base, write); !errors.Is(err, gojob.ErrFenced) {
+		t.Fatalf("err = %v, want ErrFenced so the caller can check attempt history", err)
+	}
+	if calls != 1 {
+		t.Fatalf("write called %d times, want 1", calls)
+	}
+}

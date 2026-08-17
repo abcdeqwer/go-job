@@ -56,6 +56,11 @@ type tenant struct {
 	engine     *engine.Engine
 	cancel     context.CancelFunc
 
+	// retireDeferred means a retirement ran, could not finish, and must be retried. It is set
+	// when an execution was left held because its handler is still running: the engine has to
+	// stay alive so that handler can report, and so something is left to recover it.
+	retireDeferred bool
+
 	// draining means claiming has stopped but callbacks are still served.
 	//
 	// Retiring a tenant is THREE things, and they cannot happen at the same moment: stop
@@ -232,8 +237,6 @@ func (r *Registry) reconcile(ctx context.Context) {
 			"error", err)
 		return
 	}
-	r.fence.Refresh()
-
 	want := make(map[string]control.Tenant, len(rows))
 	registered := make(map[string]int64, len(rows))
 	r.mu.Lock()
@@ -279,14 +282,27 @@ func (r *Registry) reconcile(ctx context.Context) {
 		w, keep := want[name]
 		if !keep || w.Generation != t.generation {
 			r.mu.Lock()
-			if t.draining {
+			if skipRetirement(t.draining, t.retireDeferred) {
 				// Already being drained by an earlier pass.
 				r.mu.Unlock()
 				delete(have, name)
 				continue
 			}
+			// A deferred retirement is retried, once per pass. It ended because a handler was
+			// still running; the only thing that changes that is time.
+			t.retireDeferred = false
 			t.draining = true
 			r.mu.Unlock()
+
+			// Synchronously, before this pass refreshes the fence.
+			//
+			// StopClaiming is a channel close: cheap, idempotent, and it cannot block. The
+			// rest of retirement is asynchronous because it drains, but the DECISION to stop
+			// acquiring has to land here — the fence refresh below is what re-enables an
+			// engine whose control knowledge had gone stale, and a superseded engine given a
+			// fresh fence before it has been told to stop can dispatch one more tick against
+			// a schema the tenant has already left.
+			t.engine.StopClaiming()
 			reason := "disabled"
 			if keep {
 				reason = fmt.Sprintf("generation moved %d -> %d", t.generation, w.Generation)
@@ -299,6 +315,10 @@ func (r *Registry) reconcile(ctx context.Context) {
 			delete(have, name)
 		}
 	}
+
+	// NOW. Every superseded engine has been told to stop acquiring, so refreshing the right to
+	// operate cannot hand one of them another tick.
+	r.fence.Refresh()
 
 	for name, w := range want {
 		if _, running := have[name]; running {
@@ -451,6 +471,7 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	// re-pointed while this one was opening a pool. Publishing then installs an engine against
 	// a schema the tenant has already left, and the old and new schemas dispatch the same
 	// logical jobs. One read closes that, and it is the last thing done before publishing.
+	provedAt := time.Now()
 	current, enabled, err := r.control.CurrentGeneration(ctx, t.Name)
 	if err != nil {
 		_ = db.Close()
@@ -460,6 +481,21 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 		_ = db.Close()
 		return fmt.Errorf("admission for %s generation %d was superseded before it completed "+
 			"(registry is now generation %d, enabled=%v)", t.Name, t.Generation, current, enabled)
+	}
+
+	// And the proof has to still be FRESH at the moment it is acted on.
+	//
+	// A read is a fact about an instant, not a licence. This process can be suspended between
+	// that read and this line — long enough for the tenant to be disabled, proven quiescent,
+	// re-pointed and re-enabled — and then publish an engine against a schema the tenant left
+	// two cutovers ago. Bounding the proof by the staleness limit ties it to the same number
+	// that governs every other use of stale control knowledge: past it, this instance has no
+	// right to act on what it read, and abandoning costs one poll interval.
+	if age := time.Since(provedAt); age > r.opts.StalenessLimit {
+		_ = db.Close()
+		return fmt.Errorf("admission for %s stalled %s between confirming generation %d and "+
+			"publishing; abandoning rather than acting on a stale proof",
+			t.Name, age.Truncate(time.Millisecond), t.Generation)
 	}
 
 	r.mu.Lock()
@@ -503,6 +539,13 @@ func (r *Registry) releaseContext(parent context.Context) (context.Context, cont
 	return context.WithTimeout(context.WithoutCancel(parent), r.opts.DrainTimeout)
 }
 
+// skipRetirement decides whether a tenant already being retired should be left alone.
+//
+// A retirement in progress must not be started twice. A DEFERRED one — which ended because a
+// handler was still running — must be, because only another attempt can finish it, and
+// skipping it for ever is how a tenant becomes permanently un-quiescent.
+func skipRetirement(draining, deferred bool) bool { return draining && !deferred }
+
 // retire stops claiming, waits a bounded time for in-flight work, then closes the pool.
 //
 // The drain is bounded rather than absent OR unlimited. Closing immediately leaves running
@@ -541,6 +584,7 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 		}
 	}
 
+	deferred := false
 	if releaseHeld {
 		// Still holding the leases, so this can act as the owner. From the DATABASE, because
 		// an exhausted unknown dispatch is held and untracked.
@@ -557,11 +601,33 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 		// Detached from ctx as well, for the same reason at process scope: a shutdown that
 		// cancelled ctx would otherwise cancel the release it just decided to make.
 		releaseCtx, cancelRelease := r.releaseContext(ctx)
-		t.engine.ReleaseOwnedWork(releaseCtx)
+		deferred = t.engine.ReleaseOwnedWork(releaseCtx)
 		cancelRelease()
 	} else if left := t.engine.Tracking(); left > 0 {
 		r.log.Warn("shutting down with work still in flight; those leases will expire and "+
 			"another instance will recover them", "tenant", t.name, "in_flight", left)
+	}
+
+	// A handler that is still running keeps this tenant alive.
+	//
+	// The release refuses to end an execution whose executor reports RUNNING — a delivered
+	// cancel is not a stopped handler. Stopping the engine and closing the pool anyway takes
+	// away the only route that handler has to report its result, and the only process holding
+	// the old DSN that could ever recover it: the lease expires with nobody left to notice,
+	// and the row stays held for ever. Old-schema quiescence — and the cutover it gates — then
+	// becomes unreachable by construction.
+	//
+	// So retirement DEFERS. Claiming has stopped, the heartbeat keeps the lease alive,
+	// callbacks are still routed, and the next reconciliation tries again. The runtime cap is
+	// what bounds it: the timeout pass runs throughout a drain, so a handler that never ends
+	// is still fenced at its cap rather than waited on indefinitely.
+	if deferred {
+		r.mu.Lock()
+		t.retireDeferred = true
+		r.mu.Unlock()
+		r.log.Warn("retirement deferred: an execution is still running on its executor",
+			"tenant", t.name, "reason", why)
+		return
 	}
 
 	// Only NOW does the heartbeat stop, and only now is routing removed and the pool closed.
