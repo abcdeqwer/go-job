@@ -147,9 +147,22 @@ func (a *Auth) identify(r *http.Request) (string, Role, bool) {
 		username string
 		role     string
 	)
+	// Joined to the ACCOUNT, and the account's CURRENT role.
+	//
+	// Reading the role copied into the session made disabling an account a promise about the
+	// next twelve hours rather than about now: a compromised operator whose account was
+	// disabled — or whose password was rotated in response — kept every privilege until the
+	// session expired on its own, and could go on triggering work and re-pointing tenant DSNs
+	// the whole time. A disable that does not take effect is not a control.
+	//
+	// A demotion has to take effect for the same reason and by the same mechanism: the role
+	// that authorises a request is the one the account holds when the request arrives, not the
+	// one it held at sign-in.
 	err = a.db.QueryRowContext(r.Context(), `
-		SELECT username, role FROM admin_session
-		WHERE token_sha256 = ? AND expires_at > ?`,
+		SELECT s.username, u.role
+		FROM admin_session s
+		JOIN admin_user u ON u.username = s.username
+		WHERE s.token_sha256 = ? AND s.expires_at > ? AND u.disabled = 0`,
 		hashToken(c.Value), a.clock.Now()).Scan(&username, &role)
 	if err != nil {
 		return "", "", false

@@ -626,21 +626,46 @@ func (e *Engine) mayRecover(adopt bool) bool {
 	return e.renewing()
 }
 
-func (e *Engine) recoverStale(ctx context.Context, adopt bool) {
-	stale, err := e.store.StaleExecutions(ctx, e.cfg.PageSize)
-	if err != nil {
-		e.log.Error("stale scan failed", "error", err)
-		return
-	}
-	for _, v := range stale {
-		if !e.mayRecover(adopt) {
-			return
+// It returns whether anything was left UNSETTLED — during retirement that is the difference
+// between a tenant that is quiescent and one that only looks it.
+func (e *Engine) recoverStale(ctx context.Context, adopt bool) (unsettled bool) {
+	// Paged. One PageSize batch was enough for the periodic pass, which runs again in a
+	// moment; retirement does not run again, so a second batch of expired rows would simply
+	// never be visited and would be left held with no engine to notice.
+	for page := 0; page < 100; page++ {
+		stale, err := e.store.StaleExecutions(ctx, e.cfg.PageSize)
+		if err != nil {
+			e.log.Error("stale scan failed", "error", err)
+			return true
 		}
-		e.recoverOne(ctx, v, adopt)
+		if len(stale) == 0 {
+			return unsettled
+		}
+		settled := 0
+		for _, v := range stale {
+			if !e.mayRecover(adopt) {
+				return true
+			}
+			if e.recoverOne(ctx, v, adopt) {
+				settled++
+			} else {
+				unsettled = true
+			}
+		}
+		if settled == 0 {
+			// Every row in the page was contended, unreachable or deliberately held. Another
+			// pass would read the same rows and reach the same answer.
+			return true
+		}
 	}
+	e.log.Error("gave up recovering stale work after a hundred pages; some rows remain held")
+	return true
 }
 
-func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
+// It returns whether the row was SETTLED — moved out of the state it was scanned in. A row
+// deliberately left held because a handler is still running is not settled, and during
+// retirement that is what keeps the tenant alive.
+func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) (settled bool) {
 	// Phase 2, outside any transaction. An RPC to a process that may be wedged must never be
 	// made while holding a row lock: a connection that stays open and never answers would pin
 	// job_state and job_execution indefinitely, blocking completion, cancellation and every
@@ -710,11 +735,14 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 		switch {
 		case errors.Is(err, store.ErrCapElapsed):
 			e.fenceTimedOut(ctx, v)
+			settled = true
 		case errors.Is(err, gojob.ErrContended):
+			settled = true // somebody else took it; the row has moved either way
 		case err != nil:
 			e.log.Error("adopting a running execution failed",
 				"execution", v.ExecutionKey, "error", err)
 		default:
+			settled = true
 			// Same run_token, new epoch: rotating the token would fence a healthy run, while
 			// the new epoch is what evicts the dead scheduler's in-flight writes.
 			e.track(store.Holder{
@@ -727,7 +755,7 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 
 	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED &&
 		finishedOutcomeIsUsable(rec.Outcome):
-		e.adoptResult(ctx, v, rec)
+		settled = e.adoptResult(ctx, v, rec)
 
 	default:
 		if rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_FINISHED {
@@ -736,7 +764,7 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 		}
 		landed, err := e.store.Resolve(ctx, v, e.backoff(v.RecoveryCount))
 		if errors.Is(err, gojob.ErrContended) {
-			return
+			return true // another instance moved it; the row is no longer as scanned
 		}
 		if err != nil {
 			e.log.Error("resolving an unknown attempt failed",
@@ -744,25 +772,28 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 			return
 		}
 		e.untrack(v.ID, v.FenceEpoch)
+		settled = true
 		e.log.Warn("attempt resolved as unknown", "execution", v.ExecutionKey,
 			"landed", landed, "recoveries", v.RecoveryCount+1)
 	}
+	return settled
 }
 
-// adoptResult applies an outcome the executor still remembers.
-func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Reconciliation) {
+// adoptResult applies an outcome the executor still remembers, and reports whether the row
+// moved as a result.
+func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Reconciliation) bool {
 	// Take ownership before writing the result: the terminal CAS is guarded on the epoch, and
 	// the one on the row belongs to the scheduler that died.
 	epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID, e.leaseSecondsFor(ctx, v.JobName))
 	switch {
 	case errors.Is(err, store.ErrCapElapsed):
 		e.fenceTimedOut(ctx, v)
-		return
+		return true
 	case errors.Is(err, gojob.ErrContended):
-		return
+		return true // another instance moved it
 	case err != nil:
 		e.log.Error("adopting a finished execution failed", "execution", v.ExecutionKey, "error", err)
-		return
+		return false
 	}
 
 	h := store.Holder{
@@ -770,6 +801,7 @@ func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Re
 		Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: epoch,
 	}
 	e.applyOutcome(ctx, h, rec.Outcome, v.DispatchedTo)
+	return true
 }
 
 // finishedOutcomeIsUsable reports whether a FINISHED reconciliation actually carries a result.
@@ -807,7 +839,13 @@ func (e *Engine) timeoutPass(ctx context.Context) {
 		return
 	}
 	for _, v := range over {
-		if e.stopping() {
+		// renewing(), not stopping(). The timeout scan is a HOLDING loop: it exists to bound
+		// work this instance already owns, and it is the only bound a deferred retirement has.
+		// Guarded on stopping() it went silent the moment StopClaiming ran — so an executor
+		// that answers RUNNING for ever, ignores cancellation and never reports would defer
+		// retirement indefinitely while the heartbeat renewed its lease, with the runtime cap
+		// that was supposed to end it never applied.
+		if !e.renewing() {
 			return
 		}
 		e.fenceTimedOut(ctx, v)
@@ -828,7 +866,9 @@ func (e *Engine) silencePass(ctx context.Context) {
 		return
 	}
 	for _, v := range silent {
-		if e.stopping() {
+		// A holding loop: an executor that goes silent during a drain still has to be
+		// accounted for, or a deferred retirement waits on a process nobody is checking.
+		if !e.renewing() {
 			return
 		}
 		e.resolveSilent(ctx, v)
@@ -864,7 +904,9 @@ func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
 		// names another one or names none.
 		rec = dispatch.Reconciliation{}
 	}
-	if e.stopping() {
+	// Phase 2 was an RPC. Re-check before phase 3 writes — and on the holding predicate, for
+	// the same reason the loop above uses it.
+	if !e.renewing() {
 		return
 	}
 
@@ -944,7 +986,8 @@ func (e *Engine) cancelPass(ctx context.Context) {
 		return
 	}
 	for _, v := range rows {
-		if e.stopping() {
+		// A holding loop: an operator's cancel must still reach its executor during a drain.
+		if !e.renewing() {
 			return
 		}
 		e.requestStop(ctx, v, "cancelled by an operator")

@@ -511,8 +511,11 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) (deferred bool) {
 	for page := 0; page < 100; page++ {
 		owned, err := e.store.OwnedByInstance(ctx, e.cfg.InstanceID, 200)
 		if err != nil {
+			// Not knowing is not the same as nothing being there. Reporting `false` here told
+			// the caller the tenant was clean, after which the pool closes and whatever this
+			// query failed to list is stranded with no engine left to find it.
 			e.log.Error("listing owned work on retirement failed", "error", err)
-			return deferred
+			return true
 		}
 		if len(owned) == 0 {
 			break
@@ -521,8 +524,13 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) (deferred bool) {
 		deferred = deferred || held
 		if !progress {
 			// Nothing in the page could be released — every row was contended, failing, or
-			// deliberately held. Looping again would spin on the same rows.
-			break
+			// deliberately held. Looping again would spin on the same rows, and something is
+			// still there, so say so.
+			return true
+		}
+		if page == 99 {
+			e.log.Error("gave up releasing owned work after a hundred pages; rows remain held")
+			return true
 		}
 	}
 
@@ -537,8 +545,9 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) (deferred bool) {
 	// Owner-local release first, this second: what this instance holds it can end directly,
 	// while somebody else's expired work has to go through reconciliation, which is slower and
 	// may not reach a conclusion at all.
-	e.recoverStale(ctx, false)
-	return deferred
+	// Its answer counts too: an expired row this sweep could not settle is a row nothing will
+	// settle once the pool closes.
+	return e.recoverStale(ctx, false) || deferred
 }
 
 // releasePage releases one page, reporting whether it made any progress.

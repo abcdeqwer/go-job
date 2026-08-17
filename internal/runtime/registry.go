@@ -228,6 +228,7 @@ func (r *Registry) Stop() {
 
 // reconcile brings the admitted set in line with the registry.
 func (r *Registry) reconcile(ctx context.Context) {
+	readAt := time.Now()
 	rows, err := r.control.Tenants(ctx)
 	if err != nil {
 		// The fence is NOT refreshed. Every loop stops within the staleness limit, and
@@ -316,13 +317,48 @@ func (r *Registry) reconcile(ctx context.Context) {
 		}
 	}
 
-	// NOW. Every superseded engine has been told to stop acquiring, so refreshing the right to
-	// operate cannot hand one of them another tick.
+	// Say what this instance holds, for every tenant it is running, before deciding whether it
+	// may go on running them. The order matters: the fence refresh below is conditional on
+	// these having landed.
+	observed := true
+	for name, w := range want {
+		if _, running := have[name]; running {
+			observed = r.observe(ctx, name, w.Generation) && observed
+		}
+	}
+
+	// NOW, and only if this pass is entitled to.
+	//
+	// Every superseded engine has been told to stop acquiring, so refreshing the right to
+	// operate cannot hand one of them another tick. Two further conditions apply, and both
+	// were missing:
+	//
+	//   - the READ must still be fresh. A registry read is a fact about an instant. This
+	//     process can be suspended after it returns for longer than the staleness limit, and
+	//     the tenant can be disabled, proven quiescent and re-pointed in that time — after
+	//     which refreshing on those rows hands the old engine the right to dispatch against a
+	//     schema the tenant has left.
+	//
+	//   - every observation this pass owed must have LANDED. The fence and the observations
+	//     are two halves of one bargain: this instance may keep operating because the control
+	//     plane can see what it holds. An instance whose observations fail keeps claiming
+	//     while its row ages out of the liveness window, and a cutover then finds no blocker
+	//     and no held work at the wrong moment. Failing to say what you hold has to cost you
+	//     the right to hold it.
+	if age := time.Since(readAt); age > r.opts.StalenessLimit {
+		r.log.Warn("this pass took longer than the staleness limit; not refreshing the fence",
+			"took", age.Truncate(time.Millisecond), "limit", r.opts.StalenessLimit)
+		return
+	}
+	if !observed {
+		r.log.Warn("an observation could not be recorded; not refreshing the fence, because " +
+			"the control plane cannot see what this instance holds")
+		return
+	}
 	r.fence.Refresh()
 
 	for name, w := range want {
 		if _, running := have[name]; running {
-			r.observe(ctx, name, w.Generation)
 			continue
 		}
 		// A tenant still draining is NOT re-admitted yet. Starting a new engine beside a drain
@@ -361,7 +397,16 @@ func (r *Registry) reconcile(ctx context.Context) {
 		//
 		// Recorded as NOT quiesced at the generation being admitted, which is what it is: an
 		// instance about to hold work for that generation.
-		r.observeAs(ctx, admitting.Name, admitting.Generation, false)
+		//
+		// And if it does not land, the admission does not start. Publishing an engine the
+		// control plane cannot see is the split brain itself, not a step towards it — the
+		// cutover gate would find no blocker from an instance that is about to hold work.
+		if !r.observeAs(ctx, admitting.Name, admitting.Generation, false) {
+			r.endAdmit(admitting.Name)
+			r.log.Warn("not admitting a tenant this instance cannot announce",
+				"tenant", admitting.Name, "generation", admitting.Generation)
+			continue
+		}
 		r.goTracked(func() {
 			defer r.endAdmit(admitting.Name)
 			if err := r.admit(ctx, admitting); err != nil {
@@ -398,7 +443,7 @@ func (r *Registry) endAdmit(name string) {
 //
 // Quiescence is answered from the engine's tracked set rather than from the database, because
 // this is a statement about THIS instance: the database says what is held, not by whom.
-func (r *Registry) observe(ctx context.Context, name string, generation int64) {
+func (r *Registry) observe(ctx context.Context, name string, generation int64) bool {
 	r.mu.RLock()
 	t := r.tenants[name]
 	r.mu.RUnlock()
@@ -407,15 +452,19 @@ func (r *Registry) observe(ctx context.Context, name string, generation int64) {
 	if t != nil {
 		quiesced = t.engine.Tracking() == 0
 	}
-	r.observeAs(ctx, name, generation, quiesced)
+	return r.observeAs(ctx, name, generation, quiesced)
 }
 
 // observeAs records an observation with an explicit quiescence, for the cases where the answer
 // is known without looking at an engine — there is none yet, or there is no longer one.
-func (r *Registry) observeAs(ctx context.Context, name string, generation int64, quiesced bool) {
+// It returns whether the observation landed. That answer is load-bearing: an instance the
+// control plane cannot see is an instance a cutover will conclude is gone.
+func (r *Registry) observeAs(ctx context.Context, name string, generation int64, quiesced bool) bool {
 	if err := r.control.Observe(ctx, name, r.opts.InstanceID, generation, quiesced); err != nil {
 		r.log.Warn("recording an observation failed", "tenant", name, "error", err)
+		return false
 	}
+	return true
 }
 
 // admit opens a tenant's pool, verifies its schema and starts its engine.

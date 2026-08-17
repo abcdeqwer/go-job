@@ -353,3 +353,56 @@ func TestOwnershipProofIsDatedBeforeItsCall(t *testing.T) {
 		t.Fatal("an older confirmation overwrote a newer one")
 	}
 }
+
+// The holding loops must all run through a drain.
+//
+// They are what bounds work this instance already owns: the heartbeat keeps its leases live,
+// the timeout scan applies the runtime cap, the silence scan accounts for an executor that
+// stopped reporting, and the cancel relay carries an operator's stop. A drain stops ACQUIRING;
+// none of those is acquisition, and a deferred retirement — which waits for a running handler
+// to end — depends on the cap being applied while it waits. Guarded on stopping(), every one
+// of them went silent at StopClaiming, so an executor that answered RUNNING for ever would
+// defer retirement indefinitely with the bound that was supposed to end it never applied.
+func TestHoldingPassesRunThroughADrain(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	holding := map[string]bool{
+		"heartbeatPass": true, "timeoutPass": true, "silencePass": true,
+		"cancelPass": true, "resolveSilent": true, "fenceTimedOut": true,
+	}
+	seen := map[string]bool{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Body == nil || !holding[fd.Name.Name] {
+					continue
+				}
+				seen[fd.Name.Name] = true
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "stopping" {
+						t.Errorf("%s: %s guards on stopping(), which is true throughout a drain; "+
+							"a holding pass must use renewing()",
+							fset.Position(sel.Pos()), fd.Name.Name)
+					}
+					return true
+				})
+			}
+		}
+	}
+	for name := range holding {
+		if !seen[name] {
+			t.Errorf("%s was not found; this test names a function that no longer exists", name)
+		}
+	}
+}

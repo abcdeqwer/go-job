@@ -144,6 +144,18 @@ static analysis for everything else.
 28r. retirement applies a confirmed FINISHED outcome rather than recording `dead`/unknown over
     a success the executor was still holding;
 28s. a result another writer recorded concurrently is answered already_recorded, not ABORTED;
+28t. the right to operate is refreshed only by control knowledge that is FRESH — a pass slower
+    than the staleness limit does not refresh — and COMPLETE: an instance whose observation
+    did not land loses the fence rather than keeping it, because a cutover cannot see what it
+    was not told;
+28u. an admission whose pre-admission observation fails does not start;
+28v. every HOLDING pass — heartbeat, timeout, silence, cancel — runs through a drain, which is
+    what makes the runtime cap the bound on a deferred retirement;
+28w. retirement reports work it could not settle rather than reporting success: a failed
+    listing, a page it could not progress, an exhausted page budget and an unsettled recovery
+    sweep all defer;
+28x. disabling or demoting an admin account takes effect on the next request, not at session
+    expiry;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

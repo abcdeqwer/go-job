@@ -411,3 +411,59 @@ func TestCutoverRefusesABlockerThatAppearedLate(t *testing.T) {
 		t.Fatalf("the cutover was refused after every instance acknowledged: %v", err)
 	}
 }
+
+// Disabling an account must end its sessions now, not in twelve hours.
+//
+// The role was copied into admin_session at sign-in and read from there on every request, so
+// disabling a compromised operator — or rotating its password in response — left it fully
+// privileged until the session expired on its own, still able to trigger work and re-point
+// tenant DSNs. A disable that takes effect at some later time is not a control. A demotion is
+// the same question: the role that authorises a request is the one the account holds when the
+// request arrives.
+func TestDisablingAnAccountEndsItsSessions(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+
+	hash, err := admin.HashPassword("a-reasonable-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO admin_user (username, password_hash, role, created_at, updated_at)
+		VALUES ('carol', ?, 'OPERATOR', NOW(), NOW())`, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	auth := admin.NewAuth(db, clock, time.Hour, admin.TrustedHeader{}, false)
+	api := admin.New(admin.Config{Clock: clock}, nil, nil, alwaysHealthy{}, auth, discardLogger())
+
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, jsonPost("/api/login",
+		`{"username":"carol","password":"a-reasonable-password"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login returned %d: %s", rec.Code, rec.Body)
+	}
+	cookies := rec.Result().Cookies()
+
+	me := func() int {
+		req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		api.Handler().ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := me(); got != http.StatusOK {
+		t.Fatalf("a fresh session returned %d", got)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		`UPDATE admin_user SET disabled = 1 WHERE username = 'carol'`); err != nil {
+		t.Fatal(err)
+	}
+	if got := me(); got != http.StatusUnauthorized {
+		t.Fatalf("a disabled account's existing session still worked (%d); disabling has to "+
+			"take effect on the next request, not at session expiry", got)
+	}
+}

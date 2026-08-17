@@ -147,15 +147,21 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 			continue
 		}
 
-		// A disjunction voids every exemption. The predicates below are only self-proving as
-		// top-level conjuncts: `WHERE status = 'ready' OR status = 'running'` contains the
-		// exempting substring while being able to mutate a running row without a fence, so a
-		// substring match alone would let the test pass the exact defect it exists to prevent.
+		// An exemption must be a TOP-LEVEL CONJUNCT, not a substring.
+		//
+		// The predicates below are self-proving only when they constrain the row this
+		// statement is about. Matched anywhere in the WHERE clause they can be satisfied by
+		// text that constrains nothing: `EXISTS (SELECT 1 FROM job_execution WHERE status =
+		// 'ready')` excuses an unfenced write to a running row, and so does the same phrase
+		// sitting in a comment. The disjunction check below is the same idea one level up —
+		// `status = 'ready' OR status = 'running'` contains the exempting text while permitting
+		// exactly what it is meant to forbid.
+		conjuncts := topLevelConjuncts(where)
 		disjunctive := strings.Contains(strings.ToUpper(where), " OR ")
 
 		var excused bool
 		for _, e := range guardExemptions {
-			if disjunctive || !strings.Contains(where, e.predicate) {
+			if disjunctive || !conjuncts[e.predicate] {
 				continue
 			}
 			if e.alsoAssign != "" && !strings.Contains(norm, e.alsoAssign) {
@@ -277,6 +283,44 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 	if comparisons < 4 {
 		t.Fatalf("checked only %d ownership comparisons; the extractor is probably broken", comparisons)
 	}
+}
+
+// topLevelConjuncts splits a WHERE clause into the predicates joined by AND at depth zero.
+//
+// Depth zero is the whole point: a predicate inside a subquery constrains that subquery's
+// rows, not this statement's, so it can never be the proof an exemption needs. Trailing
+// clauses are cut for the same reason — ORDER BY and LIMIT are not predicates.
+func topLevelConjuncts(where string) map[string]bool {
+	w := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(where), "WHERE"))
+	if i := indexTopLevel(strings.ToUpper(w), " ORDER BY "); i >= 0 {
+		w = w[:i]
+	}
+	if i := indexTopLevel(strings.ToUpper(w), " LIMIT "); i >= 0 {
+		w = w[:i]
+	}
+
+	out := map[string]bool{}
+	depth, last := 0, 0
+	add := func(part string) {
+		if p := strings.TrimSpace(part); p != "" {
+			out[p] = true
+		}
+	}
+	for i := 0; i < len(w); i++ {
+		switch w[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case 'A', 'a':
+			if depth == 0 && i > 0 && w[i-1] == ' ' && strings.HasPrefix(strings.ToUpper(w[i:]), "AND ") {
+				add(w[last : i-1])
+				last = i + len("AND ")
+			}
+		}
+	}
+	add(w[last:])
+	return out
 }
 
 // balancedExpr reads one SQL expression from the front of s, stopping at the first top-level
@@ -672,6 +716,28 @@ func TestTransactionHandlesAreNamedTx(t *testing.T) {
 		}
 		pkg, ok := sel.X.(*ast.Ident)
 		return ok && pkg.Name == "sql" && sel.Sel.Name == "Tx"
+	}
+
+	// The IMPORT may not be renamed either.
+	//
+	// Every rule here reads `*sql.Tx` as written, so `import dbsql "database/sql"` and a
+	// parameter typed `*dbsql.Tx` is a transaction none of them can see — and the lock-order
+	// walker then ignores its statements too, because the receiver is not spelled `tx`. The
+	// package is imported once, under its own name, and that is now checkable.
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, imp := range file.Imports {
+				if imp.Path.Value != `"database/sql"` || imp.Name == nil {
+					continue
+				}
+				if imp.Name.Name != "sql" {
+					t.Errorf("%s: database/sql is imported as %q; every transaction rule in "+
+						"this file matches the written type, so a second name for the package "+
+						"is a hole in all of them",
+						fset.Position(imp.Pos()), imp.Name.Name)
+				}
+			}
+		}
 	}
 
 	// An ALIAS defeats the shape test entirely: `type txAlias = sql.Tx` and a parameter typed
