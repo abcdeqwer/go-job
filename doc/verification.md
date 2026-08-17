@@ -156,6 +156,14 @@ static analysis for everything else.
     sweep all defer;
 28x. disabling or demoting an admin account takes effect on the next request, not at session
     expiry;
+28y. a LIVE executor id cannot be taken over by a second process at another address — the
+    upsert would move the address recovery asks, and be told NOT_FOUND about work the first
+    process is still running; a lapsed registration is reusable, which is what a restart needs;
+28z. adopting a `dispatching` row the executor reports RUNNING records the acceptance the dead
+    scheduler never did — status, attempt_no, started_at and the silence deadline — so the
+    silence scan can see it and the attempt budget is charged once;
+28aa. a terminally retired tenant answers callbacks NOT_FOUND rather than UNAVAILABLE for
+    ever, so an executor holding a result stops retrying into a tenant that is gone;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

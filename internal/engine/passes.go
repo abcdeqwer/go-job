@@ -731,7 +731,8 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) (set
 
 	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING:
 		adoptedAt := time.Now()
-		epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID, e.leaseSecondsFor(ctx, v.JobName))
+		epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID,
+			e.leaseSecondsFor(ctx, v.JobName), e.silenceSeconds(), true)
 		switch {
 		case errors.Is(err, store.ErrCapElapsed):
 			e.fenceTimedOut(ctx, v)
@@ -784,7 +785,10 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) (set
 func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Reconciliation) bool {
 	// Take ownership before writing the result: the terminal CAS is guarded on the epoch, and
 	// the one on the row belongs to the scheduler that died.
-	epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID, e.leaseSecondsFor(ctx, v.JobName))
+	// promote=false: the work is FINISHED, and chargeUnacceptedAttempt in the terminal write
+	// already accounts for an attempt whose result arrived while the row was `dispatching`.
+	epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID,
+		e.leaseSecondsFor(ctx, v.JobName), e.silenceSeconds(), false)
 	switch {
 	case errors.Is(err, store.ErrCapElapsed):
 		e.fenceTimedOut(ctx, v)

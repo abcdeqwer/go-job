@@ -610,3 +610,57 @@ func TestTriggerIdempotencyIsBoundToTheJob(t *testing.T) {
 		}
 	}
 }
+
+// A live executor id cannot be taken over by a second process.
+//
+// Ids are required to be unique per process and a restart is required to mint a fresh one.
+// Accepting a duplicate anyway is not leniency: the registration upsert replaces the ADDRESS,
+// so recovery asking "does executor E still have this work" reaches the wrong process, is told
+// NOT_FOUND, and re-dispatches an execution the original E is still running. One malformed
+// registration becomes two handlers.
+func TestALiveExecutorIdCannotBeTakenOver(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	original := store.Executor{
+		ExecutorID: "exec-live", Group: "main", Address: "host-a:9000",
+		ContractVersion: "1", Revision: "r1", Capacity: 4,
+		Handlers: []string{"test.handler"},
+	}
+	if err := h.store.Register(ctx, original, 30); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another process, same id, different address.
+	impostor := original
+	impostor.Address = "host-b:9000"
+	if err := h.store.Register(ctx, impostor, 30); err == nil {
+		t.Fatal("a second process took over a live executor id; recovery would then ask the " +
+			"wrong process about work the first one is still running")
+	}
+
+	addr, err := h.store.ExecutorAddress(ctx, "exec-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "host-a:9000" {
+		t.Fatalf("the address moved to %q despite the refusal", addr)
+	}
+
+	// The same process re-registering at its own address is fine — that is a heartbeat-losing
+	// reconnect, not a takeover.
+	if err := h.store.Register(ctx, original, 30); err != nil {
+		t.Fatalf("a process could not re-register at its own address: %v", err)
+	}
+
+	// And once the registration has lapsed, the id is free: a legitimate restart finds
+	// exactly this, and refusing there would make an id unusable for ever.
+	if _, err := h.db.ExecContext(ctx, `
+		UPDATE job_executor SET heartbeat_at = TIMESTAMPADD(SECOND, -3600, UTC_TIMESTAMP())
+		WHERE executor_id = 'exec-live'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.Register(ctx, impostor, 30); err != nil {
+		t.Fatalf("a lapsed id was not reusable: %v", err)
+	}
+}

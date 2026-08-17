@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -51,7 +52,7 @@ type Executor struct {
 // executor_id is unique per PROCESS, so a restart mints a new one. That is deliberate — an
 // id reused across restarts would let a stale registration for a process that no longer
 // exists keep a job looking runnable.
-func (s *Store) Register(ctx context.Context, e Executor) error {
+func (s *Store) Register(ctx context.Context, e Executor, livenessSeconds int) error {
 	if e.ExecutorID == "" || e.Group == "" || e.Address == "" {
 		return fmt.Errorf("%w: registration needs an id, a group and an address", gojob.ErrProtocol)
 	}
@@ -60,7 +61,37 @@ func (s *Store) Register(ctx context.Context, e Executor) error {
 	}
 
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+		// A LIVE registration under this id, at another address, is refused.
+		//
+		// Executor ids are required to be unique per process and a restart is required to mint
+		// a fresh one. Accepting a duplicate anyway is not leniency, it is a route to double
+		// execution: the upsert replaces the address and the handler set, so recovery asking
+		// "does executor E still have this work" reaches the WRONG PROCESS, is told NOT_FOUND,
+		// and re-dispatches an execution the original E is still running. One malformed
+		// registration becomes two handlers.
+		//
+		// Only a LIVE one is protected. A registration whose heartbeat has lapsed is exactly
+		// what a legitimate restart finds, and re-using an id after the old process is gone
+		// costs nothing — so the reap window is the boundary, not the id itself.
+		var (
+			existing string
+			live     bool
+		)
+		err := tx.QueryRowContext(ctx, `
+			SELECT address, heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
+			FROM job_executor WHERE executor_id = ? FOR UPDATE`,
+			-livenessSeconds, e.ExecutorID).Scan(&existing, &live)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read the current registration of %q: %w", e.ExecutorID, err)
+		}
+		if err == nil && live && existing != e.Address {
+			return fmt.Errorf("%w: executor id %q is already registered and alive at %s; a "+
+				"restart must mint a new id, because taking over this one would point recovery "+
+				"at the wrong process",
+				gojob.ErrProtocol, e.ExecutorID, existing)
+		}
+
+		_, err = tx.ExecContext(ctx, `
 			INSERT INTO job_executor
 			    (executor_id, executor_group, address, contract_version, revision,
 			     capacity, running, capabilities, identity, started_at, heartbeat_at)

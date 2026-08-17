@@ -130,7 +130,10 @@ const (
 //
 // Returns the new epoch to track under. It returns ErrCapElapsed when the execution outran
 // its runtime cap while the reconciliation call was in flight; the caller fences it instead.
-func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSeconds int) (int64, error) {
+// promote says the executor confirmed the handler is RUNNING, so a row still recorded as
+// `dispatching` should be moved on exactly as a live Accept would have moved it.
+func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string,
+	leaseSeconds, silenceSeconds int, promote bool) (int64, error) {
 	var epoch int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		st, err := lockState(ctx, tx, v.JobName)
@@ -179,15 +182,35 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string, leaseSecond
 			return err
 		}
 
+		// A `dispatching` row that the executor says is RUNNING is an acceptance the dead
+		// scheduler never got to record.
+		//
+		// Leaving the status alone looked harmless and was not. The silence scan reads only
+		// `running` and `cancel_requested`, so an adopted handler that later goes quiet is
+		// invisible to it and stays held until its runtime cap — which for a job capped in
+		// days means days. `attempt_no` stays zero, so the same failure repeated can run the
+		// work more times than max_attempts allows, bounded only by the recovery budget. And
+		// deadline_at may still be NULL, so there is no silence budget to elapse at all.
+		//
+		// promote is false on the FINISHED path: chargeUnacceptedAttempt already accounts for
+		// an attempt whose result arrived while the row was still `dispatching`, and charging
+		// it here as well would count one run twice.
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
 			    owner_instance = ?, fence_epoch = ?,
+			    status      = IF(? AND status = 'dispatching', 'running', status),
+			    attempt_no  = IF(? AND status = 'dispatching', attempt_no + 1, attempt_no),
+			    started_at  = IF(? AND status = 'dispatching', COALESCE(started_at, ?), started_at),
+			    deadline_at = IF(? AND status = 'dispatching',
+			                     TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), deadline_at),
 			    lease_until  = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
 			    heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?`,
-			newOwner, epoch, leaseSeconds, now, v.ID, v.RunToken, v.FenceEpoch)
+			newOwner, epoch,
+			promote, promote, promote, now, promote, silenceSeconds,
+			leaseSeconds, now, v.ID, v.RunToken, v.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("adopt execution %d: %w", v.ID, err)
 		}

@@ -242,12 +242,27 @@ func (r *Registry) reconcile(ctx context.Context) {
 	registered := make(map[string]int64, len(rows))
 	r.mu.Lock()
 	for _, t := range rows {
-		if g := r.seen[t.Name]; t.Generation > g {
+		if g := r.seen[t.Name]; t.Generation > g && t.Enabled {
 			r.seen[t.Name] = t.Generation
 		}
 		registered[t.Name] = t.Generation
 		if t.Enabled {
 			want[t.Name] = t
+			continue
+		}
+		// A DISABLED tenant is not pending, it is finished.
+		//
+		// `seen` is what makes Lookup answer Pending, which an executor reads as UNAVAILABLE
+		// and retries. Retirement deletes the entry precisely so a late callback gets a
+		// terminal answer instead — and then the very next poll put it straight back, for
+		// every row in the registry including the disabled ones. An executor holding a result
+		// for a tenant that has been terminally retired would retry it for ever.
+		//
+		// It is removed only when this instance is not still draining the tenant: while a
+		// drain is in progress the callbacks are the POINT, and r.tenants answers Available
+		// for them anyway.
+		if _, draining := r.tenants[t.Name]; !draining {
+			delete(r.seen, t.Name)
 		}
 	}
 	// A tenant that has vanished from the registry entirely stops being tracked, so its

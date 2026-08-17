@@ -175,8 +175,11 @@ func TestOwnershipUpdatesCarryTheFence(t *testing.T) {
 			continue
 		}
 
-		hasToken := strings.Contains(where, "run_token = ?") || strings.Contains(where, "active_run_token = ?")
-		hasEpoch := strings.Contains(where, "fence_epoch = ?")
+		// Masked: a fence is a predicate, not a phrase that happens to appear in a value.
+		masked := maskLiterals(where)
+		hasToken := strings.Contains(masked, "run_token = ?") ||
+			strings.Contains(masked, "active_run_token = ?")
+		hasEpoch := strings.Contains(masked, "fence_epoch = ?")
 		if !hasToken || !hasEpoch {
 			t.Errorf("ownership UPDATE missing its fence (token=%v epoch=%v); "+
 				"a zombie holding a stale epoch would be able to write:\n  %s", hasToken, hasEpoch, norm)
@@ -210,9 +213,10 @@ func TestEveryUpdateBumpsWriteSeq(t *testing.T) {
 		// job_definition carries `version` instead, which serves the identical purpose: it is
 		// the optimistic-concurrency counter, it always changes, and an edit is refused on a
 		// stale value rather than reported through the affected-row count.
-		hasWitness := strings.Contains(norm, "write_seq = write_seq + 1") ||
-			strings.Contains(norm, "js.write_seq = js.write_seq + 1") ||
-			strings.Contains(norm, "version = version + 1")
+		masked := maskLiterals(norm)
+		hasWitness := strings.Contains(masked, "write_seq = write_seq + 1") ||
+			strings.Contains(masked, "js.write_seq = js.write_seq + 1") ||
+			strings.Contains(masked, "version = version + 1")
 		if !hasWitness {
 			t.Errorf("UPDATE has no column that always changes, so a no-op repeat would be "+
 				"indistinguishable from a failed guard:\n  %s", norm)
@@ -283,6 +287,34 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 	if comparisons < 4 {
 		t.Fatalf("checked only %d ownership comparisons; the extractor is probably broken", comparisons)
 	}
+}
+
+// maskLiterals blanks the CONTENTS of every quoted string in a statement.
+//
+// The fence and write_seq rules ask whether a statement contains a predicate or an assignment,
+// and a substring search cannot tell a predicate from the same characters sitting inside a
+// quoted value. `SET error_message = 'write_seq = write_seq + 1'` satisfied the witness check
+// while writing no witness, and `WHERE summary = 'run_token = ? AND fence_epoch = ?'` produced
+// a fence out of a string comparison. MySQL reads neither as anything but text, and neither
+// should these rules.
+//
+// The masked form keeps the quotes and the length, so offsets and clause splitting are
+// unaffected; only the characters that could impersonate SQL are gone.
+func maskLiterals(sql string) string {
+	out := []byte(sql)
+	inside := false
+	for i := 0; i < len(out); i++ {
+		switch {
+		case out[i] == '\'' && i+1 < len(out) && out[i+1] == '\'' && inside:
+			out[i+1] = '~' // an escaped quote inside a literal is content, not a terminator
+			i++
+		case out[i] == '\'':
+			inside = !inside
+		case inside:
+			out[i] = '~'
+		}
+	}
+	return string(out)
 }
 
 // topLevelConjuncts splits a WHERE clause into the predicates joined by AND at depth zero.
@@ -791,6 +823,25 @@ func TestTransactionHandlesAreNamedTx(t *testing.T) {
 						}
 					}
 				case *ast.AssignStmt:
+					// `runner := tx` — an alias is a transaction under a name the lock-order
+					// walker does not recognise, and it never passes through BeginTx, so the
+					// rule below cannot see it. Copying the handle at all is what is
+					// forbidden; there is no reason to.
+					for i, rhs := range v.Rhs {
+						id, ok := rhs.(*ast.Ident)
+						if !ok || id.Name != "tx" {
+							continue
+						}
+						checked++
+						if i < len(v.Lhs) {
+							if lhs, ok := v.Lhs[i].(*ast.Ident); ok && lhs.Name != "tx" {
+								t.Errorf("%s: the transaction is copied into %q; the lock-order "+
+									"walker recognises statements by the receiver being `tx`, so "+
+									"everything done through this name is invisible to it",
+									fset.Position(lhs.Pos()), lhs.Name)
+							}
+						}
+					}
 					// `tx, err := db.BeginTx(...)` — the handle enters here too.
 					for _, rhs := range v.Rhs {
 						call, ok := rhs.(*ast.CallExpr)

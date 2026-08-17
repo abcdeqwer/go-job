@@ -191,7 +191,7 @@ func (s *Server) Register(ctx context.Context, req *gojobv1.RegisterRequest) (*g
 		return nil, status.Errorf(codes.Internal, "reconcile in-flight work: %v", err)
 	}
 
-	if err := st.Register(ctx, e); err != nil {
+	if err := st.Register(ctx, e, roundUpSeconds(s.cfg.RegistrationTTL)); err != nil {
 		return nil, status.Errorf(codes.Internal, "record registration: %v", err)
 	}
 
