@@ -82,6 +82,16 @@ type config struct {
 	hashToken    string
 }
 
+// progressInterval is how often an executor is asked to report, given how long it may be
+// silent. Floored at a second so a very short liveness setting cannot ask for a report every
+// zero seconds.
+func progressInterval(silence time.Duration) time.Duration {
+	if p := silence / 3; p >= time.Second {
+		return p
+	}
+	return time.Second
+}
+
 func run() error {
 	var c config
 	flag.StringVar(&c.controlDSN, "control-dsn", env("GOJOB_CONTROL_DSN", ""),
@@ -264,8 +274,17 @@ func run() error {
 	gojobv1.RegisterJobSchedulerServer(grpcSrv, server.New(server.Config{
 		HeartbeatInterval: c.executorLiveness / 3,
 		RegistrationTTL:   c.executorLiveness,
-		ProgressInterval:  30 * time.Second,
-		SilenceDeadline:   c.executorLiveness,
+
+		// A THIRD of the silence budget, the same ratio the lease heartbeat uses, and for the
+		// same reason: an executor that reports on the interval it was told should be able to
+		// lose two reports in a row and still not be called silent.
+		//
+		// These were both thirty seconds, which is no margin at all — a conforming executor
+		// reporting exactly on time is silent the moment one report is late, after which a
+		// single failed GetExecution ends a running handler and records its side effects as
+		// unknown.
+		ProgressInterval: progressInterval(c.executorLiveness),
+		SilenceDeadline:  c.executorLiveness,
 	}, runtime.SchedulerTenants{R: reg}, disp, fence, clock, func() int { return 30 }, log))
 
 	lis, err := net.Listen("tcp", c.grpcAddr)

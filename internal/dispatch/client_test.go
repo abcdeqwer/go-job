@@ -48,7 +48,7 @@ func TestClassifyRun(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := classifyRun(c.resp, c.err)
+		got := classifyRun(c.resp, c.err, RunSpec{})
 		if got.Answer != c.want {
 			t.Errorf("%s: classifyRun = %v, want %v", c.name, got.Answer, c.want)
 		}
@@ -59,7 +59,7 @@ func TestClassifyRun(t *testing.T) {
 // code space rather than against a list that can drift.
 func TestNoStatusCodeCanRelease(t *testing.T) {
 	for c := codes.Code(1); c <= codes.Unauthenticated; c++ {
-		if got := classifyRun(nil, status.Error(c, "")); got.Answer == Refused {
+		if got := classifyRun(nil, status.Error(c, ""), RunSpec{}); got.Answer == Refused {
 			t.Errorf("code %v classified Refused; only an OK response with refused=true may "+
 				"release a job, because a status cannot prove the request was not delivered", c)
 		}
@@ -75,7 +75,7 @@ func TestAlreadyExistsCarriesTheHeldToken(t *testing.T) {
 		t.Fatalf("build status: %v", err)
 	}
 
-	got := classifyRun(nil, st.Err())
+	got := classifyRun(nil, st.Err(), RunSpec{})
 	if got.Answer != Accepted {
 		t.Fatalf("Answer = %v, want Accepted", got.Answer)
 	}
@@ -103,6 +103,37 @@ func TestRoundUpSeconds(t *testing.T) {
 	for _, c := range cases {
 		if got := roundUpSeconds(c.in); got != c.want {
 			t.Errorf("roundUpSeconds(%s) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// An OK response that names a different execution or a different attempt is not an
+// acceptance.
+//
+// The empty case stays an acceptance on purpose: both identity fields are echoes, a
+// conforming executor may send neither, and requiring them would break those executors. What
+// cannot be waved through is a non-empty value that DISAGREES — it says the executor answered
+// about something else. Read as acceptance, the row goes `running` and charges an attempt for
+// work nobody took, then waits for a result that will never come until silence or recovery
+// clears it.
+func TestRunAcknowledgementMustNameTheDispatch(t *testing.T) {
+	sent := RunSpec{ExecutionKey: "job:1:2026-08-17T00:00:00Z", RunToken: "tok-2"}
+
+	for _, c := range []struct {
+		name string
+		resp *gojobv1.RunResponse
+		want Answer
+	}{
+		{"echoes nothing", &gojobv1.RunResponse{}, Accepted},
+		{"echoes both correctly", &gojobv1.RunResponse{
+			ExecutionKey: sent.ExecutionKey, RunToken: sent.RunToken}, Accepted},
+		{"echoes another execution", &gojobv1.RunResponse{
+			ExecutionKey: "job:9:2026-08-17T00:00:00Z"}, Unknown},
+		{"echoes another attempt", &gojobv1.RunResponse{
+			ExecutionKey: sent.ExecutionKey, RunToken: "tok-1"}, Unknown},
+	} {
+		if got := classifyRun(c.resp, nil, sent); got.Answer != c.want {
+			t.Errorf("%s: answer = %v, want %v (%v)", c.name, got.Answer, c.want, got.Err)
 		}
 	}
 }

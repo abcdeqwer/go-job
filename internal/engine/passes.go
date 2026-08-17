@@ -383,7 +383,17 @@ func (e *Engine) dispatch(ctx context.Context, h store.Holder, def gojob.Definit
 			// what REMAINS rather than what was configured: the cap started at the claim, so
 			// handing over the full amount after a delayed re-send leaves the executor
 			// believing it owns the run for longer than the scheduler will wait.
-			SilenceDeadline:  def.Lease,
+			//
+			// The silence budget is the SCHEDULER's, not the job's lease. Those are unrelated
+			// numbers: the lease bounds how long this instance may go without renewing, and
+			// its floor is ten seconds, while the progress interval the scheduler advertises
+			// to executors is configured separately and is typically longer. Initialising the
+			// silence deadline from a ten-second lease classifies a perfectly conforming
+			// executor as silent before its first scheduled progress report is even due — and
+			// one transient GetExecution failure then ends a running handler and records its
+			// side effects as unknown. Every extension already uses silenceSeconds(); this is
+			// the one place that did not.
+			SilenceDeadline:  time.Duration(e.silenceSeconds()) * time.Second,
 			RemainingTimeout: remaining,
 			Params:           params,
 		}
@@ -517,7 +527,7 @@ func (e *Engine) attemptDispatch(ctx context.Context, h store.Holder, def gojob.
 				return dispatch.Unknown
 			}
 			if err := e.store.Accept(ctx, h.ExecutionID, h.RunToken, h.FenceEpoch,
-				int(def.Lease/time.Second)); err != nil {
+				e.silenceSeconds()); err != nil {
 				if errors.Is(err, gojob.ErrFenced) {
 					e.untrack(h.ExecutionID, h.FenceEpoch)
 					return dispatch.Unknown
@@ -584,20 +594,42 @@ func decodeParams(raw []byte) (map[string]any, error) {
 
 // recoverPass is the only path that clears an expired holder.
 func (e *Engine) recoverPass(ctx context.Context) {
+	e.recoverStale(ctx, true)
+}
+
+// recoverStale is the pass, with adoption optional.
+//
+// Retirement runs it with adoption OFF. "Owned by me" is not the whole of what a retiring
+// instance may need to settle: an instance that crashed holding an execution leaves an expired
+// lease only a recovery pass can clear, and if the tenant is disabled before any survivor's
+// next recovery tick, every replica releases its own work, finds nothing else, and closes its
+// pool — leaving that row held for ever, and quiescence, which the cutover gates on,
+// permanently false.
+//
+// Adoption is off because this engine is stopping. Taking ownership of a handler that is still
+// running would track it, renew it for a few more seconds, and then stop — arriving back at
+// the same stranded row by a longer route. A genuinely running handler is left held, which is
+// the honest answer: the cutover SHOULD wait for it, and quiescence exists to say so.
+func (e *Engine) recoverStale(ctx context.Context, adopt bool) {
 	stale, err := e.store.StaleExecutions(ctx, e.cfg.PageSize)
 	if err != nil {
 		e.log.Error("stale scan failed", "error", err)
 		return
 	}
 	for _, v := range stale {
-		if e.stopping() {
+		// During retirement `stopping()` is true by construction — StopClaiming has run — so
+		// the guard is on the fence and the full stop instead.
+		if adopt && e.stopping() {
 			return
 		}
-		e.recoverOne(ctx, v)
+		if !adopt && !e.renewing() {
+			return
+		}
+		e.recoverOne(ctx, v, adopt)
 	}
 }
 
-func (e *Engine) recoverOne(ctx context.Context, v store.Stale) {
+func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 	// Phase 2, outside any transaction. An RPC to a process that may be wedged must never be
 	// made while holding a row lock: a connection that stays open and never answers would pin
 	// job_state and job_execution indefinitely, blocking completion, cancellation and every
@@ -632,6 +664,13 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale) {
 	}
 
 	switch {
+	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING && !adopt:
+		// Retirement. The handler really is running, so the row stays held and the schema
+		// stays un-quiet — which is the correct report, not a failure to clean up.
+		e.log.Warn("leaving a running execution held: the tenant is retiring and adopting it "+
+			"would only strand it again a moment later",
+			"execution", v.ExecutionKey, "executor", v.DispatchedTo)
+
 	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING:
 		epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID, e.leaseSecondsFor(ctx, v.JobName))
 		switch {

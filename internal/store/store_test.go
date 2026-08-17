@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	gojob "github.com/abcdeqwer/go-job"
 )
@@ -935,6 +936,50 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 	}
 }
 
+// A statement-running method may only ever be CALLED, never referred to.
+//
+// `exec := tx.ExecContext` compiles, and the call that follows has an identifier for its
+// function rather than a selector — so every rule in this file that looks for `tx.Exec…(…)`
+// sees nothing, and a statement built by concatenation and passed through that variable is
+// invisible to the fence, clock, write_seq and lock-order checks alike.
+//
+// Nothing here needs a method value, so the rule is simply that there are none. That is a
+// cheaper rule to state and a cheaper one to check than trying to follow where such a value
+// ends up.
+func TestStatementMethodsAreOnlyEverCalled(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			called := map[ast.Node]bool{}
+			ast.Inspect(file, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					called[call.Fun] = true
+				}
+				return true
+			})
+			ast.Inspect(file, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || called[ast.Node(sel)] {
+					return true
+				}
+				if _, runs := statementArg(sel.Sel.Name); runs {
+					t.Errorf("%s: %s is referred to rather than called; a method value hides "+
+						"the statement from every static check in this file",
+						fset.Position(sel.Pos()), sel.Sel.Name)
+				}
+				return true
+			})
+		}
+	}
+}
+
 // statementArg reports whether a database/sql method name executes SQL, and which argument
 // carries the statement.
 //
@@ -1359,5 +1404,49 @@ func TestClockFamiliesAreNeverCompared(t *testing.T) {
 	}
 	if checked < 10 {
 		t.Fatalf("inspected only %d expressions; the extractor is probably broken", checked)
+	}
+}
+
+// Executor-supplied strings must be bounded before they reach a column.
+//
+// This is the difference between a long message and a lost result. Under MySQL's default
+// strict mode a 513-character summary makes the terminal transaction fail with "Data too
+// long", deterministically: the callback retries and fails identically, recovery adopts the
+// executor's FINISHED answer and fails identically, and the execution finally records a
+// timeout instead of the success it actually had — after which it may run again. An executor
+// is somebody else's program in some other language, and nothing stops it sending a stack
+// trace as its summary.
+func TestOutcomeStringsAreBounded(t *testing.T) {
+	long := strings.Repeat("x", 4096)
+	got := Outcome{FailureKind: long, ErrorMessage: long, ResultSummary: long}.clipped()
+
+	for _, c := range []struct {
+		name  string
+		value string
+		max   int
+	}{
+		{"failure_kind", got.FailureKind, maxFailureKind},
+		{"error_message", got.ErrorMessage, maxMessage},
+		{"result_summary", got.ResultSummary, maxMessage},
+	} {
+		if n := len([]rune(c.value)); n != c.max {
+			t.Errorf("%s clipped to %d runes, want %d", c.name, n, c.max)
+		}
+	}
+
+	// Multi-byte input must not be cut mid-rune: the columns count characters, and a broken
+	// UTF-8 sequence is rejected exactly as firmly as an over-long one.
+	multi := strings.Repeat("汉", 4096)
+	clipped := clip(multi, maxMessage)
+	if n := len([]rune(clipped)); n != maxMessage {
+		t.Fatalf("multi-byte input clipped to %d runes, want %d", n, maxMessage)
+	}
+	if !utf8.ValidString(clipped) {
+		t.Fatal("clipping produced invalid UTF-8")
+	}
+
+	// And a short string is returned untouched.
+	if got := clip("fine", maxMessage); got != "fine" {
+		t.Fatalf("clip altered a short string: %q", got)
 	}
 }

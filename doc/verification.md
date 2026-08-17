@@ -107,6 +107,18 @@ static analysis for everything else.
 28d. a reconciliation answer that does not name the attempt it describes, or reports FINISHED
     without a disposition, is treated as unknown — spending a recovery rather than an attempt,
     and never adopting a state that belongs to another run;
+28e. a drain stops CLAIMING and keeps RENEWING, so an in-flight lease cannot expire inside the
+    drain window and leave work only a stopped recovery pass could clear;
+28f. retirement settles expired work owned by a crashed instance as well as its own, without
+    adopting anything — a running handler is left held, which is quiescence reporting
+    correctly rather than failing to clean up;
+28g. executor-supplied strings are bounded before they reach a column, so a long message
+    cannot make a terminal write fail identically on every retry and turn a success into a
+    recorded timeout;
+28h. an OK dispatch acknowledgement naming a different execution or attempt is unknown, not
+    accepted;
+28i. retiring a generation records an observation for it, so the acknowledgement half of the
+    cutover gate is satisfied by an answer rather than by a liveness timeout;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

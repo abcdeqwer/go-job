@@ -253,7 +253,7 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) Result {
 	defer cancel()
 
 	resp, err := gojobv1.NewJobExecutorClient(cc).Run(callCtx, req)
-	return classifyRun(resp, err)
+	return classifyRun(resp, err, spec)
 }
 
 // classifyRun maps a Run reply onto the three outcomes.
@@ -270,11 +270,28 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) Result {
 // lease and its recorded target, and either the bounded re-send or recovery resolves it. The
 // cost is that an executor which signals draining with a status rather than the field pays one
 // re-send cycle. That is the right direction to be wrong in.
-func classifyRun(resp *gojobv1.RunResponse, err error) Result {
+func classifyRun(resp *gojobv1.RunResponse, err error, sent RunSpec) Result {
 	if err == nil {
 		if resp.GetRefused() {
 			return Result{Answer: Refused, Code: codes.OK,
 				Err: fmt.Errorf("executor declined: %s", resp.GetRefusalReason())}
+		}
+		// An acceptance must be about the dispatch that was sent.
+		//
+		// Both identity fields are optional in practice — an executor may echo neither, and
+		// an empty response is deliberately still an acceptance, because requiring the echo
+		// would break conforming executors that simply do not send it. But a NON-EMPTY value
+		// that disagrees is a different matter: it says the executor answered about some
+		// other execution or some other attempt. Read as acceptance, the row goes `running`
+		// and charges an attempt for work nobody took, then waits for a result that cannot
+		// arrive until silence or recovery clears it.
+		if k := resp.GetExecutionKey(); k != "" && k != sent.ExecutionKey {
+			return Result{Answer: Unknown, Code: codes.OK,
+				Err: fmt.Errorf("executor answered about execution %q, not %q", k, sent.ExecutionKey)}
+		}
+		if tok := resp.GetRunToken(); tok != "" && tok != sent.RunToken {
+			return Result{Answer: Unknown, Code: codes.OK, HeldToken: tok,
+				Err: fmt.Errorf("executor answered about attempt %q, not %q", tok, sent.RunToken)}
 		}
 		return Result{Answer: Accepted, Code: codes.OK}
 	}

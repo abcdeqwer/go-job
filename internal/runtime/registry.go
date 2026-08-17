@@ -216,7 +216,7 @@ func (r *Registry) Stop() {
 	// recover it, and releasing early guarantees a second executor may start beside a handler
 	// that has not proved it stopped.
 	for _, t := range tenants {
-		r.retire(context.Background(), t, "shutdown", false)
+		r.retire(context.Background(), t, "shutdown", false, 0)
 	}
 	_ = r.disp.Close()
 }
@@ -235,11 +235,13 @@ func (r *Registry) reconcile(ctx context.Context) {
 	r.fence.Refresh()
 
 	want := make(map[string]control.Tenant, len(rows))
+	registered := make(map[string]int64, len(rows))
 	r.mu.Lock()
 	for _, t := range rows {
 		if g := r.seen[t.Name]; t.Generation > g {
 			r.seen[t.Name] = t.Generation
 		}
+		registered[t.Name] = t.Generation
 		if t.Enabled {
 			want[t.Name] = t
 		}
@@ -289,8 +291,11 @@ func (r *Registry) reconcile(ctx context.Context) {
 			if keep {
 				reason = fmt.Sprintf("generation moved %d -> %d", t.generation, w.Generation)
 			}
-			retiring, why := t, reason
-			r.goTracked(func() { r.retire(ctx, retiring, why, true) })
+			// The generation being retired FOR, which is the one a cutover is waiting to
+			// see acknowledged. A disabled tenant is absent from `want`, so it has to come
+			// from the registry rows directly.
+			retiring, why, ack := t, reason, registered[name]
+			r.goTracked(func() { r.retire(ctx, retiring, why, true, ack) })
 			delete(have, name)
 		}
 	}
@@ -474,7 +479,8 @@ func (r *Registry) releaseContext(parent context.Context) (context.Context, cont
 // handler that has not proved it stopped keeps its lease until it expires: expiry is not proof
 // a handler stopped, but releasing early is a guarantee that a second executor may start while
 // the first is still writing.
-func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHeld bool) {
+func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHeld bool,
+	ackGeneration int64) {
 	r.log.Info("retiring tenant", "tenant", t.name, "reason", why,
 		"still_tracking", t.engine.Tracking())
 
@@ -542,6 +548,25 @@ func (r *Registry) retire(ctx context.Context, t *tenant, why string, releaseHel
 	t.cancel()
 	if err := t.db.Close(); err != nil {
 		r.log.Warn("closing a tenant pool failed", "tenant", t.name, "error", err)
+	}
+
+	// Acknowledge the generation this retirement was FOR.
+	//
+	// The acknowledgement half of the cutover gate is worth nothing without this. `want` holds
+	// only enabled tenants, so a disable was never observed at its new generation: every
+	// replica kept a blocker at the PREVIOUS one, and the cutover could not proceed until
+	// those observations aged out of the liveness window. A gate that is satisfied by
+	// forgetting about live instances is not the gate the design describes — it is a timeout
+	// wearing its name, and it imposes a full liveness delay on every cutover.
+	//
+	// Written after the engine has stopped and the tenant is out of the map, so `quiesced`
+	// reflects a retirement that has actually finished. Detached and separately bounded for
+	// the same reason the release is: this is the last thing anyone will say about this
+	// tenant, and losing it costs an operator the wait it was meant to remove.
+	if ackGeneration > 0 {
+		ackCtx, cancelAck := r.releaseContext(ctx)
+		r.observe(ackCtx, t.name, ackGeneration)
+		cancelAck()
 	}
 }
 

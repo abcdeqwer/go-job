@@ -178,7 +178,7 @@ func TestHoldRemainingGatesDispatch(t *testing.T) {
 	}
 }
 
-// The heartbeat must refresh the ownership proof the dispatch gate reads.
+// The heartbeat's two guards and its one obligation, read off the source.
 //
 // This is a source-reading test because nothing else can reach the seam. The renewal path
 // needs a live store, and the gate's dependence on it only shows up when a routing decision
@@ -189,7 +189,7 @@ func TestHoldRemainingGatesDispatch(t *testing.T) {
 // It exists because that is exactly what happened. The refresh was written into a patch aimed
 // at the wrong file, applied to nothing, and shipped in a commit that described it — leaving
 // holdRemaining measuring from the claim alone.
-func TestHeartbeatRefreshesTheOwnershipProof(t *testing.T) {
+func TestHeartbeatGuardsAndObligations(t *testing.T) {
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
@@ -198,7 +198,7 @@ func TestHeartbeatRefreshesTheOwnershipProof(t *testing.T) {
 		t.Fatalf("parse package: %v", err)
 	}
 
-	found := false
+	calls := map[string]bool{}
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			for _, decl := range file.Decls {
@@ -207,21 +207,72 @@ func TestHeartbeatRefreshesTheOwnershipProof(t *testing.T) {
 					continue
 				}
 				ast.Inspect(fd.Body, func(n ast.Node) bool {
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "confirmHold" {
-						found = true
+					if call, ok := n.(*ast.CallExpr); ok {
+						if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+							calls[sel.Sel.Name] = true
+						}
 					}
 					return true
 				})
 			}
 		}
 	}
-	if !found {
-		t.Fatal("heartbeatPass does not call confirmHold; the dispatch gate would then measure " +
+	if !calls["confirmHold"] {
+		t.Error("heartbeatPass does not call confirmHold; the dispatch gate would then measure " +
 			"only from the claim, and a routing decision slower than four fifths of a lease " +
 			"would be refused while that lease is being renewed normally")
 	}
+	if !calls["renewing"] {
+		t.Error("heartbeatPass does not guard on renewing(); without it the heartbeat has no " +
+			"control-fence check at all, and a fenced instance would keep an owner alive that " +
+			"the control plane has already written off")
+	}
+	if calls["stopping"] {
+		t.Error("heartbeatPass guards on stopping(), which is also true during a DRAIN. " +
+			"Renewal must continue through a drain: a legal ten-second lease otherwise expires " +
+			"inside the fifteen-second drain window, the release refuses it as recovery's " +
+			"business, and every recovery pass for that tenant has already stopped")
+	}
 }
+
+// Draining must not stop lease renewal.
+//
+// StopClaiming and Stop are deliberately different: the first halts acquisition and leaves
+// the heartbeat running, because leases of what is already in flight have to stay live or the
+// owner loses the right to release its own work — and with every engine for that tenant
+// retiring, nothing is left to recover it. Reading the claim signal in the heartbeat collapsed
+// the two, so a drain silently stopped renewing: a legal ten-second lease expired inside the
+// fifteen-second drain, ReleaseAsOwner then refused the row because expired work belongs to a
+// recovery pass that had already stopped, and the job stayed held for ever — taking quiescence,
+// and the DSN cutover it gates, with it.
+func TestDrainingStopsClaimingButNotRenewing(t *testing.T) {
+	e := &Engine{
+		tracked:   map[int64]held{},
+		stopClaim: make(chan struct{}),
+		stop:      make(chan struct{}),
+		fence:     alwaysHealthy{},
+	}
+
+	if e.stopping() || !e.renewing() {
+		t.Fatal("a running engine should be both claiming and renewing")
+	}
+
+	e.StopClaiming()
+	if !e.stopping() {
+		t.Fatal("StopClaiming did not stop claiming")
+	}
+	if !e.renewing() {
+		t.Fatal("StopClaiming stopped renewal; the drain cannot then release its own work, " +
+			"and nothing else is left to recover it")
+	}
+
+	e.Stop()
+	if e.renewing() {
+		t.Fatal("Stop did not stop renewal")
+	}
+}
+
+type alwaysHealthy struct{}
+
+func (alwaysHealthy) Check() error  { return nil }
+func (alwaysHealthy) Healthy() bool { return true }

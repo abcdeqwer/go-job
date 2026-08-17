@@ -280,6 +280,29 @@ func (e *Engine) stopping() bool {
 	return e.fence.Check() != nil
 }
 
+// renewing reports whether this instance may still RENEW what it already holds, which is a
+// different question from whether it may take on more.
+//
+// The drain depends on the difference. StopClaiming halts acquisition and leaves the
+// heartbeat running deliberately: leases of what is already in flight have to stay live, or
+// the owner loses the right to release its own work — and with every engine for that tenant
+// retiring, nothing is left to recover it. Checking `stopping()` in the heartbeat collapsed
+// the two, so a drain silently stopped renewal, a legal ten-second lease expired inside the
+// fifteen-second drain, and ReleaseAsOwner then refused the row because expired work belongs
+// to a recovery pass that had already stopped. The job stayed held for ever, and quiescence —
+// hence the DSN cutover it gates — became unreachable.
+//
+// The control fence still applies, and must: renewing after it lapses is the one write that
+// preserves an owner nobody can see.
+func (e *Engine) renewing() bool {
+	select {
+	case <-e.stop:
+		return false
+	default:
+	}
+	return e.fence.Check() == nil
+}
+
 // safely runs one pass and turns a panic into a logged error rather than a dead loop.
 //
 // A panic in one pass must not take the scheduler down: the other loops are still holding
@@ -484,10 +507,22 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 		if !e.releasePage(ctx, owned) {
 			// Nothing in the page could be released — every row was contended or failing.
 			// Looping again would spin on the same rows.
-			return
+			break
 		}
 	}
-	e.log.Error("gave up releasing owned work after a hundred pages; some rows remain held")
+
+	// And a last recovery sweep, because "owned by me" is not the whole of what is left.
+	//
+	// An instance that crashed holding an execution leaves an expired lease that only a
+	// recovery pass can clear. If the tenant is disabled before any surviving instance's next
+	// recovery tick, every replica runs this owner-local release, finds nothing of its own,
+	// and closes its pool. The dead instance's row stays held for ever — and quiescence, which
+	// the DSN cutover gates on, can never become true.
+	//
+	// Owner-local release first, this second: what this instance holds it can end directly,
+	// while somebody else's expired work has to go through reconciliation, which is slower and
+	// may not reach a conclusion at all.
+	e.recoverStale(ctx, false)
 }
 
 // releasePage releases one page, reporting whether it made any progress.
@@ -532,8 +567,9 @@ func (e *Engine) Tracking() int {
 func (e *Engine) heartbeatPass(ctx context.Context) {
 	for _, h := range e.holders() {
 		// A renewal after the fence lapsed is the single worst write this instance can make:
-		// it keeps an owner alive that the control plane has already concluded is gone.
-		if e.stopping() {
+		// it keeps an owner alive that the control plane has already concluded is gone. But a
+		// DRAIN is not that: it must keep renewing, or it cannot release its own work.
+		if !e.renewing() {
 			return
 		}
 		lease := e.leaseSecondsFor(ctx, h.JobName)

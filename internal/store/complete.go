@@ -37,10 +37,51 @@ type Outcome struct {
 // finished, and recording that as `cancelled` would tell an operator the opposite of the
 // truth about a job that may have moved money. The audit trail keeps the request, so "we
 // asked, but it had already finished" stays visible.
+// Column widths for the executor-supplied strings, and the reason they are enforced HERE.
+//
+// An executor is a separate project in some other language, and nothing stops it reporting a
+// stack trace as its summary. Passed through, a 513-character summary makes the terminal
+// transaction fail with "Data too long" under MySQL's default strict mode — and it fails the
+// same way every time. The callback retries and fails; recovery adopts the executor's FINISHED
+// answer and fails; and the execution eventually records a timeout or a silence expiry instead
+// of the success it actually had, after which it may be run again. A result is lost because a
+// message was long.
+//
+// Truncation is what the contract already promises ("Truncated by the scheduler; do not rely
+// on it being complete"), and it is applied at the store boundary rather than at the two
+// callers so that a third path cannot be added without it.
+const (
+	maxFailureKind = 48
+	maxMessage     = 512
+)
+
+// clipped bounds every executor-supplied string to what its column can hold.
+func (o Outcome) clipped() Outcome {
+	o.FailureKind = clip(o.FailureKind, maxFailureKind)
+	o.ErrorMessage = clip(o.ErrorMessage, maxMessage)
+	o.ResultSummary = clip(o.ResultSummary, maxMessage)
+	return o
+}
+
+// clip truncates to n RUNES, because the columns are VARCHAR(n) — which MySQL counts in
+// characters — and cutting a UTF-8 sequence in the middle produces bytes the column will
+// reject just as firmly as the length would have.
+func clip(s string, n int) string {
+	if len(s) <= n { // bytes <= runes, so this is the common case and needs no decoding
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
 func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 	if !o.Status.Terminal() {
 		return fmt.Errorf("%w: Complete called with non-terminal status %q", gojob.ErrProtocol, o.Status)
 	}
+	o = o.clipped()
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		if err := releaseJobLock(ctx, tx, h, o.Status == gojob.StatusSuccess, now); err != nil {
@@ -106,6 +147,7 @@ func (s *Store) Complete(ctx context.Context, h Holder, o Outcome) error {
 // backoffSeconds is bounded, and jitter is applied by the caller after computing the base
 // delay so the sequence stays testable.
 func (s *Store) Retry(ctx context.Context, h Holder, o Outcome, backoffSeconds int) error {
+	o = o.clipped()
 	now := s.clock.Now()
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		// A retry is a failed attempt whether or not the budget is spent, so the state row
