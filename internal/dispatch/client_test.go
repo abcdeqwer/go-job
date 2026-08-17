@@ -131,6 +131,17 @@ func TestRunAcknowledgementMustNameTheDispatch(t *testing.T) {
 			ExecutionKey: "job:9:2026-08-17T00:00:00Z"}, Unknown},
 		{"echoes another attempt", &gojobv1.RunResponse{
 			ExecutionKey: sent.ExecutionKey, RunToken: "tok-1"}, Unknown},
+
+		// A REFUSAL naming other work is the dangerous half: refusal is the one verdict that
+		// releases the claim immediately, so a mismatched one is how a dispatch that may
+		// actually have been accepted gets a second handler started beside it.
+		{"refuses, naming another attempt", &gojobv1.RunResponse{
+			ExecutionKey: sent.ExecutionKey, RunToken: "tok-1", Refused: true}, Unknown},
+		{"refuses, naming another execution", &gojobv1.RunResponse{
+			ExecutionKey: "job:9", Refused: true}, Unknown},
+		{"refuses, echoing nothing", &gojobv1.RunResponse{Refused: true}, Refused},
+		{"refuses, echoing correctly", &gojobv1.RunResponse{
+			ExecutionKey: sent.ExecutionKey, RunToken: sent.RunToken, Refused: true}, Refused},
 	} {
 		if got := classifyRun(c.resp, nil, sent); got.Answer != c.want {
 			t.Errorf("%s: answer = %v, want %v (%v)", c.name, got.Answer, c.want, got.Err)

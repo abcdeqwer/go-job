@@ -610,6 +610,19 @@ func (e *Engine) recoverPass(ctx context.Context) {
 // running would track it, renew it for a few more seconds, and then stop — arriving back at
 // the same stranded row by a longer route. A genuinely running handler is left held, which is
 // the honest answer: the cutover SHOULD wait for it, and quiescence exists to say so.
+// mayRecover is the guard for a recovery pass, and it differs by WHY the pass is running.
+//
+// A normal pass must stop when claiming stops: taking on somebody else's work is acquisition.
+// The retirement pass runs precisely BECAUSE claiming has stopped, so it can only be bounded
+// by the two things that still mean "make no further write" — the full stop, and the control
+// fence.
+func (e *Engine) mayRecover(adopt bool) bool {
+	if adopt {
+		return !e.stopping()
+	}
+	return e.renewing()
+}
+
 func (e *Engine) recoverStale(ctx context.Context, adopt bool) {
 	stale, err := e.store.StaleExecutions(ctx, e.cfg.PageSize)
 	if err != nil {
@@ -617,12 +630,7 @@ func (e *Engine) recoverStale(ctx context.Context, adopt bool) {
 		return
 	}
 	for _, v := range stale {
-		// During retirement `stopping()` is true by construction — StopClaiming has run — so
-		// the guard is on the fence and the full stop instead.
-		if adopt && e.stopping() {
-			return
-		}
-		if !adopt && !e.renewing() {
+		if !e.mayRecover(adopt) {
 			return
 		}
 		e.recoverOne(ctx, v, adopt)
@@ -643,14 +651,31 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 
 	// An answer must be about THIS attempt, and must say which. A different run_token
 	// describes another attempt entirely; an ABSENT one proves nothing at all, and treating
-	// absence as agreement is how an answer about somebody else gets adopted. An executor
-	// still running token T1 that omits its token, against a row now holding T2, would have
-	// its "running" adopted as T2's — after which T2's real result is refused and a further
-	// attempt may be dispatched while T1 is still running.
+	// absence as agreement is how an answer about somebody else gets adopted.
 	//
-	// The response is non-conforming either way. Failing closed on it costs one recovery
-	// cycle; accepting it costs a concurrent handler.
+	// But "not about this attempt" and "tells us nothing" are different, and the difference
+	// decides whether the row may be RELEASED. `RUNNING` is an answer about the EXECUTION KEY:
+	// it says a handler for this key is running right now. Which attempt it belongs to decides
+	// whether this instance may adopt it — it does not change the fact that releasing the key
+	// would put a second handler beside a live one.
+	//
+	// That was the gap. An older attempt T1 recovered as unknown leaves the executor still
+	// running it; T2 is dispatched, the executor answers ALREADY_EXISTS naming T1, and the row
+	// stays `dispatching`. Reconciliation then reported RUNNING/T1, the mismatch erased the
+	// whole answer, and Resolve returned the row to `ready` — after which T3 went to a
+	// different executor while T1 was demonstrably still running, on the scheduler's own
+	// evidence.
 	if rec.Reachable && rec.RunToken != v.RunToken {
+		if rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING {
+			// Held, and deliberately not progressed. The runtime cap is what bounds this: the
+			// timeout scan does not care whose token is on the row, so a handler that never
+			// ends is still fenced at its cap rather than waited on for ever.
+			e.log.Warn("another attempt for this execution is still running on the executor; "+
+				"holding rather than releasing",
+				"execution", v.ExecutionKey, "held_by", rec.RunToken, "row_token", v.RunToken,
+				"executor", v.DispatchedTo)
+			return
+		}
 		e.log.Warn("executor's answer does not identify this attempt; treating as unknown",
 			"execution", v.ExecutionKey, "asked_about", v.RunToken, "answered_about", rec.RunToken)
 		rec = dispatch.Reconciliation{}
@@ -659,7 +684,12 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 	// Phase 2 was an RPC with its own deadline. Re-check before phase 3 writes: the fence can
 	// have lapsed during it, and adopting or resolving afterwards is precisely the invisible
 	// ownership the fence exists to stop.
-	if e.stopping() {
+	//
+	// mayRecover, not stopping(), and that distinction is the whole of the retirement sweep.
+	// During retirement StopClaiming has already run, so stopping() is unconditionally true —
+	// a guard here on it returns before Resolve, Adopt or any result is applied, and the
+	// sweep added to settle a crashed instance's work settles nothing at all.
+	if !e.mayRecover(adopt) {
 		return
 	}
 
@@ -819,8 +849,15 @@ func (e *Engine) resolveSilent(ctx context.Context, v store.Stale) {
 		}
 	}
 	if rec.Reachable && rec.RunToken != v.RunToken {
-		// Same rule as recovery: an answer that does not name THIS attempt proves nothing,
-		// whether it names another one or names none.
+		if rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING {
+			// Same rule as recovery: RUNNING is an answer about the KEY, and a key with a live
+			// handler must not be released whichever attempt holds it.
+			e.log.Warn("another attempt for this execution is still running; not expiring it",
+				"execution", v.ExecutionKey, "held_by", rec.RunToken, "row_token", v.RunToken)
+			return
+		}
+		// An answer that does not name THIS attempt otherwise proves nothing, whether it
+		// names another one or names none.
 		rec = dispatch.Reconciliation{}
 	}
 	if e.stopping() {

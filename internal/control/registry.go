@@ -224,7 +224,38 @@ var ErrNotQuiesced = errors.New("gojob: tenant is not quiesced; a DSN change wou
 // instance that is partitioned from THIS database and still perfectly able to reach the
 // tenant's — which is why the caller must additionally prove quiescence by looking at the old
 // coordination schema itself, and why an instance that cannot read this registry self-fences.
-func (s *Store) SetTenantDSN(ctx context.Context, name, dsn, schemaUUID, actor, reason string, quiescedElsewhere bool) error {
+// blockersTx is Blockers, inside a transaction that is about to act on the answer.
+//
+// The handler's earlier check is a snapshot, and everything after it — verifying the new
+// schema, opening a pool — takes time an instance can finish admitting in. Re-reading here
+// makes the gate and the write atomic with respect to every other control-plane writer.
+func blockersTx(ctx context.Context, tx *sql.Tx, tenant string, generation int64,
+	liveness time.Duration) ([]string, error) {
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT instance_id
+		FROM tenant_observation
+		WHERE tenant = ?
+		  AND observed_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
+		  AND NOT (generation >= ? AND quiesced = 1)
+		ORDER BY instance_id`, tenant, -roundUpSeconds(liveness), generation)
+	if err != nil {
+		return nil, fmt.Errorf("re-check blockers for %q: %w", tenant, err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan blocker: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetTenantDSN(ctx context.Context, name, dsn, schemaUUID, actor, reason string, quiescedElsewhere bool, liveness time.Duration) error {
 	if reason == "" {
 		return fmt.Errorf("%w: re-pointing a tenant needs a reason", gojob.ErrProtocol)
 	}
@@ -238,6 +269,27 @@ func (s *Store) SetTenantDSN(ctx context.Context, name, dsn, schemaUUID, actor, 
 	now := s.clock.Now()
 
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		// The gate, re-read here rather than trusted from the caller's earlier snapshot.
+		//
+		// Between that snapshot and this write the handler verifies the new schema and opens a
+		// pool, which is time enough for an instance to finish admitting the OLD one and start
+		// an engine against it. Read inside the transaction, the answer cannot go stale before
+		// the DSN moves.
+		var generation int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT generation FROM tenant_registry WHERE tenant = ? FOR UPDATE`,
+			name).Scan(&generation); err != nil {
+			return fmt.Errorf("read generation of %q: %w", name, err)
+		}
+		blockers, err := blockersTx(ctx, tx, name, generation, liveness)
+		if err != nil {
+			return err
+		}
+		if len(blockers) > 0 {
+			return fmt.Errorf("%w: %s is still held by %s", ErrNotQuiesced, name,
+				strings.Join(blockers, ", "))
+		}
+
 		res, err := tx.ExecContext(ctx, `
 			UPDATE tenant_registry
 			SET coordination_dsn = ?, schema_uuid = ?, schema_version = NULL,

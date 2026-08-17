@@ -256,7 +256,7 @@ func TestDSNChangeRequiresDisableFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", true)
+	err = ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", true, 30*time.Second)
 	if err == nil {
 		t.Fatal("re-pointed an ENABLED tenant; a cutover must be disable, prove, then change")
 	}
@@ -264,7 +264,7 @@ func TestDSNChangeRequiresDisableFirst(t *testing.T) {
 	if err := ctl.SetTenantEnabled(ctx, "np", false, "test", "preparing a cutover"); err != nil {
 		t.Fatal(err)
 	}
-	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", true); err != nil {
+	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", true, 30*time.Second); err != nil {
 		t.Fatalf("re-pointing a disabled, quiescent tenant failed: %v", err)
 	}
 
@@ -299,7 +299,7 @@ func TestSetTenantDSNRefusesWhenNotQuiescent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", false); err == nil {
+	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2", "test", "moving schemas", false, 30*time.Second); err == nil {
 		t.Fatal("re-pointed a tenant that was not proven quiescent")
 	}
 }
@@ -360,5 +360,54 @@ func TestAdmissionChecksTheClockContract(t *testing.T) {
 	}
 	if !errors.Is(err, gojob.ErrTimeZone) {
 		t.Fatalf("refusal was not reported as a time-zone error: %v", err)
+	}
+}
+
+// A cutover must be refused by a blocker that appeared AFTER the caller's own check.
+//
+// The handler's blocker check is a snapshot, and what follows it — verifying the new schema,
+// opening a pool — takes time. An instance that was mid-admission during the snapshot has no
+// observation row at all, so it blocks nothing; it then finishes, publishes, starts an engine
+// against the OLD DSN, and records its observation. If the cutover writes after that, two
+// schemas serve one tenant.
+//
+// The registry now re-reads the gate inside the transaction that moves the DSN, so an
+// observation written at any point before the commit is seen.
+func TestCutoverRefusesABlockerThatAppearedLate(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+
+	key := make([]byte, 32)
+	ctl, err := control.New(db, clock, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.AddTenant(ctx, "np", "u:p@tcp(a:3306)/x", "uuid-1", "test", "adding"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.SetTenantEnabled(ctx, "np", false, "test", "preparing a cutover"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Generation is now 2. A late instance declares itself at the OLD generation, not
+	// quiesced — exactly what an admission in flight records before it publishes.
+	if err := ctl.Observe(ctx, "np", "late-instance", 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The caller says it checked and found nothing, which was true when it looked.
+	err = ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2",
+		"test", "moving schemas", true, 30*time.Second)
+	if !errors.Is(err, control.ErrNotQuiesced) {
+		t.Fatalf("the cutover was accepted with a live blocker: %v", err)
+	}
+
+	// Once that instance reports the new generation and quiet, the cutover proceeds.
+	if err := ctl.Observe(ctx, "np", "late-instance", 2, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.SetTenantDSN(ctx, "np", "u:p@tcp(b:3306)/y", "uuid-2",
+		"test", "moving schemas", true, 30*time.Second); err != nil {
+		t.Fatalf("the cutover was refused after every instance acknowledged: %v", err)
 	}
 }

@@ -276,3 +276,52 @@ type alwaysHealthy struct{}
 
 func (alwaysHealthy) Check() error  { return nil }
 func (alwaysHealthy) Healthy() bool { return true }
+
+// Every guard on the retirement recovery path must be the retirement guard.
+//
+// The pass runs precisely because claiming has stopped, so any `stopping()` left on the path
+// is unconditionally true during retirement and returns before anything is settled. That is
+// exactly what happened when the sweep was added: the outer loop was written with the right
+// predicate, `recoverOne` kept the wrong one, and the whole sweep did nothing while looking
+// correct. It needs a crashed instance, a disable, and a real database to observe — none of
+// which any test here has — so this reads the source.
+func TestRecoveryPathUsesTheRetirementGuard(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	onPath := map[string]bool{"recoverStale": true, "recoverOne": true, "adoptResult": true}
+	seen := map[string]bool{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Body == nil || !onPath[fd.Name.Name] {
+					continue
+				}
+				seen[fd.Name.Name] = true
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "stopping" {
+						t.Errorf("%s: %s guards on stopping(); during retirement that is always "+
+							"true, so the sweep returns before settling anything — use "+
+							"mayRecover(adopt)", fset.Position(sel.Pos()), fd.Name.Name)
+					}
+					return true
+				})
+			}
+		}
+	}
+	for name := range onPath {
+		if !seen[name] {
+			t.Errorf("%s was not found; this test is checking a function that no longer exists", name)
+		}
+	}
+}

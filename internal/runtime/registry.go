@@ -330,6 +330,18 @@ func (r *Registry) reconcile(ctx context.Context) {
 		// engine: a "stopped" registry claiming and dispatching, with a pool nothing will
 		// ever close, against a dispatch client Stop has already closed.
 		admitting := w
+		// Declare the intent BEFORE doing any of the work.
+		//
+		// Admission is asynchronous: a pool, a schema check, a clock check. An instance in
+		// that window has no observation row at all, so a cutover started meanwhile sees no
+		// blocker from it, finds the old schema quiet, and proceeds — after which this
+		// admission finishes, publishes, and starts an engine against the OLD DSN. Two
+		// schemas then serve one tenant, which is the exact split brain the whole cutover
+		// procedure exists to prevent.
+		//
+		// Recorded as NOT quiesced at the generation being admitted, which is what it is: an
+		// instance about to hold work for that generation.
+		r.observeAs(ctx, admitting.Name, admitting.Generation, false)
 		r.goTracked(func() {
 			defer r.endAdmit(admitting.Name)
 			if err := r.admit(ctx, admitting); err != nil {
@@ -375,6 +387,12 @@ func (r *Registry) observe(ctx context.Context, name string, generation int64) {
 	if t != nil {
 		quiesced = t.engine.Tracking() == 0
 	}
+	r.observeAs(ctx, name, generation, quiesced)
+}
+
+// observeAs records an observation with an explicit quiescence, for the cases where the answer
+// is known without looking at an engine — there is none yet, or there is no longer one.
+func (r *Registry) observeAs(ctx context.Context, name string, generation int64, quiesced bool) {
 	if err := r.control.Observe(ctx, name, r.opts.InstanceID, generation, quiesced); err != nil {
 		r.log.Warn("recording an observation failed", "tenant", name, "error", err)
 	}

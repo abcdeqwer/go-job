@@ -119,6 +119,12 @@ static analysis for everything else.
     accepted;
 28i. retiring a generation records an observation for it, so the acknowledgement half of the
     cutover gate is satisfied by an answer rather than by a liveness timeout;
+28j. an execution key with a live handler is never released, whichever attempt holds it: a
+    reconciliation reporting RUNNING under a DIFFERENT token holds the row rather than
+    resolving it, and the runtime cap remains the bound;
+28k. an instance that is still ADMITTING blocks a cutover, and the gate is re-read inside the
+    transaction that moves the DSN — a snapshot taken before the new schema was verified is
+    not evidence at the moment of the write;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

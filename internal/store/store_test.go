@@ -936,6 +936,47 @@ func TestEverySQLArgumentIsInspectable(t *testing.T) {
 	}
 }
 
+// This package does not use prepared statements, and must not start.
+//
+// A *sql.Stmt carries its SQL from wherever it was prepared, and the call that runs it —
+// `stmt.ExecContext(ctx, args...)` — has no statement argument at all. Every rule in this file
+// reads statements out of call sites, so a prepared statement is text no rule can reach: the
+// fence, clock, write_seq and lock-order audits would all pass on a method that executes
+// arbitrary SQL.
+//
+// There is no reason to want one here. The driver interpolates arguments on the wire, none of
+// these statements is executed in a tight enough loop for preparation to matter, and the
+// tenant pools are opened from operator-supplied DSNs where a server-side statement cache is
+// one more thing to reason about. So the rule is that there are none, which is a far cheaper
+// rule to check than following a *sql.Stmt to its use.
+func TestPreparedStatementsAreNotUsed(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				switch sel.Sel.Name {
+				case "Prepare", "PrepareContext", "Stmt", "StmtContext":
+					t.Errorf("%s: %s prepares or re-binds a statement; its SQL then lives "+
+						"somewhere no rule in this file can read",
+						fset.Position(sel.Pos()), sel.Sel.Name)
+				}
+				return true
+			})
+		}
+	}
+}
+
 // A statement-running method may only ever be CALLED, never referred to.
 //
 // `exec := tx.ExecContext` compiles, and the call that follows has an identifier for its

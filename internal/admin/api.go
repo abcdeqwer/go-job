@@ -416,7 +416,7 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 			reason, queued)
 	}
 	return a.control.SetTenantDSN(r.Context(), name, body.DSN, body.SchemaUUID,
-		ActorFrom(r.Context()), reason, quiet)
+		ActorFrom(r.Context()), reason, quiet, a.cfg.InstanceLiveness)
 }
 
 // oldSchemaQuiescent opens the tenant's CURRENT coordination schema and asks it directly.

@@ -272,19 +272,19 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) Result {
 // re-send cycle. That is the right direction to be wrong in.
 func classifyRun(resp *gojobv1.RunResponse, err error, sent RunSpec) Result {
 	if err == nil {
-		if resp.GetRefused() {
-			return Result{Answer: Refused, Code: codes.OK,
-				Err: fmt.Errorf("executor declined: %s", resp.GetRefusalReason())}
-		}
-		// An acceptance must be about the dispatch that was sent.
+		// Identity FIRST, before either verdict.
 		//
-		// Both identity fields are optional in practice — an executor may echo neither, and
-		// an empty response is deliberately still an acceptance, because requiring the echo
-		// would break conforming executors that simply do not send it. But a NON-EMPTY value
-		// that disagrees is a different matter: it says the executor answered about some
-		// other execution or some other attempt. Read as acceptance, the row goes `running`
-		// and charges an attempt for work nobody took, then waits for a result that cannot
-		// arrive until silence or recovery clears it.
+		// Both echo fields are optional in practice — an executor may send neither, and an
+		// empty response is deliberately still a valid answer, because requiring the echo
+		// would break conforming executors that do not send it. But a NON-EMPTY value that
+		// disagrees says the executor answered about some other execution or some other
+		// attempt, and that disqualifies the response as evidence of ANYTHING about this one.
+		//
+		// A refusal is the more dangerous half. Refusal is the one verdict that releases a
+		// claim and lets the job be routed elsewhere immediately; a mismatched refusal is
+		// therefore how a dispatch that may in fact have been ACCEPTED gets a second handler
+		// started beside it. Checking identity only on the acceptance path guarded the
+		// cheaper mistake and left the expensive one open.
 		if k := resp.GetExecutionKey(); k != "" && k != sent.ExecutionKey {
 			return Result{Answer: Unknown, Code: codes.OK,
 				Err: fmt.Errorf("executor answered about execution %q, not %q", k, sent.ExecutionKey)}
@@ -292,6 +292,10 @@ func classifyRun(resp *gojobv1.RunResponse, err error, sent RunSpec) Result {
 		if tok := resp.GetRunToken(); tok != "" && tok != sent.RunToken {
 			return Result{Answer: Unknown, Code: codes.OK, HeldToken: tok,
 				Err: fmt.Errorf("executor answered about attempt %q, not %q", tok, sent.RunToken)}
+		}
+		if resp.GetRefused() {
+			return Result{Answer: Refused, Code: codes.OK,
+				Err: fmt.Errorf("executor declined: %s", resp.GetRefusalReason())}
 		}
 		return Result{Answer: Accepted, Code: codes.OK}
 	}
