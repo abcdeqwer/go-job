@@ -984,18 +984,33 @@ func (e *Engine) silenceSeconds() int {
 // and make the call, and that something is every instance, repeatedly — Cancel is idempotent
 // and an executor that no longer has it answers NOT_FOUND, which this treats as done.
 func (e *Engine) cancelPass(ctx context.Context) {
-	rows, err := e.store.CancelRequested(ctx, e.cfg.PageSize)
-	if err != nil {
-		e.log.Error("cancel scan failed", "error", err)
-		return
-	}
-	for _, v := range rows {
-		// A holding loop: an operator's cancel must still reach its executor during a drain.
-		if !e.renewing() {
+	// Paged to the END, not one page from the lowest ids.
+	//
+	// Rows stay `cancel_requested` until their handler actually stops, which for a stuck or
+	// unreachable executor is never. A single page taken from the lowest ids therefore re-sent
+	// the same hundred stop requests on every pass, and a cancel an operator issued a minute
+	// ago — higher id — was never sent at all.
+	var after int64
+	for page := 0; page < 100; page++ {
+		rows, err := e.store.CancelRequested(ctx, after, e.cfg.PageSize)
+		if err != nil {
+			e.log.Error("cancel scan failed", "error", err)
 			return
 		}
-		e.requestStop(ctx, v, "cancelled by an operator")
+		if len(rows) == 0 {
+			return
+		}
+		for _, v := range rows {
+			// A holding loop: an operator's cancel must still reach its executor during a drain.
+			if !e.renewing() {
+				return
+			}
+			e.requestStop(ctx, v, "cancelled by an operator")
+			after = v.ID
+		}
 	}
+	e.log.Warn("stopped relaying cancels after a hundred pages; the rest wait for the next pass",
+		"resumed_after_id", after)
 }
 
 // requestStop relays a stop to whichever executor holds an execution.

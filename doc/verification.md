@@ -164,6 +164,8 @@ static analysis for everything else.
     silence scan can see it and the attempt budget is charged once;
 28aa. a terminally retired tenant answers callbacks NOT_FOUND rather than UNAVAILABLE for
     ever, so an executor holding a result stops retrying into a tenant that is gone;
+28ab. the cancel relay pages to the END with a cursor: a stuck executor's lingering
+    `cancel_requested` rows cannot starve every cancellation issued after them;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;

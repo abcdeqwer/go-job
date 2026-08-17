@@ -289,6 +289,42 @@ func TestOwnershipColumnsUseDatabaseClock(t *testing.T) {
 	}
 }
 
+// stripComments removes SQL comments before anything else looks at a statement.
+//
+// A comment is not SQL, and every rule here was reading it as though it were — in both
+// directions. `"/* handoff */ UPDATE job_execution SET status='running' WHERE id=?"` is valid
+// MySQL and a plain inspectable literal, but looksLikeSQL tests the FIRST keyword, so a
+// leading comment removed the statement from the fence, write_seq, clock and lock-order audits
+// at once. And in the other direction, an exempting predicate written inside a comment would
+// have excused a statement it does not constrain.
+//
+// Line comments end at a newline; the caller normalises whitespace afterwards, so removing the
+// comment body and leaving the newline is enough.
+func stripComments(sql string) string {
+	var b strings.Builder
+	for i := 0; i < len(sql); i++ {
+		switch {
+		case strings.HasPrefix(sql[i:], "/*"):
+			end := strings.Index(sql[i+2:], "*/")
+			if end < 0 {
+				return b.String()
+			}
+			i += 2 + end + 1
+			b.WriteByte(' ')
+		case strings.HasPrefix(sql[i:], "--"):
+			nl := strings.IndexByte(sql[i:], '\n')
+			if nl < 0 {
+				return b.String()
+			}
+			i += nl
+			b.WriteByte('\n')
+		default:
+			b.WriteByte(sql[i])
+		}
+	}
+	return b.String()
+}
+
 // maskLiterals blanks the CONTENTS of every quoted string in a statement.
 //
 // The fence and write_seq rules ask whether a statement contains a predicate or an assignment,
@@ -1287,9 +1323,9 @@ func statementArg(name string) (int, bool) {
 // something it should.
 func literalValue(lit *ast.BasicLit) string {
 	if v, err := strconv.Unquote(lit.Value); err == nil {
-		return v
+		return stripComments(v)
 	}
-	return strings.Trim(lit.Value, "`\"")
+	return stripComments(strings.Trim(lit.Value, "`\""))
 }
 
 // stringConsts collects every string constant, package level or function local, KEYED BY

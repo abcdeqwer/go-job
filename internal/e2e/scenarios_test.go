@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -662,5 +663,185 @@ func TestALiveExecutorIdCannotBeTakenOver(t *testing.T) {
 	}
 	if err := h.store.Register(ctx, impostor, 30); err != nil {
 		t.Fatalf("a lapsed id was not reusable: %v", err)
+	}
+}
+
+// Adopting a `dispatching` row the executor reports RUNNING must record the acceptance the
+// dead scheduler never did.
+//
+// Without it the row stays `dispatching`, which the silence scan does not read, so a handler
+// that later goes quiet is invisible until its runtime cap — days, for a job capped in days.
+// attempt_no stays zero, so the same failure repeated runs the work more times than
+// max_attempts allows, and deadline_at stays NULL, so there is no silence budget to elapse.
+//
+// It is also where MySQL's assignment order bites: UPDATE assignments are evaluated left to
+// right and each sees the previous ones' writes, so a promotion that assigned status first and
+// then tested `status = 'dispatching'` promoted the row and updated nothing else. That defect
+// is invisible to any test starting from an already-running row, which is why this one starts
+// from `dispatching`.
+func TestAdoptingADispatchingRowRecordsAcceptance(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	h.createJob(cronJob("adoptme", "0 0 0 1 1 *"), h.clock.Now().Add(24*time.Hour))
+	key, err := h.store.Trigger(ctx, "adoptme", "req-adopt-dispatch", "test", "because", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim it, leaving the row exactly where a scheduler that died before Accept leaves it:
+	// `dispatching`, no attempt charged, no deadline.
+	cands, err := h.store.ReadyCandidates(ctx, true, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c store.Candidate
+	for _, v := range cands {
+		if v.ExecutionKey == key {
+			c = v
+		}
+	}
+	if c.ExecutionKey == "" {
+		t.Fatal("the triggered execution was not claimable")
+	}
+
+	res, err := h.store.Claim(ctx, store.ClaimParams{
+		JobName: c.JobName, ExecutionID: c.ID, ExecutionKey: c.ExecutionKey,
+		Owner: "dead-instance", RunToken: "tok-adopt", BackoffSeconds: 5,
+		ExecutorID: "exec-1",
+	}, func(context.Context, *sql.Tx, gojob.Definition, store.StateRow) error { return nil })
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if res.Outcome != store.ClaimAcquired {
+		t.Fatalf("claim outcome = %v, want acquired", res.Outcome)
+	}
+
+	before, err := h.store.ExecutionByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Status != gojob.StatusDispatching {
+		t.Fatalf("status = %q, want dispatching", before.Status)
+	}
+
+	// Expire the lease so the row is adoptable, then adopt it as a RUNNING handler.
+	if _, err := h.db.ExecContext(ctx, `
+		UPDATE job_execution SET lease_until = TIMESTAMPADD(SECOND, -60, UTC_TIMESTAMP())
+		WHERE execution_key = ?`, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.ExecContext(ctx, `
+		UPDATE job_state SET lease_until = TIMESTAMPADD(SECOND, -60, UTC_TIMESTAMP())
+		WHERE job_name = 'adoptme'`); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := h.store.StaleExecutions(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target store.Stale
+	for _, v := range stale {
+		if v.ExecutionKey == key {
+			target = v
+		}
+	}
+	if target.ExecutionKey == "" {
+		t.Fatal("the expired execution was not returned by the stale scan")
+	}
+
+	if _, err := h.store.Adopt(ctx, target, "live-instance", 30, 45, true); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	after, err := h.store.ExecutionByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != gojob.StatusRunning {
+		t.Errorf("status = %q after adopting a running handler, want running", after.Status)
+	}
+	if after.AttemptNo != 1 {
+		t.Errorf("attempt_no = %d, want 1; the attempt ran and must be charged", after.AttemptNo)
+	}
+
+	var startedAt, deadlineAt sql.NullTime
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT started_at, deadline_at FROM job_execution WHERE execution_key = ?`,
+		key).Scan(&startedAt, &deadlineAt); err != nil {
+		t.Fatal(err)
+	}
+	if !startedAt.Valid {
+		t.Error("started_at is still NULL after adoption")
+	}
+	if !deadlineAt.Valid {
+		t.Error("deadline_at is still NULL; the silence scan needs a deadline, so this " +
+			"execution would be invisible to it until its runtime cap")
+	}
+}
+
+// A slow cancel must not starve a later one.
+//
+// Rows stay `cancel_requested` until their handler actually stops, which for a stuck or
+// unreachable executor is never. A relay that always took one page from the lowest ids
+// therefore re-sent the same stop requests every pass, and a cancel issued a minute ago —
+// higher id — was never sent at all. One group of stuck executors could delay every unrelated
+// cancellation indefinitely.
+func TestCancelRelayReachesLaterRequests(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	// Three cancel-requested executions, and a page size of one.
+	var keys []string
+	for _, name := range []string{"c1", "c2", "c3"} {
+		h.createJob(cronJob(name, "0 0 0 1 1 *"), h.clock.Now().Add(24*time.Hour))
+		key, err := h.store.Trigger(ctx, name, "req-"+name, "test", "because", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.db.ExecContext(ctx, `
+			UPDATE job_execution
+			SET status = 'cancel_requested', dispatched_to = 'exec-1', run_token = ?
+			WHERE execution_key = ?`, "tok-"+name, key); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, key)
+	}
+
+	// One page at a time, walking the cursor, must reach all three.
+	seen := map[string]bool{}
+	var after int64
+	for page := 0; page < 10; page++ {
+		rows, err := h.store.CancelRequested(ctx, after, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, v := range rows {
+			seen[v.ExecutionKey] = true
+			after = v.ID
+		}
+	}
+	for _, key := range keys {
+		if !seen[key] {
+			t.Errorf("execution %q was never reached; the oldest page starves everything "+
+				"behind it", key)
+		}
+	}
+
+	// And without the cursor, the same page comes back for ever.
+	first, err := h.store.CancelRequested(ctx, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := h.store.CancelRequested(ctx, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || len(again) != 1 || first[0].ID != again[0].ID {
+		t.Fatal("the scan is not deterministic; this test's premise no longer holds")
 	}
 }

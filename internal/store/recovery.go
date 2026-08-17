@@ -195,21 +195,34 @@ func (s *Store) Adopt(ctx context.Context, v Stale, newOwner string,
 		// promote is false on the FINISHED path: chargeUnacceptedAttempt already accounts for
 		// an attempt whose result arrived while the row was still `dispatching`, and charging
 		// it here as well would count one run twice.
+		// The decision is made HERE, in Go, from the row this transaction already locked —
+		// not by testing `status = 'dispatching'` inside the SET clause.
+		//
+		// MySQL evaluates single-table UPDATE assignments left to right, and each one sees the
+		// values written by the ones before it. An earlier version assigned status first and
+		// then tested `status = 'dispatching'` in the assignments that followed, which by then
+		// read `running`: the row was promoted while attempt_no stayed 0, started_at stayed
+		// NULL and deadline_at stayed NULL — so the silence scan, which needs a deadline,
+		// could never see it, and the attempt was never charged. Reproducible on MySQL 8.4,
+		// and invisible to any test starting from an already-running row.
+		//
+		// A precomputed flag depends on no column at all, so no ordering can change it.
+		promoteNow := promote && cur.Status == gojob.StatusDispatching
+
 		res, err = tx.ExecContext(ctx, `
 			UPDATE job_execution
 			SET write_seq = write_seq + 1,
 			    owner_instance = ?, fence_epoch = ?,
-			    status      = IF(? AND status = 'dispatching', 'running', status),
-			    attempt_no  = IF(? AND status = 'dispatching', attempt_no + 1, attempt_no),
-			    started_at  = IF(? AND status = 'dispatching', COALESCE(started_at, ?), started_at),
-			    deadline_at = IF(? AND status = 'dispatching',
-			                     TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), deadline_at),
+			    attempt_no  = IF(?, attempt_no + 1, attempt_no),
+			    started_at  = IF(?, COALESCE(started_at, ?), started_at),
+			    deadline_at = IF(?, TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()), deadline_at),
+			    status      = IF(?, 'running', status),
 			    lease_until  = TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
 			    heartbeat_at = UTC_TIMESTAMP(), updated_at = ?
 			WHERE id = ? AND status IN ('dispatching', 'running', 'cancel_requested')
 			  AND run_token = ? AND fence_epoch = ?`,
 			newOwner, epoch,
-			promote, promote, promote, now, promote, silenceSeconds,
+			promoteNow, promoteNow, now, promoteNow, silenceSeconds, promoteNow,
 			leaseSeconds, now, v.ID, v.RunToken, v.FenceEpoch)
 		if err != nil {
 			return fmt.Errorf("adopt execution %d: %w", v.ID, err)
@@ -599,7 +612,12 @@ func (s *Store) ExecutionByKey(ctx context.Context, key string) (Stale, error) {
 // to the executor, and it cannot be the API call itself: the operator's request lands on
 // whichever scheduler instance the load balancer picked, which is usually not the one holding
 // the execution and may not be able to reach the executor at all.
-func (s *Store) CancelRequested(ctx context.Context, limit int) ([]Stale, error) {
+// afterID is a cursor. A cancel is a REQUEST that has to be repeated until the handler stops,
+// so rows linger here by design — and a page always taken from the lowest ids means a hundred
+// slow or unreachable ones are re-sent on every pass while a cancel issued a minute ago, with
+// a higher id, is never sent at all. One group of stuck executors could delay every later
+// cancellation indefinitely.
+func (s *Store) CancelRequested(ctx context.Context, afterID int64, limit int) ([]Stale, error) {
 	const q = `
 		SELECT id, execution_key, job_name, status,
 		       COALESCE(dispatched_to, ''), COALESCE(run_token, ''), fence_epoch,
@@ -610,9 +628,9 @@ func (s *Store) CancelRequested(ctx context.Context, limit int) ([]Stale, error)
 		       (deadline_at IS NOT NULL AND deadline_at < UTC_TIMESTAMP()),
 		       (lease_until IS NOT NULL AND lease_until >= UTC_TIMESTAMP())
 		FROM job_execution
-		WHERE status = 'cancel_requested' AND dispatched_to IS NOT NULL
+		WHERE status = 'cancel_requested' AND dispatched_to IS NOT NULL AND id > ?
 		ORDER BY id LIMIT ?`
-	return s.scanStale(ctx, q, limit)
+	return s.scanStale(ctx, q, afterID, limit)
 }
 
 // Silent lists executions whose SILENCE budget has elapsed while their lease is still fresh.
@@ -648,8 +666,8 @@ func (s *Store) Silent(ctx context.Context, limit int) ([]Stale, error) {
 }
 
 // scanStale runs one of the Stale-shaped queries above.
-func (s *Store) scanStale(ctx context.Context, query string, limit int) ([]Stale, error) {
-	rows, err := s.db.QueryContext(ctx, query, limit)
+func (s *Store) scanStale(ctx context.Context, query string, args ...any) ([]Stale, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("scan executions: %w", err)
 	}
