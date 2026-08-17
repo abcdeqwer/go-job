@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -641,6 +642,93 @@ func indexTopLevel(hay, needle string) int {
 	return -1
 }
 
+// A transaction handle is always called `tx`.
+//
+// The lock-order walker recognises a transactional statement by its receiver's SPELLING,
+// because deciding it properly needs type information the parser does not carry. That makes
+// the rule rename-sensitive: a new function writing `txn.ExecContext(...)` is simply not seen,
+// and it could take job_execution before job_state while TestCanonicalLockOrder passes.
+//
+// Rather than leave the guard silently dependent on a convention, the convention is checked.
+// Every *sql.Tx — parameter, named result, or short variable declaration — must be called
+// `tx`, and then "receiver named tx" is exactly "receiver that is a transaction".
+func TestTransactionHandlesAreNamedTx(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+
+	isTxType := func(e ast.Expr) bool {
+		star, ok := e.(*ast.StarExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := star.X.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		return ok && pkg.Name == "sql" && sel.Sel.Name == "Tx"
+	}
+	complain := func(pos token.Pos, name string) {
+		if name != "tx" && name != "_" {
+			t.Errorf("%s: a *sql.Tx named %q; the lock-order walker recognises transactional "+
+				"statements by the receiver being `tx`, so this one would not be checked",
+				fset.Position(pos), name)
+		}
+	}
+
+	var checked int
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				switch v := n.(type) {
+				case *ast.FuncType:
+					for _, group := range []*ast.FieldList{v.Params, v.Results} {
+						if group == nil {
+							continue
+						}
+						for _, f := range group.List {
+							if !isTxType(f.Type) {
+								continue
+							}
+							checked++
+							for _, name := range f.Names {
+								complain(name.Pos(), name.Name)
+							}
+						}
+					}
+				case *ast.AssignStmt:
+					// `tx, err := db.BeginTx(...)` — the handle enters here too.
+					for _, rhs := range v.Rhs {
+						call, ok := rhs.(*ast.CallExpr)
+						if !ok {
+							continue
+						}
+						sel, ok := call.Fun.(*ast.SelectorExpr)
+						if !ok || (sel.Sel.Name != "BeginTx" && sel.Sel.Name != "Begin") {
+							continue
+						}
+						checked++
+						if len(v.Lhs) > 0 {
+							if id, ok := v.Lhs[0].(*ast.Ident); ok {
+								complain(id.Pos(), id.Name)
+							}
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	if checked < 10 {
+		t.Fatalf("found only %d *sql.Tx bindings; the extractor is probably broken", checked)
+	}
+}
+
 // The canonical lock order is job_state then job_execution. A transaction that took them the
 // other way round would deadlock against every completion, and the deadlock needs two
 // transactions racing on one job to appear — so it shows up under production load and almost
@@ -756,7 +844,7 @@ func packageFunctions(t *testing.T) map[string]packageFunc {
 					switch q := call.Args[at].(type) {
 					case *ast.BasicLit:
 						if q.Kind == token.STRING {
-							pf.events = append(pf.events, tableEvents(strings.Trim(q.Value, "`\""))...)
+							pf.events = append(pf.events, tableEvents(literalValue(q))...)
 						}
 					case *ast.Ident:
 						if sql, ok := constIn(consts, fd.Name.Name, q.Name); ok {
@@ -1046,6 +1134,24 @@ func statementArg(name string) (int, bool) {
 	return 0, false
 }
 
+// literalValue is what a string literal MEANS, not how it is spelled.
+//
+// Trimming quotes off the source text left every escape in place, and an escape is enough to
+// hide a statement from all of these rules at once: `"\x55PDATE job_execution SET ..."` runs
+// as an UPDATE and reads, to a source-text extractor, as a string beginning `\x55PDATE` —
+// which looksLikeSQL does not recognise, so the fence, clock, write_seq and assignment audits
+// never see it, while the inspectability rule is satisfied because it is a plain literal.
+//
+// Unquote handles raw and interpreted literals alike. A literal it cannot decode is returned
+// as its source text, which can only make a rule fire on something it should not, never miss
+// something it should.
+func literalValue(lit *ast.BasicLit) string {
+	if v, err := strconv.Unquote(lit.Value); err == nil {
+		return v
+	}
+	return strings.Trim(lit.Value, "`\"")
+}
+
 // stringConsts collects every string constant, package level or function local, KEYED BY
 // SCOPE: a package-level `q` is ".q", one local to Claim is "Claim.q".
 //
@@ -1072,7 +1178,7 @@ func stringConsts(pkgs map[string]*ast.Package) map[string]string {
 						continue
 					}
 					if lit, ok := vs.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						out[scope+"."+name.Name] = strings.Trim(lit.Value, "`\"")
+						out[scope+"."+name.Name] = literalValue(lit)
 					}
 				}
 			}
@@ -1326,7 +1432,7 @@ func sqlStatementsInPackage(t *testing.T) []string {
 				if !ok || lit.Kind != token.STRING {
 					return true
 				}
-				if v := strings.Trim(lit.Value, "`\""); looksLikeSQL(v) {
+				if v := literalValue(lit); looksLikeSQL(v) {
 					out = append(out, v)
 				}
 				return true

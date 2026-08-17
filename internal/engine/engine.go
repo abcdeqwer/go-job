@@ -18,6 +18,7 @@ import (
 	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
+	gojobv1 "github.com/abcdeqwer/go-job/gen/gojob/v1"
 	"github.com/abcdeqwer/go-job/internal/cron"
 	"github.com/abcdeqwer/go-job/internal/dispatch"
 	"github.com/abcdeqwer/go-job/internal/store"
@@ -395,17 +396,25 @@ type held struct {
 }
 
 // track and untrack maintain the heartbeat set.
-func (e *Engine) track(h store.Holder) {
+//
+// `since` is the instant taken BEFORE the database call that proved ownership, not after it.
+// Stamping it afterwards is wrong in exactly the case the guard exists for: a process
+// suspended between the commit and this line resumes and records a proof dated to the resume,
+// so an ownership fact minutes old reads as seconds old, the dispatch gate passes, and the
+// stale attempt goes to an executor after another instance has already recovered it. Taken
+// before the call, the stamp can only ever be older than the truth, which is the safe
+// direction.
+func (e *Engine) track(h store.Holder, since time.Time) {
 	e.mu.Lock()
-	e.tracked[h.ExecutionID] = held{h: h, confirmed: time.Now()}
+	e.tracked[h.ExecutionID] = held{h: h, confirmed: since}
 	e.mu.Unlock()
 }
 
-// confirmHold records that ownership was just proved again.
-func (e *Engine) confirmHold(id int64, epoch int64) {
+// confirmHold records that ownership was proved again, as of `since` — see track.
+func (e *Engine) confirmHold(id int64, epoch int64, since time.Time) {
 	e.mu.Lock()
-	if cur, ok := e.tracked[id]; ok && cur.h.FenceEpoch == epoch {
-		cur.confirmed = time.Now()
+	if cur, ok := e.tracked[id]; ok && cur.h.FenceEpoch == epoch && since.After(cur.confirmed) {
+		cur.confirmed = since
 		e.tracked[id] = cur
 	}
 	e.mu.Unlock()
@@ -526,10 +535,49 @@ func (e *Engine) ReleaseOwnedWork(ctx context.Context) {
 }
 
 // releasePage releases one page, reporting whether it made any progress.
+// stillRunning asks the executor whether a handler for this execution is running now.
+//
+// Unreachable is NOT treated as running. That looks like the unsafe direction and is the
+// deliberate one: an executor nobody can reach is exactly the case where waiting is unbounded,
+// and holding for ever on a process that may have died turns every crashed executor into a
+// tenant that can never be re-pointed. Unknown work is ended rather than assumed complete,
+// which is the same judgement recovery makes.
+func (e *Engine) stillRunning(ctx context.Context, v store.Stale) bool {
+	if v.DispatchedTo == "" {
+		return false
+	}
+	addr, ok := e.addressOf(ctx, v.DispatchedTo)
+	if !ok {
+		return false
+	}
+	rec := e.disp.GetExecution(ctx, addr, e.cfg.Tenant, v.ExecutionKey, e.cfg.ReconcileDeadline)
+	return rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING
+}
+
 func (e *Engine) releasePage(ctx context.Context, owned []store.Stale) bool {
 	progress := false
 	for _, v := range owned {
 		e.requestStop(ctx, v, "the tenant was disabled")
+
+		// A stop REQUEST is not a stopped handler.
+		//
+		// Cancel acknowledges that the signal was delivered, nothing more: cancellation is
+		// cooperative, and a handler not watching its context never sees it. Ending the row
+		// anyway frees the job lock and erases every trace of an execution that may still be
+		// writing — after which the schema scans clean, the cutover proceeds, and the new
+		// schema dispatches the same logical job beside the handler that never stopped.
+		// Quiescence would be a forced database transition presented as proof.
+		//
+		// So this asks first. A RUNNING answer means the row cannot be ended; anything else
+		// means no handler is running. It is the same rule the retirement recovery sweep
+		// applies to another instance's work — the two were inconsistent, and this was the
+		// unsafe side.
+		if e.stillRunning(ctx, v) {
+			e.log.Warn("not releasing an execution whose handler is still running; the tenant "+
+				"cannot be certified quiescent until it stops",
+				"execution", v.ExecutionKey, "job", v.JobName, "executor", v.DispatchedTo)
+			continue
+		}
 
 		h := store.Holder{
 			JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
@@ -573,6 +621,8 @@ func (e *Engine) heartbeatPass(ctx context.Context) {
 			return
 		}
 		lease := e.leaseSecondsFor(ctx, h.JobName)
+		// Before the call, not after: see track.
+		proved := time.Now()
 		err := e.store.Renew(ctx, h, lease)
 		switch {
 		case err == nil:
@@ -581,7 +631,7 @@ func (e *Engine) heartbeatPass(ctx context.Context) {
 			// takes longer than four fifths of the lease is refused while the lease under it
 			// is being renewed perfectly well — an unnecessary expiry and recovery cycle for
 			// a healthy execution.
-			e.confirmHold(h.ExecutionID, h.FenceEpoch)
+			e.confirmHold(h.ExecutionID, h.FenceEpoch, proved)
 
 		case errors.Is(err, gojob.ErrFenced):
 			// Ownership is provably gone. Abandon the handler context and make no further

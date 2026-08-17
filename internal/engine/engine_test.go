@@ -142,7 +142,7 @@ func TestHoldRemainingGatesDispatch(t *testing.T) {
 	h := store.Holder{ExecutionID: 7, FenceEpoch: 3, ExecutionKey: "job:1"}
 
 	const lease = 50 * time.Millisecond
-	e.track(h)
+	e.track(h, time.Now())
 	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) <= 0 {
 		t.Fatal("a claim made a moment ago is not considered fresh")
 	}
@@ -164,7 +164,7 @@ func TestHoldRemainingGatesDispatch(t *testing.T) {
 	}
 
 	// A successful renewal is what makes it fresh again — that is the heartbeat's other job.
-	e.confirmHold(h.ExecutionID, h.FenceEpoch)
+	e.confirmHold(h.ExecutionID, h.FenceEpoch, time.Now())
 	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) <= 0 {
 		t.Fatal("a renewed lease did not restore the hold; a slow routing decision would be " +
 			"refused even while its lease is being renewed normally")
@@ -172,7 +172,7 @@ func TestHoldRemainingGatesDispatch(t *testing.T) {
 
 	// And a renewal for a DIFFERENT epoch must not refresh this entry.
 	time.Sleep(lease)
-	e.confirmHold(h.ExecutionID, h.FenceEpoch+1)
+	e.confirmHold(h.ExecutionID, h.FenceEpoch+1, time.Now())
 	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) > 0 {
 		t.Fatal("a renewal at another epoch refreshed this hold")
 	}
@@ -323,5 +323,33 @@ func TestRecoveryPathUsesTheRetirementGuard(t *testing.T) {
 		if !seen[name] {
 			t.Errorf("%s was not found; this test is checking a function that no longer exists", name)
 		}
+	}
+}
+
+// An ownership proof must be dated to BEFORE the call that established it.
+//
+// Stamped afterwards, a process suspended between the commit and the bookkeeping resumes and
+// records an ownership fact minutes old as though it were seconds old — the dispatch gate then
+// passes and the stale attempt goes to an executor that another instance has already recovered
+// from. Taken before the call, the stamp can only be older than the truth, which is the
+// direction that fails safe.
+func TestOwnershipProofIsDatedBeforeItsCall(t *testing.T) {
+	e := &Engine{tracked: map[int64]held{}}
+	h := store.Holder{ExecutionID: 1, FenceEpoch: 1}
+
+	// A claim whose commit was a long time ago must not look fresh.
+	const lease = time.Second
+	e.track(h, time.Now().Add(-time.Hour))
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) > 0 {
+		t.Fatal("a claim proved an hour ago is dispatchable; the stamp is being taken after " +
+			"the call rather than before it")
+	}
+
+	// And a renewal cannot move the proof BACKWARDS — a slow call whose `since` predates an
+	// even later confirmation must leave the newer one alone.
+	e.track(h, time.Now())
+	e.confirmHold(h.ExecutionID, h.FenceEpoch, time.Now().Add(-time.Hour))
+	if e.holdRemaining(h.ExecutionID, h.FenceEpoch, lease) <= 0 {
+		t.Fatal("an older confirmation overwrote a newer one")
 	}
 }

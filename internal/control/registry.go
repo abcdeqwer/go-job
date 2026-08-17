@@ -143,6 +143,29 @@ func (s *Store) Tenants(ctx context.Context) ([]Tenant, error) {
 	return out, rows.Err()
 }
 
+// CurrentGeneration reads a tenant's generation and whether it is enabled, right now.
+//
+// Admission uses it as its LAST act before publishing an engine. The generation it started
+// with came from a poll, and a poll is a cache: an instance that paused during admission can
+// resume holding a generation two cutovers old and install an engine against a schema the
+// tenant has already left, which is the split brain the whole procedure exists to prevent.
+func (s *Store) CurrentGeneration(ctx context.Context, name string) (int64, bool, error) {
+	var (
+		generation int64
+		enabled    bool
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT generation, enabled FROM tenant_registry WHERE tenant = ?`, name).
+		Scan(&generation, &enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read generation of %q: %w", name, err)
+	}
+	return generation, enabled, nil
+}
+
 // AddTenant registers a new site.
 func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor, reason string) error {
 	if reason == "" {
@@ -232,13 +255,25 @@ var ErrNotQuiesced = errors.New("gojob: tenant is not quiesced; a DSN change wou
 func blockersTx(ctx context.Context, tx *sql.Tx, tenant string, generation int64,
 	liveness time.Duration) ([]string, error) {
 
+	// FOR UPDATE, and the predicate is the TENANT alone.
+	//
+	// Locking tenant_registry does not serialise this table: Observe upserts into it
+	// independently, and there is no shared row between them. A plain SELECT here is a read
+	// whose answer an instance can invalidate a microsecond later by inserting its first
+	// observation — which is exactly the instance this gate exists to catch, since one that
+	// has never observed anything is one that is still starting up.
+	//
+	// Scanning the whole tenant range under FOR UPDATE takes next-key locks across it, so a
+	// concurrent INSERT for this tenant waits for this transaction rather than slipping in
+	// behind the read. The liveness and generation tests are applied in Go for the same
+	// reason: narrowing them in SQL would narrow the locked range with them.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT instance_id
+		SELECT instance_id, generation, quiesced,
+		       observed_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
 		FROM tenant_observation
 		WHERE tenant = ?
-		  AND observed_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
-		  AND NOT (generation >= ? AND quiesced = 1)
-		ORDER BY instance_id`, tenant, -roundUpSeconds(liveness), generation)
+		ORDER BY instance_id
+		FOR UPDATE`, -roundUpSeconds(liveness), tenant)
 	if err != nil {
 		return nil, fmt.Errorf("re-check blockers for %q: %w", tenant, err)
 	}
@@ -246,11 +281,18 @@ func blockersTx(ctx context.Context, tx *sql.Tx, tenant string, generation int64
 
 	var out []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var (
+			id       string
+			gen      int64
+			quiesced bool
+			live     bool
+		)
+		if err := rows.Scan(&id, &gen, &quiesced, &live); err != nil {
 			return nil, fmt.Errorf("scan blocker: %w", err)
 		}
-		out = append(out, id)
+		if live && !(gen >= generation && quiesced) {
+			out = append(out, id)
+		}
 	}
 	return out, rows.Err()
 }

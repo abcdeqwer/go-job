@@ -444,6 +444,24 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	// engine anyway would put two schemas in service for one tenant, each correctly excluding
 	// only itself, dispatching the same logical job twice — the exact split brain the whole
 	// cutover procedure exists to prevent.
+	// The REGISTRY, not the poll that started this admission.
+	//
+	// `seen` is a cache refreshed by the poll loop, and an admission that paused can resume
+	// holding a generation two cutovers old: the tenant was disabled, proven quiescent and
+	// re-pointed while this one was opening a pool. Publishing then installs an engine against
+	// a schema the tenant has already left, and the old and new schemas dispatch the same
+	// logical jobs. One read closes that, and it is the last thing done before publishing.
+	current, enabled, err := r.control.CurrentGeneration(ctx, t.Name)
+	if err != nil {
+		_ = db.Close()
+		return fmt.Errorf("confirming %s is still at generation %d: %w", t.Name, t.Generation, err)
+	}
+	if current != t.Generation || !enabled {
+		_ = db.Close()
+		return fmt.Errorf("admission for %s generation %d was superseded before it completed "+
+			"(registry is now generation %d, enabled=%v)", t.Name, t.Generation, current, enabled)
+	}
+
 	r.mu.Lock()
 	// Superseded, or stopping. Both mean "do not install this engine", and both are decided
 	// here under the same lock that Stop takes, so there is no window between the decision

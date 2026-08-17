@@ -566,3 +566,47 @@ func TestAdoptionDoesNotFenceTheAttemptItAdopted(t *testing.T) {
 		t.Fatalf("execution is %q after a successful result, want success", after.Status)
 	}
 }
+
+// A request id belongs to one job. Reusing it for another is a conflict, not a repeat.
+//
+// It produced two silent failures. The fast path answered a trigger for job B with job A's
+// execution key and created nothing; and under a race the loser returned the key it had
+// COMPUTED for B, for a row that does not exist. Either way an operator gets an accepted
+// response, and an execution key, for work that will never run.
+func TestTriggerIdempotencyIsBoundToTheJob(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	h.createJob(cronJob("alpha", "0 0 0 1 1 *"), h.clock.Now().Add(24*time.Hour))
+	h.createJob(cronJob("beta", "0 0 0 1 1 *"), h.clock.Now().Add(24*time.Hour))
+
+	keyA, err := h.store.Trigger(ctx, "alpha", "req-shared", "test", "because", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same id again for the same job is the repeat idempotency promises.
+	again, err := h.store.Trigger(ctx, "alpha", "req-shared", "test", "because", nil)
+	if err != nil {
+		t.Fatalf("a genuine repeat was refused: %v", err)
+	}
+	if again != keyA {
+		t.Fatalf("a repeat returned a different execution: %q vs %q", again, keyA)
+	}
+
+	// The same id for a DIFFERENT job must fail, not quietly answer with alpha's key.
+	got, err := h.store.Trigger(ctx, "beta", "req-shared", "test", "because", nil)
+	if err == nil {
+		t.Fatalf("a reused request id created or matched something for another job: %q", got)
+	}
+	if !errors.Is(err, gojob.ErrProtocol) {
+		t.Fatalf("refusal was not reported as a protocol error: %v", err)
+	}
+
+	// And nothing was created for beta.
+	for _, v := range h.executions("ready") {
+		if v.JobName == "beta" {
+			t.Fatal("an execution was created for beta despite the refusal")
+		}
+	}
+}

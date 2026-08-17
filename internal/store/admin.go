@@ -331,7 +331,7 @@ func (s *Store) Trigger(ctx context.Context, jobName, requestID, actor, reason s
 	}
 
 	// Answer a repeat before doing anything else.
-	if key, ok, err := s.executionByRequest(ctx, requestID); err != nil {
+	if key, ok, err := s.executionByRequest(ctx, requestID, jobName); err != nil {
 		return "", err
 	} else if ok {
 		return key, nil
@@ -379,7 +379,21 @@ func (s *Store) Trigger(ctx context.Context, jobName, requestID, actor, reason s
 		}
 		if !created {
 			// Two callers raced on the same request id. Both get the same execution, which is
-			// exactly what idempotency promises.
+			// exactly what idempotency promises — but only if it IS the same execution. The
+			// loser must read back the row the winner actually created rather than returning
+			// the key it computed for itself: with the same job those agree, and with a reused
+			// id against another job they do not, and returning the computed one hands out a
+			// key for a row that does not exist.
+			var owner string
+			if err := tx.QueryRowContext(ctx,
+				`SELECT execution_key, job_name FROM job_execution WHERE request_id = ?`,
+				requestID).Scan(&key, &owner); err != nil {
+				return fmt.Errorf("read the winning execution for request %q: %w", requestID, err)
+			}
+			if owner != jobName {
+				return fmt.Errorf("%w: request_id %q was already used to trigger %q, not %q",
+					gojob.ErrProtocol, requestID, owner, jobName)
+			}
 			return nil
 		}
 		return audit(ctx, tx, now, actor, "job_triggered", jobName, key, reason)
@@ -439,15 +453,30 @@ func mergeParams(defaults, override []byte) ([]byte, error) {
 // on every dispatch, so a megabyte here is a megabyte per run, for ever.
 const MaxParamsBytes = 64 << 10
 
-func (s *Store) executionByRequest(ctx context.Context, requestID string) (string, bool, error) {
-	var key string
+// executionByRequest answers a repeat, and refuses a request id reused for a DIFFERENT job.
+//
+// An idempotency key identifies one request, not one string. Reused across jobs it produced
+// two silent failures: the fast path returned job A's execution key while serving a trigger
+// for job B and created nothing, and a race returned B's computed key for a row that does not
+// exist — so an operator got an accepted response, and an execution key, for work that will
+// never run.
+//
+// A reuse against another job is therefore a conflict rather than a repeat. The caller has
+// made a mistake, and the only useful answer is to say so.
+func (s *Store) executionByRequest(ctx context.Context, requestID, jobName string) (string, bool, error) {
+	var key, owner string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT execution_key FROM job_execution WHERE request_id = ?`, requestID).Scan(&key)
+		`SELECT execution_key, job_name FROM job_execution WHERE request_id = ?`,
+		requestID).Scan(&key, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, fmt.Errorf("look up request %q: %w", requestID, err)
+	}
+	if owner != jobName {
+		return "", false, fmt.Errorf("%w: request_id %q was already used to trigger %q, not %q",
+			gojob.ErrProtocol, requestID, owner, jobName)
 	}
 	return key, true, nil
 }

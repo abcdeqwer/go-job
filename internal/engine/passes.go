@@ -163,6 +163,9 @@ func (e *Engine) claimAndDispatch(ctx context.Context, c store.Candidate) {
 		return
 	}
 
+	// Before the claim, not after: the tracked proof must never be dated later than the
+	// database fact it stands for. See Engine.track.
+	claimedAt := time.Now()
 	res, err := e.store.Claim(ctx, p, e.runnableFor(targets))
 	if errors.Is(err, gojob.ErrContended) || errors.Is(err, gojob.ErrMissingState) {
 		return
@@ -192,7 +195,7 @@ func (e *Engine) claimAndDispatch(ctx context.Context, c store.Candidate) {
 	}
 	// Tracked from the moment the claim commits, not from acceptance: the row holds a lease
 	// from now, and an unrenewed `dispatching` row is a recovery cycle nobody needed.
-	e.track(h)
+	e.track(h, claimedAt)
 
 	if len(targets) == 0 {
 		// Claimed with nowhere to send it. Release immediately rather than holding the job
@@ -702,6 +705,7 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 			"execution", v.ExecutionKey, "executor", v.DispatchedTo)
 
 	case rec.Reachable && rec.State == gojobv1.ExecutionState_EXECUTION_STATE_RUNNING:
+		adoptedAt := time.Now()
 		epoch, err := e.store.Adopt(ctx, v, e.cfg.InstanceID, e.leaseSecondsFor(ctx, v.JobName))
 		switch {
 		case errors.Is(err, store.ErrCapElapsed):
@@ -716,7 +720,7 @@ func (e *Engine) recoverOne(ctx context.Context, v store.Stale, adopt bool) {
 			e.track(store.Holder{
 				JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
 				Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: epoch,
-			})
+			}, adoptedAt)
 			e.log.Info("adopted a running execution from a lost scheduler",
 				"execution", v.ExecutionKey, "epoch", epoch)
 		}

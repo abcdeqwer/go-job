@@ -125,6 +125,16 @@ static analysis for everything else.
 28k. an instance that is still ADMITTING blocks a cutover, and the gate is re-read inside the
     transaction that moves the DSN — a snapshot taken before the new schema was verified is
     not evidence at the moment of the write;
+28l. an ownership proof is dated to BEFORE the call that established it, so a process
+    suspended between the commit and its bookkeeping cannot make an old fact read as new;
+28m. retirement asks the executor before ending its own in-flight work: a RUNNING answer
+    leaves the row held and the tenant un-quiet, because a delivered cancel is not a stopped
+    handler and quiescence must not be a forced database transition presented as proof;
+28n. the blocker read holds the range it read for the duration of the cutover transaction,
+    and admission confirms the generation against the REGISTRY — not against the poll that
+    started it — as its last act before publishing an engine;
+28o. a manual trigger's request_id identifies one job: reused against another it is a
+    conflict, and the loser of a race reads back the row that was actually created;
 29. business timestamps match the configured `Clock`, stay whole-second, and are never
     compared against the database clock — including when it is wrapped, so
     `available_at <= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())` fails the check too;
