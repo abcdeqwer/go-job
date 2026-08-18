@@ -252,6 +252,9 @@ built-in login — the library does not attempt to be an identity provider.
 
 ## 6. Deployment
 
+**`doc/deployment.md` is the step-by-step runbook.** This section is the reference it points
+back to: what every setting means, and where things live.
+
 You deploy **one binary**, `cmd/gojob`, plus a MySQL. It holds no handler code: handlers live
 in your executors, which are separate processes reached over gRPC.
 
@@ -460,6 +463,7 @@ becomes a **compile error** in every Go executor rather than an `Unimplemented` 
 | `doc/data-model.md` | the tables, their indexes, and why configuration and hot state are separate |
 | `doc/admin.md` | the admin UI and API surface |
 | `doc/verification.md` | the tests an implementation must pass to be trusted |
+| `doc/deployment.md` | the deployment runbook, in order, with the production steps |
 | `doc/executor-guide.md` | how to write an executor and register its jobs — written to be handed to an agent |
 
 ---
