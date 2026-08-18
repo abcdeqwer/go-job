@@ -274,27 +274,41 @@ go-job never runs DDL. Apply the schemas with whatever migration tool you alread
 
 ### Configuration
 
-Every flag has a `GOJOB_`-prefixed environment variable. The ones a deployment must set:
+Fourteen of the twenty-six flags also read a `GOJOB_`-prefixed environment variable; the
+timing ones are flag-only. Each table below says which.
 
-| Flag | Default | Meaning |
+Required — the process refuses to start without them:
+
+| Flag | Env | Meaning |
 | --- | --- | --- |
-| `-control-dsn` | — | the control database; **required** |
-| `-dsn-key` | — | hex key encrypting tenant DSNs at rest; **required** |
-| `-location` | `UTC` | business time zone — cron expressions are evaluated in it |
-| `-grpc-addr` | `:9090` | executor-facing gRPC |
-| `-admin-addr` | `:8080` | operator API and UI |
-| `-instance-id` | derived | must be unique per replica |
+| `-control-dsn` | `GOJOB_CONTROL_DSN` | the control database |
+| `-dsn-key` | `GOJOB_DSN_KEY` | hex key encrypting tenant DSNs at rest — identical on every replica and across restarts, or every stored DSN becomes unreadable |
 
-Timing, all with working defaults:
+Identity and addresses:
+
+| Flag | Env | Default | Meaning |
+| --- | --- | --- | --- |
+| `-location` | `GOJOB_LOCATION` | `UTC` | business time zone — cron expressions are evaluated in it |
+| `-instance-id` | `GOJOB_INSTANCE_ID` | host + random | must be unique per replica |
+| `-grpc-addr` | `GOJOB_GRPC_ADDR` | `:9090` | executor-facing gRPC |
+| `-admin-addr` | `GOJOB_ADMIN_ADDR` | `:8080` | operator API and UI |
+
+Timing — **flag-only, no environment variable** — all with working defaults:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-scan-interval` | 5s | how often ready work is discovered |
 | `-recover-interval` | 15s | expired leases, runtime caps, silence, cancels |
+| `-reap-interval` | 1m | how often lapsed executor registrations are removed |
 | `-registry-poll` | 10s | how often the tenant registry is re-read |
 | `-control-staleness` | 30s | how long an instance may act on an unrefreshed registry read before fencing itself |
 | `-executor-liveness` | 30s | registration TTL, and the silence budget; the progress interval is a third of it |
-| `-drain-timeout` | 15s | how long retiring a tenant waits for in-flight work |
+| `-executor-retention` | 1h | how long a dead registration is kept for diagnosis |
+| `-session-ttl` | 12h | admin session lifetime |
+
+The tenant drain bound is **not configurable**: it is 15 seconds, in `cmd/gojob/main.go`. If a
+deployment needs a different one, that is a flag worth adding rather than a value worth
+editing.
 
 Security — a plaintext, uncredentialed gRPC port is refused unless you say so explicitly:
 
@@ -304,8 +318,30 @@ Security — a plaintext, uncredentialed gRPC port is refused unless you say so 
 | `-tls-client-ca` | require and verify executor client certificates (mTLS) |
 | `-executor-token` | bearer token this scheduler presents when calling executors |
 | `-executor-ca` | CA for verifying executor certificates on outbound calls |
-| `-allow-unauthenticated-executors` | development only; anything reaching the port can register for any tenant |
-| `-allow-unlisted-executors` | accept identities with no `executor_identity` row |
+| `-cookie-secure` (`GOJOB_COOKIE_SECURE`) | mark the admin session cookie Secure; set it whenever the UI is behind TLS |
+| `-allow-unauthenticated-executors` | flag-only. Development only: anything reaching the port can register for any tenant |
+| `-allow-unlisted-executors` | flag-only. Accept identities with no `executor_identity` row |
+
+`-tls-cert`, `-tls-key`, `-tls-client-ca`, `-executor-ca` and `-executor-token` each read the
+matching `GOJOB_`-prefixed variable.
+
+If your admin UI sits behind an SSO proxy, `-trusted-user-header` and `-trusted-role-header`
+(`GOJOB_TRUSTED_USER_HEADER`, `GOJOB_TRUSTED_ROLE_HEADER`) let it supply the identity instead of
+the built-in login. Only set them when the proxy is the only route to the port.
+
+### Not process configuration
+
+Three things are configured in the control database rather than on the command line, because
+they change without a restart and outlive the process:
+
+| What | Where |
+| --- | --- |
+| admin accounts | `admin_user` — provision the first with `gojob -hash-password` |
+| executor credentials | `executor_identity` — hash with `gojob -hash-token` |
+| tenants | `tenant_registry`, through `POST /api/tenants`; never edit the DSN column by hand, it is encrypted |
+
+Jobs themselves — schedule, timeout, attempts, params — are rows created through the admin API.
+See `doc/executor-guide.md` §3.
 
 ### Adding a tenant
 
