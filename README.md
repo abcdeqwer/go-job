@@ -143,9 +143,11 @@ scheduler daemon.
 
 Optional:
 
-- a Prometheus scrape of `/metrics`;
 - a reverse proxy in front of the admin UI if you want your own SSO instead of the
   built-in authentication.
+
+Not yet available: there is no metrics endpoint. Operational visibility today is the admin UI,
+the execution history it reads, and structured logs.
 
 ---
 
@@ -250,73 +252,87 @@ built-in login — the library does not attempt to be an identity provider.
 
 ## 6. Deployment
 
-What you deploy is **your own binary**. There is no `go-job` process to install.
+You deploy **one binary**, `cmd/gojob`, plus a MySQL. It holds no handler code: handlers live
+in your executors, which are separate processes reached over gRPC.
 
-### Roles
+An earlier revision of this section described a library you linked into your own binary, with
+a `SCHEDULER_ROLE`, a `WORKER_HANDLERS` assignment and a handler registry compiled in. None of
+that survived the decision to make executors separate projects in any language — the settings
+it named do not exist, and following it would have wasted an afternoon.
 
-One process can carry either role or both. A single-process installation carries both and
-this section is trivial; the separation matters only when a workload is later split.
+### What a deployment needs
 
-| Role | Responsibility |
+| Thing | How |
 | --- | --- |
-| `WORKER` | claims executions and dispatches them to executors |
-| `CONTROL_PLANE` | reconciles job configuration, recomputes schedules after a clock change, serves the admin UI and API |
+| control database | `mysql gojob_control < schema/mysql/control/001_control.sql`, once per installation |
+| one schema per tenant | `mysql np_scheduler < schema/mysql/tenant/001_tenant.sql`, plus its `schema_identity` row — see `schema/README.md` |
+| a DSN encryption key | 32 bytes of hex; identical on every replica and across restarts, or the stored tenant DSNs become unreadable |
+| the first admin account | `gojob -hash-password '…'` prints a bcrypt hash; INSERT it into `admin_user` |
+| executor credentials | `gojob -hash-token '…'` prints the SHA-256 for `executor_identity.token_sha256` |
 
-The `CONTROL_PLANE` role is **assigned by configuration, not elected.** A designated
-deployment carries the complete handler registry and reconciles every job for every
-tenant, including jobs it does not itself run — so a partial deployment can never leave
-another deployment's jobs unmaterialized. It may run with an empty execution assignment:
-reconciling and serving the UI while claiming no work.
-
-Reconciliation is idempotent — insert what is missing, never overwrite what exists — so a
-misconfiguration that starts two control planes costs duplicated effort, not damage.
+go-job never runs DDL. Apply the schemas with whatever migration tool you already use.
 
 ### Configuration
 
-| Setting | Meaning |
+Every flag has a `GOJOB_`-prefixed environment variable. The ones a deployment must set:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-control-dsn` | — | the control database; **required** |
+| `-dsn-key` | — | hex key encrypting tenant DSNs at rest; **required** |
+| `-location` | `UTC` | business time zone — cron expressions are evaluated in it |
+| `-grpc-addr` | `:9090` | executor-facing gRPC |
+| `-admin-addr` | `:8080` | operator API and UI |
+| `-instance-id` | derived | must be unique per replica |
+
+Timing, all with working defaults:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-scan-interval` | 5s | how often ready work is discovered |
+| `-recover-interval` | 15s | expired leases, runtime caps, silence, cancels |
+| `-registry-poll` | 10s | how often the tenant registry is re-read |
+| `-control-staleness` | 30s | how long an instance may act on an unrefreshed registry read before fencing itself |
+| `-executor-liveness` | 30s | registration TTL, and the silence budget; the progress interval is a third of it |
+| `-drain-timeout` | 15s | how long retiring a tenant waits for in-flight work |
+
+Security — a plaintext, uncredentialed gRPC port is refused unless you say so explicitly:
+
+| Flag | Meaning |
 | --- | --- |
-| `SCHEDULER_ROLE` | `WORKER`, `CONTROL_PLANE`, or both |
-| `WORKER_HANDLERS` | this deployment's execution assignment; defaults to the whole registry |
-| `LISTEN_ADDRESS` | admin UI, health, readiness and metrics |
-| tenant list | per tenant, a coordination DSN and an optional business DSN — see `doc/data-model.md` §0 |
+| `-tls-cert`, `-tls-key` | serve the gRPC port over TLS |
+| `-tls-client-ca` | require and verify executor client certificates (mTLS) |
+| `-executor-token` | bearer token this scheduler presents when calling executors |
+| `-executor-ca` | CA for verifying executor certificates on outbound calls |
+| `-allow-unauthenticated-executors` | development only; anything reaching the port can register for any tenant |
+| `-allow-unlisted-executors` | accept identities with no `executor_identity` row |
 
-A handler named in configuration but missing from the binary is a fatal startup error — a
-packaging mistake, caught loudly. A handler outside this deployment's assignment is simply
-not its work: neither an error nor a reason to refuse to start. Refusing to start because
-another deployment is down turns one missing lane into two.
+### Adding a tenant
 
-### Startup
-
-Admission is fail-closed and all-or-nothing. A missing table, an unreachable database, an
-unresolved credential, an invalid duration or an unsupported schema version prevents
-readiness. A failure affecting one tenant is reported for that tenant and never causes
-another tenant's runtime to borrow its configuration or connection.
+Sign in, then `POST /api/tenants` with the coordination DSN and the `schema_uuid` that schema
+presents. Admission verifies identity, version and the clock contract before the tenant is
+scheduled at all, and a DSN is never returned in plaintext afterwards.
 
 ### Endpoints
 
 - `GET /healthz` — liveness
-- `GET /readyz` — readiness; false while admission is incomplete or degraded
-- `GET /metrics` — Prometheus exposition
+- `GET /readyz` — readiness
 - `GET /` — admin UI
-- `/api/...` — the same operations the UI performs
+- `/api/...` — the same operations the UI performs, documented in `doc/admin.md`
+
+There is **no `/metrics` endpoint yet**. An earlier version of this section promised Prometheus
+exposition; nothing implements it.
 
 ### Scaling
 
-Start with one deployment carrying both roles. Split only on evidence of interference —
-a heavy job starving a latency-sensitive one — and split by **handler assignment**, giving
-each deployment its own resources, health endpoint and rollout. Registration data already
-carries the routing fact, so splitting is a deployment change rather than a schema change.
-
-Running several replicas of the same assignment is what leases and fencing exist for, with
-two preconditions stated in `doc/protocol.md`: aggregate per-tenant concurrency needs
-lease-backed slots rather than in-process semaphores, and the `CONTROL_PLANE` role needs
-all-or-none acquisition across tenants.
+Run several replicas against the same control database, each with its own `-instance-id`.
+Leases and fencing are what make that safe, and `doc/protocol.md` states the argument.
 
 ### Shutdown
 
-Graceful shutdown stops claiming and drops readiness first, then lets in-flight work
-finish. A lease whose handler has not proved it stopped is allowed to expire rather than be
-released early — releasing early is how two executors end up overlapping.
+Graceful shutdown stops claiming and drops readiness first, then lets in-flight work finish. A
+lease whose handler has not proved it stopped is allowed to expire rather than be released
+early — releasing early is how two executors end up overlapping.
 
 ---
 
@@ -329,6 +345,7 @@ released early — releasing early is how two executors end up overlapping.
 | `doc/data-model.md` | the tables, their indexes, and why configuration and hot state are separate |
 | `doc/admin.md` | the admin UI and API surface |
 | `doc/verification.md` | the tests an implementation must pass to be trusted |
+| `doc/executor-guide.md` | how to write an executor and register its jobs — written to be handed to an agent |
 
 ---
 
