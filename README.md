@@ -372,7 +372,86 @@ early — releasing early is how two executors end up overlapping.
 
 ---
 
-## 7. Documentation
+## 7. Working on this repository
+
+### What you need
+
+| | |
+| --- | --- |
+| Go | 1.26 (see `go.mod`) |
+| MySQL 8.x | for the tests — see below |
+| protoc + plugins | **only** to change the gRPC contract; `make proto` installs the plugins |
+
+Nothing else. The generated protobuf code is committed, so building and testing needs no
+protoc.
+
+### Running the tests, and the trap in not doing it properly
+
+```sh
+docker run -d --name gojob-mysql -p 33307:3306 \
+  -e MYSQL_ROOT_PASSWORD=gojobtest mysql:8.4
+
+GOJOB_TEST_DSN="root:gojobtest@tcp(127.0.0.1:33307)/" make check
+```
+
+`make check` is `gofmt -l .`, `go vet ./...` and `go test -race ./...`. The race detector is
+part of it rather than something to reach for after a mystery: this is several loops per
+tenant, several tenants per process, and a gRPC server on top.
+
+**Without `GOJOB_TEST_DSN`, `go test ./...` prints `ok` for every package while silently
+skipping 29 tests — the entire end-to-end suite among them.** A test that needs a database
+skips rather than fails, because failing would make a clean checkout look broken; the cost is
+that a green run means nothing until you have set it. Check for `SKIP` before believing a pass:
+
+```sh
+go test ./... -v 2>&1 | grep -c -- "--- SKIP"     # want 0
+```
+
+The DSN needs no database name. Each test creates and drops its own schema.
+
+### Where things are
+
+| Path | Contents |
+| --- | --- |
+| `clock.go`, `job.go`, `errors.go`, `defaults.go` | the vocabulary: Clock, Definition, Status, the sentinel errors, the defaults and why each is what it is |
+| `cmd/gojob` | the binary — flags, wiring, TLS, the `-hash-*` helpers |
+| `internal/store` | every statement that touches a tenant schema, and the static tests that police them |
+| `internal/engine` | the scheduler loops: materialize, dispatch, heartbeat, recover, timeout, silence, cancel |
+| `internal/dispatch` | the outbound gRPC client, and the accepted/refused/unknown classification |
+| `internal/server` | the inbound gRPC service executors call |
+| `internal/control` | the control database: tenant registry, admission, the operate fence |
+| `internal/runtime` | tenant lifecycle: admission, retirement, draining, DSN cutover |
+| `internal/testexec` | a conforming reference executor, ~450 lines |
+| `internal/e2e` | the database-backed tests |
+| `proto/`, `gen/` | the contract, and its committed generated code |
+| `schema/` | the SQL to apply; go-job never runs DDL |
+
+### Two conventions that are enforced by tests
+
+Both live in `internal/store/store_test.go`, and both exist because the failures they prevent
+are invisible in ordinary testing.
+
+- **Every SQL statement must be a plain, readable literal.** Not concatenated, not built, not
+  prepared, not reached through a method value or an aliased transaction handle. The fence,
+  clock, `write_seq` and lock-order audits read statements out of the source, and anything that
+  hides the text from them hides it from all of them at once.
+- **A transaction handle is called `tx`.** The lock-order walker recognises a transactional
+  statement by its receiver's spelling, because deciding it properly needs type information the
+  parser does not carry.
+
+`doc/verification.md` lists what an implementation has to satisfy to be trusted; the tests are
+written against it.
+
+### Changing the contract
+
+`make proto` regenerates from `proto/gojob/v1/executor.proto`. The generated code is committed
+and reviewed like any other diff — a contract change nobody reads is how an executor discovers
+at runtime that a field moved. `require_unimplemented_servers=false` is deliberate: a new RPC
+becomes a **compile error** in every Go executor rather than an `Unimplemented` at runtime.
+
+---
+
+## 8. Documentation
 
 | Document | Contents |
 | --- | --- |
@@ -385,6 +464,6 @@ early — releasing early is how two executors end up overlapping.
 
 ---
 
-## 8. License
+## 9. License
 
 Not yet chosen. Do not distribute externally until it is.
