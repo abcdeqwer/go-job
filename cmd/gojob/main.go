@@ -50,6 +50,7 @@ func main() {
 type config struct {
 	controlDSN string
 	dsnKeyHex  string
+	configPath string
 	location   string
 	instanceID string
 
@@ -99,6 +100,8 @@ func run() error {
 	flag.StringVar(&c.dsnKeyHex, "dsn-key", env("GOJOB_DSN_KEY", ""),
 		"OPTIONAL hex-encoded 16, 24 or 32 byte key encrypting tenant DSNs at rest; "+
 			"without it they are stored as typed")
+	flag.StringVar(&c.configPath, "config", env("GOJOB_CONFIG", "gojob.json"),
+		"where setup writes the control DSN, and where startup looks for it when -control-dsn is unset")
 	flag.StringVar(&c.location, "location", env("GOJOB_LOCATION", "UTC"),
 		"business time zone; cron expressions are evaluated in it")
 	flag.StringVar(&c.instanceID, "instance-id", env("GOJOB_INSTANCE_ID", ""),
@@ -167,8 +170,15 @@ func run() error {
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// No control DSN? Look for one setup left behind, then offer setup.
 	if c.controlDSN == "" {
-		return errors.New("-control-dsn is required")
+		if cfg, ok := loadConfig(c.configPath); ok {
+			c.controlDSN = cfg.ControlDSN
+			log.Info("control database taken from the setup file", "path", c.configPath)
+		}
+	}
+	if c.controlDSN == "" {
+		return runSetup(c, log)
 	}
 	key, err := decodeKey(c.dsnKeyHex)
 	if err != nil {

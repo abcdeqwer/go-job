@@ -27,8 +27,23 @@ handler code — see `doc/executor-guide.md`.
 
 ## 1. Databases
 
-The **control** database you apply yourself, once — the process cannot serve a page without it,
-so there is nowhere for a UI to do it from.
+**You can do all of this from the browser.** Start with no `-control-dsn` and go-job comes up in
+setup mode: it prints a one-time token to its log, and the page behind that token takes a
+database address, creates the control tables if the database is empty, writes the DSN to its
+config file and restarts into normal operation. From there the UI handles the first
+administrator, tenants (including their schemas), jobs and executor credentials.
+
+The token is the whole gate, and it has to be: before a control database exists there are no
+accounts, and an unauthenticated endpoint that accepts a database address and connects to it is
+not a convenience — point it at a MySQL the caller controls and they own the installation.
+Printing it to the log means whoever can read the container's output is who can configure it.
+
+Two things to know before relying on it: the config file must survive restarts, so a container
+needs a volume for it; and with several replicas only the one you configured has the file, so a
+multi-replica deployment should still pass `-control-dsn` (or `GOJOB_CONTROL_DSN`) to all of
+them.
+
+The rest of this section is the same thing done by hand.
 
 **Tenant schemas you can create from the UI.** Add-tenant asks for host, database, user and
 password, tests the connection, and — if the database is empty — offers to create the tables
