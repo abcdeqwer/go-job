@@ -38,3 +38,11 @@ services:
     ports:
       - "8080:8080"   # operator API and UI
       - "9090:9090"   # executor-facing gRPC
+    volumes:
+      # Only needed if you configure the control database through the browser instead of
+      # setting GOJOB_CONTROL_DSN above. Without it, recreating the container loses the
+      # setting and setup starts over.
+      - gojob-config:/var/lib/gojob
+
+volumes:
+  gojob-config:

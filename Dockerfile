@@ -11,5 +11,16 @@ FROM alpine:3.20
 # falls back to UTC is a scheduler that fires at the wrong hour without saying so.
 RUN apk add --no-cache tzdata ca-certificates
 COPY --from=build /gojob /usr/local/bin/gojob
+
+# Where browser setup writes the control DSN.
+#
+# On a path that is a declared volume, so it survives `docker restart`. It does NOT survive the
+# container being RECREATED — `compose up -d` after a rebuild makes a new anonymous volume — so
+# a compose deployment should either mount this path itself or, better, set GOJOB_CONTROL_DSN
+# and never need the file at all. The setup page says so at the moment it writes it.
+ENV GOJOB_CONFIG=/var/lib/gojob/gojob.json
+RUN mkdir -p /var/lib/gojob
+VOLUME /var/lib/gojob
+
 EXPOSE 8080 9090
 ENTRYPOINT ["/usr/local/bin/gojob"]

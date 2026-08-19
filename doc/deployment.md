@@ -38,10 +38,14 @@ accounts, and an unauthenticated endpoint that accepts a database address and co
 not a convenience — point it at a MySQL the caller controls and they own the installation.
 Printing it to the log means whoever can read the container's output is who can configure it.
 
-Two things to know before relying on it: the config file must survive restarts, so a container
-needs a volume for it; and with several replicas only the one you configured has the file, so a
-multi-replica deployment should still pass `-control-dsn` (or `GOJOB_CONTROL_DSN`) to all of
-them.
+**The file has to survive, and in a container it does not by default.** The image writes it to
+`/var/lib/gojob/gojob.json`, which is a declared volume — enough for `docker restart`, and not
+enough for a RECREATE: `compose up -d` after a rebuild starts from a clean image and setup runs
+again. Either mount that path, or take the `GOJOB_CONTROL_DSN=…` line the setup page prints and
+put it in your compose file. The page prints it for exactly this reason.
+
+With several replicas the environment variable is the only workable answer anyway: only the one
+you configured has the file.
 
 The rest of this section is the same thing done by hand.
 

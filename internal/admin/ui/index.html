@@ -1223,19 +1223,38 @@ $("#bootstrapForm").addEventListener("submit", async ev => {
   $("#bsApply").disabled = true;
   $("#bsBox").innerHTML = "写入配置并重启…";
   try {
-    await bsPost("/api/bootstrap/apply",
+    const r = await bsPost("/api/bootstrap/apply",
       { dsn: bsDSN(f), create_tables: f.dataset.create === "true" });
+
+    // Say how to make this stick, HERE, while it is the thing being done.
+    //
+    // The setting is written to a file inside the process's filesystem. In a container that
+    // survives a restart and not a recreate — `compose up -d` after a rebuild starts from a
+    // clean image — so without either a mounted path or the environment variable, the next
+    // deploy lands back on this page. Finding that out by having to do it again is a bad way
+    // to learn it, and it is the one thing this screen knows and the operator does not.
+    $("#bsBox").innerHTML =
+      `<div style="line-height:1.7">已写入 <code>${esc(r.config_path || "")}</code>，正在重启…
+       <br><br><b>要让它活过容器重建</b>，二选一：
+       <br>① 在 compose 里直接给环境变量（推荐，多副本也只能这样）：
+       <br><code style="user-select:all">GOJOB_CONTROL_DSN=${esc(r.control_dsn || "")}</code>
+       <br>② 或者把 <code>${esc((r.config_path || "").replace(/\/[^/]*$/, ""))}</code> 挂成卷。
+       <br><br><span class="dim">只 restart 容器不受影响；重建（rebuild / up -d）才会丢。</span></div>`;
+
     // The process re-execs, so poll until the ordinary UI answers rather than reloading into
-    // a connection refused.
-    $("#bsBox").innerHTML = "已配置，正在重启…";
-    for (let i = 0; i < 60; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      try {
-        const r = await fetch("/api/setup", { cache: "no-store" });
-        if (r.ok) { location.reload(); return; }
-      } catch (e) { /* still down */ }
+    // a connection refused. Deliberately not reloading the moment it is up: the note above is
+    // the only time this information appears.
+    let back = false;
+    for (let i = 0; i < 60 && !back; i++) {
+      await new Promise(r2 => setTimeout(r2, 1000));
+      try { back = (await fetch("/api/setup", { cache: "no-store" })).ok; } catch (e) { /* down */ }
     }
-    $("#bsBox").innerHTML = '<span class="bad">重启超时，看一下容器日志。</span>';
+    $("#bsApply").disabled = false;
+    $("#bsApply").textContent = back ? "已记下，继续" : "重启超时，看容器日志";
+    if (back) {
+      $("#bsApply").onclick = () => location.reload();
+      $("#bootstrapForm").onsubmit = ev2 => { ev2.preventDefault(); location.reload(); };
+    }
   } catch (e) {
     $("#bsErr").textContent = String(e.message || e);
     $("#bsErr").hidden = false;

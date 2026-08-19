@@ -159,7 +159,12 @@ func (s *setupServer) handler(ui http.Handler) http.Handler {
 		}
 		s.log.Warn("control database configured through setup",
 			"config", s.cfgPath, "remote", r.RemoteAddr)
-		writeJSON(w, http.StatusOK, map[string]any{"restarting": true})
+		// The DSN comes back so the page can show what to put in a compose file. Written to a
+		// file inside a container, this setting survives a restart and NOT a recreate — and
+		// discovering that by having to configure it again is exactly what this avoids.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"restarting": true, "config_path": s.cfgPath, "control_dsn": body.DSN,
+		})
 		// Restart AFTER the response is on its way. The browser polls until the ordinary UI
 		// answers; see the setup page.
 		go func() {
