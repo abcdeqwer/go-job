@@ -134,6 +134,7 @@
     <button data-view="executions">executions</button>
     <button data-view="executors">executors</button>
     <button data-view="audit">audit</button>
+    <button data-view="identities">凭证</button>
   </nav>
   <span style="flex:1"></span>
   <span id="who" class="dim"></span>
@@ -145,6 +146,73 @@
   <div id="controls" class="row"></div>
   <div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
 </main>
+
+<dialog id="tokenDlg">
+  <form method="dialog">
+    <div class="dlg-head">
+      <h3>凭证已发放</h3>
+      <p>这个 token <b>只显示这一次</b>。库里只存了它的 SHA-256，关掉这个框就再也取不回来了——
+         丢了就重新发一个，成本很低。</p>
+    </div>
+    <div class="dlg-body">
+      <div class="f">
+        <label>token</label>
+        <textarea id="tokenOut" rows="2" readonly onclick="this.select()"></textarea>
+        <span class="hint">执行器以 <code>authorization: Bearer &lt;token&gt;</code> 发送。</span>
+      </div>
+    </div>
+    <div class="dlg-foot"><button class="primary" value="ok">我已保存</button></div>
+  </form>
+</dialog>
+
+<dialog id="identDlg">
+  <form method="dialog" id="identForm">
+    <div class="dlg-head">
+      <h3>授权一个执行器</h3>
+      <p>没有这行记录的执行器一律拒绝注册。空表不等于放行——否则在 mTLS 部署下，
+         你的 CA 签过的任何证书都能冒充任意租户领走它的任务和参数。</p>
+    </div>
+    <div class="dlg-body">
+      <div class="grid2">
+        <div class="f">
+          <label>identity</label>
+          <input name="identity" required placeholder="report-worker">
+          <span class="hint">mTLS 时是证书的 CommonName；用 token 时是你给这份凭证起的名字。</span>
+        </div>
+        <div class="f">
+          <label>tenant</label>
+          <select name="tenant" id="identTenant"></select>
+          <span class="hint">按租户授权。要服务多个租户就每个租户加一行。</span>
+        </div>
+        <div class="f">
+          <label>executor_group</label>
+          <input name="group" placeholder="任意">
+          <span class="hint">留空表示任何组。填了组名，这份凭证就只能以那个组注册——灰度时防止
+            金丝雀顶掉生产流量。</span>
+        </div>
+        <div class="f">
+          <label>认证方式</label>
+          <select name="auth">
+            <option value="mTLS">mTLS 客户端证书（推荐）</option>
+            <option value="token">共享 token</option>
+          </select>
+          <span class="hint">证书可吊销、不可重放、不用把密钥发到每个执行器的环境变量里。
+            跑不了 mTLS 才用 token。</span>
+        </div>
+      </div>
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么授权这个执行器">
+        <span class="hint">记入审计日志，挂在你的账号下。必填。</span>
+      </div>
+      <div class="err" id="identErr" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok">授权</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="setup">
   <form method="dialog" id="setupForm">
@@ -399,6 +467,7 @@ const operator = () => state.role === "OPERATOR";
 
 async function loadTenants() {
   const ts = await api("GET", "/api/tenants");
+  state.tenants = ts;          // the identities dialog needs the full list, not just the picker
   const sel = $("#tenant");
   sel.innerHTML = ts.map(t =>
     `<option value="${esc(t.tenant)}" ${t.admitted ? "" : "disabled"}>${esc(t.tenant)}${t.admitted ? "" : " (not admitted)"}</option>`
@@ -438,6 +507,7 @@ async function renderOnce() {
     if (state.view === "executions") return await renderExecutions(t);
     if (state.view === "executors") return await renderExecutors(t);
     if (state.view === "audit") return await renderAudit(t);
+    if (state.view === "identities") return await renderIdentities();
   } catch (e) { showError(e); }
 }
 
@@ -604,6 +674,77 @@ async function renderExecutors(t) {
   );
   $("#body").onclick = null;
 }
+
+// The identities view is INSTALLATION-wide, not per tenant: a row says which tenant an
+// identity may act for, so scoping the list to the selected tenant would hide exactly the
+// rows an operator is checking for ("who else can register as np?").
+async function renderIdentities() {
+  const rows = await api("GET", "/api/executor-identities");
+  $("#controls").innerHTML = state.role === "OPERATOR"
+    ? '<button class="primary" id="newIdent">授权执行器</button>'
+    : "";
+  const nb = $("#newIdent");
+  if (nb) nb.onclick = () => openIdentity();
+
+  table(["identity", "tenant", "组", "认证", "状态", "创建于", "操作"],
+    rows.map(i => [
+      esc(i.identity),
+      esc(i.tenant),
+      i.group ? esc(i.group) : '<span class="dim">任意</span>',
+      i.auth === "token" ? "token" : "mTLS",
+      i.disabled ? '<span class="tag bad">已吊销</span>' : '<span class="tag ok">有效</span>',
+      when(i.created_at),
+      state.role === "OPERATOR"
+        ? `<button data-act="${i.disabled ? "restore" : "revoke"}" data-id="${esc(i.identity)}" data-tenant="${esc(i.tenant)}">${i.disabled ? "恢复" : "吊销"}</button>`
+        : "",
+    ]));
+
+  $("#body").onclick = async ev => {
+    const b = ev.target.closest("button[data-act]");
+    if (!b) return;
+    const revoke = b.dataset.act === "revoke";
+    try {
+      const reason = await ask(
+        `${revoke ? "吊销" : "恢复"} ${b.dataset.id} @ ${b.dataset.tenant}？`,
+        revoke
+          ? "该凭证将无法再注册。已经在跑的执行不会被收回——把正在运行的 handler 从记账里拿掉，只会留下一个没人跟踪的进程。"
+          : "该凭证恢复注册能力。");
+      if (reason === null) return;
+      await api("PATCH", "/api/executor-identities",
+        { identity: b.dataset.id, tenant: b.dataset.tenant, disabled: revoke, reason });
+      render();
+    } catch (e) { showError(e); }
+  };
+}
+
+function openIdentity() {
+  const f = $("#identForm");
+  f.reset();
+  $("#identErr").hidden = true;
+  $("#identTenant").innerHTML = state.tenants
+    .map(t => `<option value="${esc(t.tenant)}">${esc(t.tenant)}</option>`).join("");
+  if (state.tenant) $("#identTenant").value = state.tenant;
+  $("#identDlg").showModal();
+}
+
+$("#identForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#identErr").hidden = true;
+  try {
+    const r = await api("POST", "/api/executor-identities", {
+      identity: f.identity.value, tenant: f.tenant.value,
+      group: f.group.value, auth: f.auth.value, reason: f.reason.value,
+    });
+    $("#identDlg").close();
+    if (r.token) { $("#tokenOut").value = r.token; $("#tokenDlg").showModal(); }
+    render();
+  } catch (e) {
+    $("#identErr").textContent = String(e.message || e);
+    $("#identErr").hidden = false;
+  }
+});
 
 async function renderAudit(t) {
   const rows = await api("GET", `/api/tenants/${t}/audit?limit=200`);

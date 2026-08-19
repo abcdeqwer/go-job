@@ -12,7 +12,9 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	gojob "github.com/abcdeqwer/go-job"
 	"github.com/abcdeqwer/go-job/internal/control"
 	"github.com/abcdeqwer/go-job/internal/cron"
+	"github.com/abcdeqwer/go-job/internal/server"
 	"github.com/abcdeqwer/go-job/internal/store"
 )
 
@@ -112,6 +115,10 @@ func (a *API) Handler() http.Handler {
 
 	a.read(mux, "GET /api/schedule/preview", a.previewSchedule)
 
+	a.read(mux, "GET /api/executor-identities", a.listIdentities)
+	a.write(mux, "POST /api/executor-identities", a.addIdentity)
+	a.write(mux, "PATCH /api/executor-identities", a.setIdentityDisabled)
+
 	mux.Handle("/", a.ui())
 	return mux
 }
@@ -178,6 +185,85 @@ func (a *API) previewSchedule(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	return badRequest("kind must be CRON or FIXED_DELAY")
+}
+
+func (a *API) listIdentities(w http.ResponseWriter, r *http.Request) error {
+	rows, err := a.control.Identities(r.Context())
+	if err != nil {
+		return err
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, i := range rows {
+		out = append(out, map[string]any{
+			"identity": i.Identity, "tenant": i.Tenant, "group": i.Group,
+			"auth":     map[bool]string{true: "token", false: "mTLS"}[i.HasToken],
+			"disabled": i.Disabled, "created_at": i.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+	return nil
+}
+
+// addIdentity authorises an executor, and mints the token itself when one is asked for.
+//
+// Generated here rather than typed by an operator, and returned exactly once. A token an
+// operator chooses is a token someone chose badly; a token echoed back on a later read is a
+// token stored in plaintext somewhere. Only its SHA-256 reaches the database, so losing it
+// means issuing another — which is the correct cost, and cheap.
+func (a *API) addIdentity(w http.ResponseWriter, r *http.Request) error {
+	var body struct {
+		Identity string `json:"identity"`
+		Tenant   string `json:"tenant"`
+		Group    string `json:"group"`
+		Auth     string `json:"auth"` // "token" or "mTLS"
+		Reason   string `json:"reason"`
+	}
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+
+	var token, sha string
+	if strings.EqualFold(body.Auth, "token") {
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return fmt.Errorf("generate token: %w", err)
+		}
+		token = base64.RawURLEncoding.EncodeToString(raw)
+		sha = server.HashToken(token)
+	}
+
+	if err := a.control.AddIdentity(r.Context(), body.Identity, body.Tenant, body.Group, sha,
+		ActorFrom(r.Context()), body.Reason); err != nil {
+		return err
+	}
+	// The only time this value exists outside the executor's configuration.
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"identity": body.Identity, "tenant": body.Tenant, "token": token,
+	})
+	return nil
+}
+
+func (a *API) setIdentityDisabled(w http.ResponseWriter, r *http.Request) error {
+	var body struct {
+		Identity string `json:"identity"`
+		Tenant   string `json:"tenant"`
+		Disabled *bool  `json:"disabled"`
+		Reason   string `json:"reason"`
+	}
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	if body.Disabled == nil {
+		return badRequest("disabled is required")
+	}
+	return a.control.SetIdentityDisabled(r.Context(), body.Identity, body.Tenant, *body.Disabled,
+		ActorFrom(r.Context()), body.Reason)
 }
 
 // wrapPublic is wrap without an authorization requirement, for the two setup endpoints.

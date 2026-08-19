@@ -166,6 +166,107 @@ func (s *Store) CurrentGeneration(ctx context.Context, name string) (int64, bool
 	return generation, enabled, nil
 }
 
+// Identity is one row of executor_identity, as an operator sees it. The token is never
+// among these fields: only its SHA-256 is stored, and nothing can turn that back.
+type Identity struct {
+	Identity  string
+	Tenant    string
+	Group     string
+	HasToken  bool
+	Disabled  bool
+	CreatedAt time.Time
+}
+
+// Identities lists who may register as an executor.
+func (s *Store) Identities(ctx context.Context) ([]Identity, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT identity, tenant, executor_group, token_sha256 IS NOT NULL, disabled, created_at
+		FROM executor_identity ORDER BY tenant, identity`)
+	if err != nil {
+		return nil, fmt.Errorf("list executor identities: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Identity
+	for rows.Next() {
+		var i Identity
+		if err := rows.Scan(&i.Identity, &i.Tenant, &i.Group, &i.HasToken, &i.Disabled,
+			&i.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan identity: %w", err)
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+// AddIdentity authorises an identity for one tenant, optionally with a shared token.
+//
+// tokenSHA is the hex SHA-256 of a token the CALLER generated; empty means this identity
+// authenticates by client certificate, which is the arrangement to prefer. The token itself
+// never reaches this package, and is never stored anywhere: an operator who loses it issues a
+// new one rather than looking the old one up.
+func (s *Store) AddIdentity(ctx context.Context, identity, tenant, group, tokenSHA, actor, reason string) error {
+	if identity == "" || tenant == "" {
+		return fmt.Errorf("%w: an identity needs a name and a tenant", gojob.ErrProtocol)
+	}
+	if reason == "" {
+		return fmt.Errorf("%w: authorising an executor needs a reason", gojob.ErrProtocol)
+	}
+	now := s.clock.Now()
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO executor_identity (identity, tenant, executor_group, token_sha256, created_at)
+			VALUES (?, ?, ?, ?, ?)`,
+			identity, tenant, group, sql.NullString{String: tokenSHA, Valid: tokenSHA != ""}, now); err != nil {
+			return fmt.Errorf("authorise %q for %q: %w", identity, tenant, err)
+		}
+		how := "by client certificate"
+		if tokenSHA != "" {
+			how = "by shared token"
+		}
+		scope := "any group"
+		if group != "" {
+			scope = "group " + group
+		}
+		return audit(ctx, tx, now, actor, "executor_authorized", tenant,
+			fmt.Sprintf("%s (%s, %s, %s)", reason, identity, how, scope))
+	})
+}
+
+// SetIdentityDisabled revokes or restores an identity.
+//
+// Revoking is immediate for REGISTRATION, not for work already dispatched: an executor that is
+// mid-handler keeps the execution it holds, because taking it away would leave a running
+// handler nobody is tracking. It simply cannot register again.
+func (s *Store) SetIdentityDisabled(ctx context.Context, identity, tenant string, disabled bool, actor, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("%w: revoking or restoring an executor needs a reason", gojob.ErrProtocol)
+	}
+	now := s.clock.Now()
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE executor_identity SET disabled = ?
+			WHERE identity = ? AND tenant = ? AND disabled <> ?`,
+			disabled, identity, tenant, disabled)
+		if err != nil {
+			return fmt.Errorf("set %q disabled=%v: %w", identity, disabled, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: %q is already disabled=%v for %q",
+				gojob.ErrProtocol, identity, disabled, tenant)
+		}
+		action := "executor_restored"
+		if disabled {
+			action = "executor_revoked"
+		}
+		return audit(ctx, tx, now, actor, action, tenant, reason+" ("+identity+")")
+	})
+}
+
 // AddTenant registers a new site.
 func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor, reason string) error {
 	if reason == "" {

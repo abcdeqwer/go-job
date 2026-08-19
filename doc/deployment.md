@@ -94,6 +94,10 @@ disabled = 1` is an immediate revocation.
 Skip this only if executors reach the gRPC port over a network you fully control **and** you
 accept that anything reaching that port can register for any tenant.
 
+**Do this in the UI** — the 凭证 tab issues and revokes credentials, and for a token it
+generates the value, shows it once, and stores only its SHA-256. The SQL below is the same
+thing if you would rather script it.
+
 Two mechanisms. Prefer the first.
 
 ### mTLS (preferred)

@@ -14,6 +14,7 @@ import (
 	gojob "github.com/abcdeqwer/go-job"
 	"github.com/abcdeqwer/go-job/internal/admin"
 	"github.com/abcdeqwer/go-job/internal/control"
+	"github.com/abcdeqwer/go-job/internal/server"
 )
 
 // controlDB gives a test its own control schema.
@@ -465,5 +466,114 @@ func TestDisablingAnAccountEndsItsSessions(t *testing.T) {
 	if got := me(); got != http.StatusUnauthorized {
 		t.Fatalf("a disabled account's existing session still worked (%d); disabling has to "+
 			"take effect on the next request, not at session expiry", got)
+	}
+}
+
+// A fresh installation can create its first administrator, once.
+//
+// Without this the only route in was `-hash-password` plus a hand-written INSERT, and the
+// screen said nothing about it: deploy, open, and meet a login form with no account behind it.
+//
+// The endpoint has to close behind itself, and has to close ATOMICALLY. An earlier version
+// counted administrators and then inserted; correct, but on an empty table the locking read
+// takes the whole gap, so concurrent callers queued until innodb_lock_wait_timeout and
+// answered 500 — one 201 and nine 500s over three minutes, measured. The condition now lives
+// inside the insert.
+func TestFirstAdminSetupClosesBehindItself(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+	auth := admin.NewAuth(db, clock, time.Hour, admin.TrustedHeader{}, false)
+
+	needed, err := auth.SetupNeeded(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needed {
+		t.Fatal("a control database with no accounts does not report setup as needed")
+	}
+
+	if err := auth.CreateFirstAdmin(ctx, "ops", "short"); err == nil {
+		t.Error("a password under 12 characters was accepted for an account that can trigger " +
+			"production jobs")
+	}
+	if err := auth.CreateFirstAdmin(ctx, "ops", "a-strong-password-1"); err != nil {
+		t.Fatalf("creating the first administrator: %v", err)
+	}
+
+	if needed, _ := auth.SetupNeeded(ctx); needed {
+		t.Error("setup is still reported as needed after an administrator exists")
+	}
+	if err := auth.CreateFirstAdmin(ctx, "attacker", "another-password-1"); err == nil {
+		t.Fatal("setup created a SECOND account; it is an open account-creation endpoint")
+	}
+
+	// Concurrently, from empty: exactly one wins, and nobody waits on a lock.
+	db2, clock2 := controlDB(t)
+	auth2 := admin.NewAuth(db2, clock2, time.Hour, admin.TrustedHeader{}, false)
+	const racers = 12
+	errs := make(chan error, racers)
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		go func(i int) {
+			<-start
+			errs <- auth2.CreateFirstAdmin(ctx, fmt.Sprintf("user%d", i), "password-number-11")
+		}(i)
+	}
+	close(start)
+	won := 0
+	for i := 0; i < racers; i++ {
+		if err := <-errs; err == nil {
+			won++
+		} else if !errors.Is(err, gojob.ErrProtocol) {
+			t.Errorf("a losing caller failed with %v; it should be a clean refusal, not an error", err)
+		}
+	}
+	if won != 1 {
+		t.Fatalf("%d of %d concurrent callers created an account, want exactly 1", won, racers)
+	}
+}
+
+// An executor credential issued through the API is stored as a hash the auth path can match,
+// and revoking it takes effect on the next registration.
+func TestExecutorIdentityLifecycle(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+	key := make([]byte, 32)
+	ctl, err := control.New(db, clock, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// What the API does: mint a token, store only its SHA-256.
+	const token = "a-token-the-api-generated"
+	if err := ctl.AddIdentity(ctx, "report-worker", "np", "", server.HashToken(token),
+		"admin", "ui test"); err != nil {
+		t.Fatal(err)
+	}
+
+	var stored string
+	if err := db.QueryRowContext(ctx,
+		`SELECT token_sha256 FROM executor_identity WHERE identity = 'report-worker'`).
+		Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored == token {
+		t.Fatal("the token is stored in plaintext")
+	}
+	if stored != server.HashToken(token) {
+		t.Fatal("the stored hash is not what the authenticator will compare against — the " +
+			"credential would be issued and then refused")
+	}
+
+	// Authorization sees it, and stops seeing it once revoked.
+	auth := &server.DBAuthenticator{DB: db, RequireCredential: true}
+	if err := auth.Authorize(ctx, server.Identity{Subject: "report-worker"}, "np", "", false); err != nil {
+		t.Fatalf("a freshly authorised identity was refused: %v", err)
+	}
+	if err := ctl.SetIdentityDisabled(ctx, "report-worker", "np", true, "admin", "ui test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.Authorize(ctx, server.Identity{Subject: "report-worker"}, "np", "", false); err == nil {
+		t.Fatal("a revoked identity is still authorised")
 	}
 }
