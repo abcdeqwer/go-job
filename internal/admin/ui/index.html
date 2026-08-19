@@ -130,6 +130,7 @@
   <span class="brand">go<span>·</span>job</span>
   <select id="tenant" title="tenant"></select>
   <nav>
+    <button data-view="tenants">租户</button>
     <button data-view="jobs" aria-current="true">jobs</button>
     <button data-view="executions">executions</button>
     <button data-view="executors">executors</button>
@@ -146,6 +147,65 @@
   <div id="controls" class="row"></div>
   <div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
 </main>
+
+<dialog id="tenantDlg" class="wide">
+  <form method="dialog" id="tenantForm">
+    <div class="dlg-head">
+      <h3>添加租户</h3>
+      <p>每个租户一个独立的 coordination schema。连接本身就是租户边界——表里没有 tenant 列，
+         所以一条查询不可能读到别的租户的数据。</p>
+    </div>
+    <div class="dlg-body">
+      <div class="grid2">
+        <div class="f">
+          <label>tenant</label>
+          <input name="tenant" required placeholder="np">
+          <span class="hint">租户标识，之后所有接口和页面都用它。</span>
+        </div>
+        <div class="f">
+          <label>database</label>
+          <input name="database" required placeholder="np_scheduler">
+          <span class="hint">这个租户专用的库。<b>不要和业务库共用</b>。</span>
+        </div>
+        <div class="f">
+          <label>host</label>
+          <input name="host" required placeholder="10.0.0.5">
+        </div>
+        <div class="f">
+          <label>port</label>
+          <input name="port" value="3306">
+        </div>
+        <div class="f">
+          <label>user</label>
+          <input name="user" required placeholder="gojob">
+          <span class="hint">日常运行只需要这个库的 DML 权限。建表那一步才需要 DDL。</span>
+        </div>
+        <div class="f">
+          <label>password</label>
+          <input name="password" type="password">
+          <span class="hint">会用这个 key 加密后存起来，页面上永远不再回显。</span>
+        </div>
+      </div>
+
+      <div class="row" style="margin:16px 0 0">
+        <button type="button" id="probeBtn">测试连接</button>
+        <span id="probeMsg" class="dim"></span>
+      </div>
+      <div id="probeBox" class="preview"></div>
+
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么添加这个租户">
+        <span class="hint">记入审计日志，挂在你的账号下。必填。</span>
+      </div>
+      <div class="err" id="tenantErr" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok" id="tenantSave" disabled>先测试连接</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="tokenDlg">
   <form method="dialog">
@@ -508,6 +568,7 @@ async function renderOnce() {
     if (state.view === "executors") return await renderExecutors(t);
     if (state.view === "audit") return await renderAudit(t);
     if (state.view === "identities") return await renderIdentities();
+    if (state.view === "tenants") return await renderTenants();
   } catch (e) { showError(e); }
 }
 
@@ -674,6 +735,140 @@ async function renderExecutors(t) {
   );
   $("#body").onclick = null;
 }
+
+// The tenants view, and with it the only route into this system that used to require curl:
+// there was no add-tenant form at all, so every installation began with a hand-written POST.
+async function renderTenants() {
+  const ts = await api("GET", "/api/tenants");
+  state.tenants = ts;
+  $("#controls").innerHTML = state.role === "OPERATOR"
+    ? '<button class="primary" id="newTenant">添加租户</button>'
+    : "";
+  const nb = $("#newTenant");
+  if (nb) nb.onclick = openTenant;
+
+  table(["tenant", "状态", "代次", "schema", "连接", "最近错误"],
+    ts.map(t => [
+      esc(t.tenant),
+      !t.enabled ? '<span class="tag warn">已停用</span>'
+        : t.admitted ? '<span class="tag ok">运行中</span>'
+        : '<span class="tag bad">未接纳</span>',
+      String(t.generation),
+      `<code>${esc((t.schema_uuid || "").slice(0, 8))}</code>`,
+      `<span class="dim">${esc(t.dsn)}</span>`,
+      t.last_error ? `<span class="bad">${esc(t.last_error)}</span>` : '<span class="dim">—</span>',
+    ]));
+}
+
+// The DSN is assembled here rather than typed, because the format is a driver detail nobody
+// should have to remember, and a typo in it produces "admission failed" rather than
+// "you wrote tcp( twice".
+function tenantDSN(f) {
+  const port = (f.port.value || "3306").trim();
+  const pw = f.password.value ? ":" + f.password.value : "";
+  return `${f.user.value}${pw}@tcp(${f.host.value}:${port})/${f.database.value}`;
+}
+
+function openTenant() {
+  const f = $("#tenantForm");
+  f.reset();
+  $("#tenantErr").hidden = true;
+  $("#probeBox").innerHTML = "";
+  $("#probeMsg").textContent = "";
+  armSave(false, "先测试连接");
+  $("#tenantDlg").showModal();
+}
+
+function armSave(on, label) {
+  const b = $("#tenantSave");
+  b.disabled = !on;
+  b.textContent = label;
+}
+
+// Probing before writing anything is the whole point. Reachable-but-empty, reachable-with-our
+// -schema, and reachable-but-someone-else's are three different situations with three
+// different next steps, and "admission failed" is what they all used to look like.
+$("#probeBtn").onclick = async () => {
+  const f = $("#tenantForm");
+  if (!f.host.value || !f.user.value || !f.database.value) {
+    $("#probeMsg").textContent = "先填 host / user / database";
+    return;
+  }
+  $("#probeMsg").textContent = "连接中…";
+  $("#probeBox").innerHTML = "";
+  armSave(false, "先测试连接");
+  try {
+    const r = await api("POST", "/api/tenants/probe", { dsn: tenantDSN(f) });
+    $("#probeMsg").textContent = "";
+    if (r.provisioned) {
+      if (!r.version_ok) {
+        $("#probeBox").innerHTML = `<span class="bad">这个库的 schema 版本是 ${esc(r.schema_version)}，`
+          + `本程序要求 ${esc(r.expects_version)}。先升级 schema 再添加。</span>`;
+        return;
+      }
+      if (f.tenant.value && r.tenant !== f.tenant.value) {
+        $("#probeBox").innerHTML = `<span class="bad">这个库已经属于租户 <b>${esc(r.tenant)}</b>，`
+          + `不是 ${esc(f.tenant.value)}。多半是 DSN 填错了——两个租户共用一个 schema 会互相踩。</span>`;
+        return;
+      }
+      f.tenant.value = r.tenant;
+      f.dataset.uuid = r.schema_uuid;
+      $("#probeBox").innerHTML = `<span class="t">已就绪</span>：租户 <b>${esc(r.tenant)}</b>，`
+        + `schema ${esc(r.schema_uuid.slice(0, 8))}，版本 ${esc(r.schema_version)}。`;
+      armSave(true, "添加租户");
+      return;
+    }
+    if (r.tables > 0) {
+      $("#probeBox").innerHTML = `<span class="bad">这个库里有 ${r.tables} 张 go-job 的表，`
+        + `但没有 schema_identity —— 是个建了一半的 schema。手工确认后再继续，`
+        + `自动补建不如你亲眼看一遍安全。</span>`;
+      return;
+    }
+    // Empty. Offer to provision, and only then.
+    $("#probeBox").innerHTML = `连接成功，<span class="t">这是一个空库</span>。`
+      + `<button type="button" id="provisionBtn" style="margin-left:8px">在这里建表</button>`;
+    $("#provisionBtn").onclick = provision;
+  } catch (e) {
+    $("#probeMsg").textContent = "";
+    $("#probeBox").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+};
+
+async function provision() {
+  const f = $("#tenantForm");
+  if (!f.tenant.value) { $("#probeBox").innerHTML = '<span class="bad">先填 tenant</span>'; return; }
+  if (!f.reason.value) { $("#probeBox").innerHTML = '<span class="bad">先填 reason</span>'; return; }
+  $("#probeBox").innerHTML = "建表中…";
+  try {
+    const r = await api("POST", "/api/tenants/provision",
+      { dsn: tenantDSN(f), tenant: f.tenant.value, reason: f.reason.value });
+    f.dataset.uuid = r.schema_uuid;
+    $("#probeBox").innerHTML = `<span class="t">建表完成</span>：schema ${esc(r.schema_uuid.slice(0, 8))}，`
+      + `版本 ${esc(r.schema_version)}。`;
+    armSave(true, "添加租户");
+  } catch (e) {
+    $("#probeBox").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+$("#tenantForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#tenantErr").hidden = true;
+  try {
+    await api("POST", "/api/tenants", {
+      tenant: f.tenant.value, dsn: tenantDSN(f),
+      schema_uuid: f.dataset.uuid, reason: f.reason.value,
+    });
+    $("#tenantDlg").close();
+    await loadTenants();
+    render();
+  } catch (e) {
+    $("#tenantErr").textContent = String(e.message || e);
+    $("#tenantErr").hidden = false;
+  }
+});
 
 // The identities view is INSTALLATION-wide, not per tenant: a row says which tenant an
 // identity may act for, so scoping the list to the selected tenant would hide exactly the

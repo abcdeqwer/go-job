@@ -27,7 +27,16 @@ handler code — see `doc/executor-guide.md`.
 
 ## 1. Databases
 
-go-job never runs DDL. Apply these with whatever migration tool you already use.
+The **control** database you apply yourself, once — the process cannot serve a page without it,
+so there is nowhere for a UI to do it from.
+
+**Tenant schemas you can create from the UI.** Add-tenant asks for host, database, user and
+password, tests the connection, and — if the database is empty — offers to create the tables
+and mint the identity row. That is the only automatic schema management this has: one operator,
+one button, on a database they just named. Nothing runs DDL at startup, because MySQL DDL does
+not roll back and several replicas starting together would race to apply it.
+
+The SQL below is the same thing if you would rather run it yourself.
 
 ```sh
 # once per installation

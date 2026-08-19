@@ -115,6 +115,9 @@ func (a *API) Handler() http.Handler {
 
 	a.read(mux, "GET /api/schedule/preview", a.previewSchedule)
 
+	a.write(mux, "POST /api/tenants/probe", a.probeTenant)
+	a.write(mux, "POST /api/tenants/provision", a.provisionTenant)
+
 	a.read(mux, "GET /api/executor-identities", a.listIdentities)
 	a.write(mux, "POST /api/executor-identities", a.addIdentity)
 	a.write(mux, "PATCH /api/executor-identities", a.setIdentityDisabled)
