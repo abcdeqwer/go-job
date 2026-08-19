@@ -51,6 +51,24 @@ type Config struct {
 	// quiescent and to verify a new one's identity before a cutover — both of which have to
 	// talk to the database in question rather than to whatever this replica happens to hold.
 	OpenDB func(dsn string) (*sql.DB, error)
+
+	// ControlServer describes the server the CONTROL database lives on, so a tenant schema can
+	// be placed beside it without an operator re-typing its address and password.
+	//
+	// The password stays here. It is never sent to the browser and never accepted from it: the
+	// UI asks for a database NAME, and this composes the DSN. Anything else would put the
+	// control credential in a form field, in a screenshot, and in a browser's autofill.
+	ControlServer ControlServer
+}
+
+// ControlServer is the control database's own connection, reusable for tenant schemas.
+type ControlServer struct {
+	// Address is host:port, shown to the operator so they can see where a schema would land.
+	Address string
+	User    string
+	// DSNFor composes a DSN for a database on this server. Nil when the deployment did not
+	// supply one, in which case the UI asks for a full connection as before.
+	DSNFor func(database string) string
 }
 
 // API is the operator HTTP surface.
@@ -114,6 +132,7 @@ func (a *API) Handler() http.Handler {
 	a.write(mux, "POST /api/tenants/{tenant}/executions/{key}/cancel", a.cancelExecution)
 
 	a.read(mux, "GET /api/schedule/preview", a.previewSchedule)
+	a.read(mux, "GET /api/control-connection", a.controlConnection)
 
 	a.write(mux, "POST /api/tenants/probe", a.probeTenant)
 	a.write(mux, "POST /api/tenants/provision", a.provisionTenant)
@@ -470,6 +489,7 @@ func (a *API) addTenant(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Tenant     string `json:"tenant"`
 		DSN        string `json:"dsn"`
+		Database   string `json:"database"`
 		SchemaUUID string `json:"schema_uuid"`
 		Reason     string `json:"reason"`
 	}
@@ -479,8 +499,12 @@ func (a *API) addTenant(w http.ResponseWriter, r *http.Request) error {
 	if err := requireReason(body.Reason); err != nil {
 		return err
 	}
+	dsn, err := a.resolveDSN(body.DSN, body.Database)
+	if err != nil {
+		return err
+	}
 	actor := ActorFrom(r.Context())
-	if err := a.control.AddTenant(r.Context(), body.Tenant, body.DSN, body.SchemaUUID,
+	if err := a.control.AddTenant(r.Context(), body.Tenant, dsn, body.SchemaUUID,
 		actor, body.Reason); err != nil {
 		return err
 	}
@@ -518,6 +542,7 @@ func (a *API) patchTenant(w http.ResponseWriter, r *http.Request) error {
 func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		DSN        string `json:"dsn"`
+		Database   string `json:"database"`
 		SchemaUUID string `json:"schema_uuid"`
 		Reason     string `json:"reason"`
 
@@ -539,10 +564,15 @@ func (a *API) repointTenant(w http.ResponseWriter, r *http.Request) error {
 	if err := requireReason(body.Reason); err != nil {
 		return err
 	}
-	if body.DSN == "" || body.SchemaUUID == "" {
-		return badRequest("dsn and schema_uuid are required; the uuid is what the new schema " +
-			"must present, and without it a mistyped DSN is undetectable")
+	if body.SchemaUUID == "" {
+		return badRequest("schema_uuid is required; it is what the new schema must present, " +
+			"and without it a mistyped DSN is undetectable")
 	}
+	dsn, err := a.resolveDSN(body.DSN, body.Database)
+	if err != nil {
+		return err
+	}
+	body.DSN = dsn
 	name := r.PathValue("tenant")
 
 	// Quiescence is proven against the OLD schema, by opening it directly.
@@ -698,6 +728,16 @@ func (a *API) quiescence(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	body := map[string]any{"generation": generation, "blockers": blockers}
+
+	// schema_observed says whether the counts below are present, EXPLICITLY.
+	//
+	// They are absent whenever this replica no longer holds the tenant — which is the ordinary
+	// state after a disable, because retirement is what a drained tenant looks like. A client
+	// left to infer that from missing keys reads "no counts" as "not quiescent" and reports the
+	// opposite of the truth at exactly the step of the cutover procedure that depends on it.
+	// That is not hypothetical: the admin UI did it the first time it was written.
+	_, held := a.tenants.Store(name)
+	body["schema_observed"] = held
 	if st, ok := a.tenants.Store(name); ok {
 		q, err := st.Quiescent(r.Context())
 		if err != nil {

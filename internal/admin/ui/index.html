@@ -156,7 +156,15 @@
          所以一条查询不可能读到别的租户的数据。</p>
     </div>
     <div class="dlg-body">
-      <div class="grid2">
+      <div class="f">
+        <label>放在哪</label>
+        <select name="placement" id="placement">
+          <option value="control">调度器自己的 MySQL 上（推荐）</option>
+          <option value="remote">另一台数据库</option>
+        </select>
+        <span class="hint" id="placementHint"></span>
+      </div>
+      <div class="grid2" style="margin-top:12px">
         <div class="f">
           <label>tenant</label>
           <input name="tenant" required placeholder="np">
@@ -164,12 +172,14 @@
         </div>
         <div class="f">
           <label>database</label>
-          <input name="database" required placeholder="np_scheduler">
+          <input name="database" required placeholder="gojob_np">
           <span class="hint">这个租户专用的库。<b>不要和业务库共用</b>。</span>
         </div>
+      </div>
+      <div class="grid2 remote-only" style="margin-top:12px">
         <div class="f">
           <label>host</label>
-          <input name="host" required placeholder="10.0.0.5">
+          <input name="host" placeholder="10.0.0.5">
         </div>
         <div class="f">
           <label>port</label>
@@ -177,7 +187,7 @@
         </div>
         <div class="f">
           <label>user</label>
-          <input name="user" required placeholder="gojob">
+          <input name="user" placeholder="gojob">
           <span class="hint">日常运行只需要这个库的 DML 权限。建表那一步才需要 DDL。</span>
         </div>
         <div class="f">
@@ -203,6 +213,84 @@
     <div class="dlg-foot">
       <button value="cancel" formnovalidate>取消</button>
       <button class="primary" value="ok" id="tenantSave" disabled>先测试连接</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="tenantEditDlg">
+  <form method="dialog" id="tenantEditForm">
+    <div class="dlg-head">
+      <h3>编辑租户 <span id="editTenantName"></span></h3>
+      <p>停用会让每个调度器实例停止认领这个租户的任务，并排空手上已经在跑的。
+         已经在执行器上跑着的任务不会被打断——它照常回报结果。</p>
+    </div>
+    <div class="dlg-body">
+      <div class="f">
+        <label>状态</label>
+        <select name="enabled" id="editEnabled">
+          <option value="true">启用</option>
+          <option value="false">停用</option>
+        </select>
+        <span class="hint">停用是可逆的，配置和历史都留着。</span>
+      </div>
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么改这个租户">
+        <span class="hint">记入审计日志，挂在你的账号下。必填。</span>
+      </div>
+      <div class="err" id="tenantEditErr" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="tenantMoveDlg" class="wide">
+  <form method="dialog" id="tenantMoveForm">
+    <div class="dlg-head">
+      <h3>换连接 <span id="moveTenantName"></span></h3>
+      <p>把这个租户指向另一个 coordination schema。两个 schema 同时服务一个租户，
+         各自都只会正确地排除自己，于是同一个任务被派两次——所以旧库必须先排空。</p>
+    </div>
+    <div class="dlg-body">
+      <div id="moveQuiesce" class="preview">读取排空状态…</div>
+
+      <div class="f" style="margin-top:14px">
+        <label>放在哪</label>
+        <select name="placement" id="movePlacement">
+          <option value="control">调度器自己的 MySQL 上</option>
+          <option value="remote">另一台数据库</option>
+        </select>
+      </div>
+      <div class="grid2" style="margin-top:12px">
+        <div class="f">
+          <label>database</label>
+          <input name="database" required placeholder="gojob_np">
+        </div>
+        <div class="f">
+          <label>schema_uuid</label>
+          <input name="schema_uuid" required placeholder="新 schema 必须出示的 uuid">
+          <span class="hint">没有它，一个打错的 DSN 是检测不出来的。</span>
+        </div>
+      </div>
+      <div class="grid2 move-remote-only" style="margin-top:12px">
+        <div class="f"><label>host</label><input name="host" placeholder="10.0.0.5"></div>
+        <div class="f"><label>port</label><input name="port" value="3306"></div>
+        <div class="f"><label>user</label><input name="user" placeholder="gojob"></div>
+        <div class="f"><label>password</label><input name="password" type="password"></div>
+      </div>
+
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么换库">
+      </div>
+      <div class="err" id="tenantMoveErr" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok">换连接</button>
     </div>
   </form>
 </dialog>
@@ -525,7 +613,20 @@ function ask(title, note) {
 
 const operator = () => state.role === "OPERATOR";
 
+// Read once. It describes the deployment, not the session, and re-reading it on every render
+// would put a request on the polling path for a value that cannot change while the process runs.
+async function loadControlServer() {
+  if (state.controlServer) return;
+  try {
+    state.controlServer = await api("GET", "/api/control-connection");
+  } catch {
+    // A viewer role, or an older build. The form falls back to asking for a full connection.
+    state.controlServer = { available: false };
+  }
+}
+
 async function loadTenants() {
+  await loadControlServer();
   const ts = await api("GET", "/api/tenants");
   state.tenants = ts;          // the identities dialog needs the full list, not just the picker
   const sel = $("#tenant");
@@ -768,7 +869,8 @@ async function renderTenants() {
   const nb = $("#newTenant");
   if (nb) nb.onclick = openTenant;
 
-  table(["tenant", "状态", "代次", "schema", "连接", "最近错误"],
+  const canEdit = state.role === "OPERATOR";
+  table(["tenant", "状态", "代次", "schema", "连接", "最近错误"].concat(canEdit ? ["操作"] : []),
     ts.map(t => [
       esc(t.tenant),
       !t.enabled ? '<span class="tag warn">已停用</span>'
@@ -778,24 +880,198 @@ async function renderTenants() {
       `<code>${esc((t.schema_uuid || "").slice(0, 8))}</code>`,
       `<span class="dim">${esc(t.dsn)}</span>`,
       t.last_error ? `<span class="bad">${esc(t.last_error)}</span>` : '<span class="dim">—</span>',
-    ]));
+    ].concat(canEdit ? [
+      `<button type="button" data-edit="${esc(t.tenant)}">编辑</button>`
+      + ` <button type="button" data-move="${esc(t.tenant)}">换连接</button>`,
+    ] : [])));
+
+  // Delegated, because the rows are re-rendered on every poll and per-row handlers attached
+  // here would be dropped by the next render without anybody noticing.
+  $("#body").onclick = ev => {
+    const edit = ev.target.closest("[data-edit]");
+    if (edit) return openTenantEdit(edit.dataset.edit);
+    const move = ev.target.closest("[data-move]");
+    if (move) return openTenantMove(move.dataset.move);
+  };
 }
 
-// The DSN is assembled here rather than typed, because the format is a driver detail nobody
-// should have to remember, and a typo in it produces "admission failed" rather than
-// "you wrote tcp( twice".
-function tenantDSN(f) {
+// 编辑 is enable/disable and nothing else, deliberately. It is the operation an operator reaches
+// for weekly; a DSN cutover is a five-step procedure with a quiescence gate, and putting the two
+// behind one button makes the cheap one feel as dangerous as the expensive one.
+function openTenantEdit(name) {
+  const t = (state.tenants || []).find(x => x.tenant === name);
+  if (!t) return;
+  const f = $("#tenantEditForm");
+  f.reset();
+  f.dataset.tenant = name;
+  $("#editTenantName").textContent = name;
+  $("#editEnabled").value = t.enabled ? "true" : "false";
+  $("#tenantEditErr").hidden = true;
+  $("#tenantEditDlg").showModal();
+}
+
+$("#tenantEditForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#tenantEditErr").hidden = true;
+  try {
+    await api("PATCH", `/api/tenants/${encodeURIComponent(f.dataset.tenant)}`, {
+      enabled: f.enabled.value === "true", reason: f.reason.value,
+    });
+    $("#tenantEditDlg").close();
+    await loadTenants();
+    render();
+  } catch (e) {
+    $("#tenantEditErr").textContent = String(e.message || e);
+    $("#tenantEditErr").hidden = false;
+  }
+});
+
+// The cutover. Quiescence is READ and shown rather than assumed: the API refuses the move until
+// the old schema is quiet, and an operator who cannot see why is left retrying a button.
+async function openTenantMove(name) {
+  const f = $("#tenantMoveForm");
+  f.reset();
+  f.dataset.tenant = name;
+  $("#moveTenantName").textContent = name;
+  $("#tenantMoveErr").hidden = true;
+  $("#moveQuiesce").textContent = "读取排空状态…";
+  applyMovePlacement();
+  $("#tenantMoveDlg").showModal();
+  try {
+    const q = await api("GET", `/api/tenants/${encodeURIComponent(name)}/quiescence`);
+    $("#moveQuiesce").innerHTML = quiescenceView(q).html;
+  } catch (e) {
+    $("#moveQuiesce").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+// quiescenceView classifies a quiescence response. Separated from the dialog so it can be
+// exercised with synthetic payloads: the bug this replaced was a CLASSIFICATION error, and
+// reproducing it end to end depends on catching a replica mid-retirement, which is a race.
+//
+// Three states, not two. `schema_observed: false` means this replica has RETIRED the tenant,
+// which is what a fully drained tenant looks like — so it is evidence FOR quiescence, not
+// against it. Reading missing counts as "still busy" reports the opposite of the truth at the
+// one step of the cutover procedure that depends on this number.
+function quiescenceView(q) {
+  const blockers = (q.blockers || []).filter(b => !b.Quiesced || b.Generation !== q.generation);
+  const busy = q.schema_observed && (!q.schema_quiescent || q.held > 0 || q.in_flight > 0);
+  const ready = !busy && blockers.length === 0;
+  const counts = q.schema_observed
+    ? `持有 ${q.held}，执行中 ${q.in_flight}，排队中 ${q.queued_and_would_be_abandoned}（换库时会被丢弃）`
+    : `本实例已经退租了这个租户——它手上的任务都排空了，所以这里没有计数可看`;
+  const html = ready
+    ? `<span class="t">旧库已排空</span>：${counts}。`
+    : `<span class="bad">还没排空</span>：${counts}，`
+      + `未确认当前代次的实例 ${blockers.length} 个。`
+      + `<br><span class="dim">先把租户停用，等它们自己排空——禁用租户不会自己排空排队中的任务，`
+      + `所以排队数不构成阻塞，但会被丢弃。</span>`;
+  return { ready, busy, blockers: blockers.length, html };
+}
+window.quiescenceView = quiescenceView;
+
+function applyMovePlacement() {
+  const remote = $("#movePlacement").value === "remote";
+  document.querySelectorAll(".move-remote-only").forEach(el => { el.hidden = !remote; });
+}
+$("#movePlacement").onchange = applyMovePlacement;
+
+$("#tenantMoveForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#tenantMoveErr").hidden = true;
+  const body = {
+    schema_uuid: f.schema_uuid.value, reason: f.reason.value,
+    ...connectionOf(f, $("#movePlacement").value),
+  };
+  try {
+    await api("PUT", `/api/tenants/${encodeURIComponent(f.dataset.tenant)}/dsn`, body);
+    $("#tenantMoveDlg").close();
+    await loadTenants();
+    render();
+  } catch (e) {
+    const msg = String(e.message || e);
+    // The API answers with the count when queued work would be abandoned. Asking here, with
+    // the number in the question, is the only way that acknowledgement means anything.
+    if (/abandon_queued/.test(msg)) {
+      if (confirm(`${msg}\n\n确认丢弃这些排队中的任务并继续？`)) {
+        try {
+          await api("PUT", `/api/tenants/${encodeURIComponent(f.dataset.tenant)}/dsn`,
+            { ...body, abandon_queued: true });
+          $("#tenantMoveDlg").close();
+          await loadTenants();
+          render();
+          return;
+        } catch (e2) {
+          $("#tenantMoveErr").textContent = String(e2.message || e2);
+          $("#tenantMoveErr").hidden = false;
+          return;
+        }
+      }
+      return;
+    }
+    $("#tenantMoveErr").textContent = msg;
+    $("#tenantMoveErr").hidden = false;
+  }
+});
+
+// The connection, as the API wants it.
+//
+// Two shapes, and the difference matters: `database` alone means "beside the control database",
+// and the DSN is composed on the SERVER from the credential it already holds. That is why the
+// recommended path has no password field — the control password never enters a browser form, an
+// autofill store, or a screenshot.
+//
+// The remote shape assembles the DSN here because the format is a driver detail nobody should
+// have to remember, and a typo in it produces "admission failed" rather than "you wrote tcp(
+// twice".
+function connectionOf(f, placement) {
+  if (placement !== "remote") return { database: f.database.value.trim() };
   const port = (f.port.value || "3306").trim();
   const pw = f.password.value ? ":" + f.password.value : "";
-  return `${f.user.value}${pw}@tcp(${f.host.value}:${port})/${f.database.value}`;
+  return { dsn: `${f.user.value}${pw}@tcp(${f.host.value}:${port})/${f.database.value}` };
 }
+
+function applyPlacement() {
+  const remote = $("#placement").value === "remote";
+  document.querySelectorAll(".remote-only").forEach(el => { el.hidden = !remote; });
+  ["host", "user"].forEach(n => { $("#tenantForm")[n].required = remote; });
+  $("#placementHint").innerHTML = remote
+    ? "自己填一套连接。密码会用 -dsn-key 加密后存起来，页面上永远不再回显。"
+    : (state.controlServer && state.controlServer.available
+        ? `库会建在 <code>${esc(state.controlServer.address)}</code>，`
+          + `用 <code>${esc(state.controlServer.user)}</code> 这个账号——`
+          + `和调度器自己的库同一台，凭据不用再填一遍。`
+        : "这个部署没法在控制库旁边建 schema，请选「另一台数据库」。");
+}
+$("#placement").onchange = applyPlacement;
+
+// The database name follows the tenant name until an operator overrides it. Typing `bp` and
+// getting `gojob_bp` is the whole of the add-tenant form on the recommended path.
+$("#tenantForm").tenant.addEventListener("input", ev => {
+  const f = $("#tenantForm");
+  if (f.dataset.dbTouched === "1") return;
+  const name = ev.target.value.trim().replace(/[^a-zA-Z0-9_]/g, "_");
+  f.database.value = name ? "gojob_" + name : "";
+});
+$("#tenantForm").database.addEventListener("input", () => {
+  $("#tenantForm").dataset.dbTouched = "1";
+});
 
 function openTenant() {
   const f = $("#tenantForm");
   f.reset();
+  delete f.dataset.dbTouched;
+  delete f.dataset.uuid;
   $("#tenantErr").hidden = true;
   $("#probeBox").innerHTML = "";
   $("#probeMsg").textContent = "";
+  $("#placement").value = (state.controlServer && state.controlServer.available)
+    ? "control" : "remote";
+  applyPlacement();
   armSave(false, "先测试连接");
   $("#tenantDlg").showModal();
 }
@@ -811,15 +1087,26 @@ function armSave(on, label) {
 // different next steps, and "admission failed" is what they all used to look like.
 $("#probeBtn").onclick = async () => {
   const f = $("#tenantForm");
-  if (!f.host.value || !f.user.value || !f.database.value) {
-    $("#probeMsg").textContent = "先填 host / user / database";
+  const placement = $("#placement").value;
+  if (!f.database.value || (placement === "remote" && (!f.host.value || !f.user.value))) {
+    $("#probeMsg").textContent = placement === "remote"
+      ? "先填 host / user / database" : "先填 database";
     return;
   }
   $("#probeMsg").textContent = "连接中…";
   $("#probeBox").innerHTML = "";
   armSave(false, "先测试连接");
   try {
-    const r = await api("POST", "/api/tenants/probe", { dsn: tenantDSN(f) });
+    const r = await api("POST", "/api/tenants/probe", connectionOf(f, placement));
+    if (r.creatable) {
+      // The database does not exist yet, and this deployment can create it. That is a state
+      // to offer to fix, not an error — it is the ordinary case for a new tenant.
+      $("#probeMsg").textContent = "";
+      $("#probeBox").innerHTML = `<span class="dim">这个库还不存在。</span>`
+        + `<button type="button" id="provisionBtn" style="margin-left:8px">建库并建表</button>`;
+      $("#provisionBtn").onclick = provision;
+      return;
+    }
     $("#probeMsg").textContent = "";
     if (r.provisioned) {
       if (!r.version_ok) {
@@ -861,8 +1148,10 @@ async function provision() {
   if (!f.reason.value) { $("#probeBox").innerHTML = '<span class="bad">先填 reason</span>'; return; }
   $("#probeBox").innerHTML = "建表中…";
   try {
-    const r = await api("POST", "/api/tenants/provision",
-      { dsn: tenantDSN(f), tenant: f.tenant.value, reason: f.reason.value });
+    const r = await api("POST", "/api/tenants/provision", {
+      ...connectionOf(f, $("#placement").value),
+      tenant: f.tenant.value, reason: f.reason.value,
+    });
     f.dataset.uuid = r.schema_uuid;
     $("#probeBox").innerHTML = `<span class="t">建表完成</span>：schema ${esc(r.schema_uuid.slice(0, 8))}，`
       + `版本 ${esc(r.schema_version)}。`;
@@ -879,8 +1168,8 @@ $("#tenantForm").addEventListener("submit", async ev => {
   $("#tenantErr").hidden = true;
   try {
     await api("POST", "/api/tenants", {
-      tenant: f.tenant.value, dsn: tenantDSN(f),
-      schema_uuid: f.dataset.uuid, reason: f.reason.value,
+      tenant: f.tenant.value, schema_uuid: f.dataset.uuid, reason: f.reason.value,
+      ...connectionOf(f, $("#placement").value),
     });
     $("#tenantDlg").close();
     await loadTenants();

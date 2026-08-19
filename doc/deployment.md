@@ -36,11 +36,21 @@ in whatever already configures the deployment — and a browser form that still 
 the deployment afterwards buys nothing, while a setup endpoint that accepts a database address
 is a real attack surface for a path nobody ends up using.
 
-**Tenant schemas you can create from the UI.** Add-tenant asks for host, database, user and
-password, tests the connection, and — if the database is empty — offers to create the tables
-and mint the identity row. That is the only automatic schema management this has: one operator,
-one button, on a database they just named. Nothing runs DDL at startup, because MySQL DDL does
-not roll back and several replicas starting together would race to apply it.
+**Tenant schemas you can create from the UI.** Add-tenant defaults to putting the schema
+**beside the control database**, on the same server and under the same account: you type a
+tenant name, the database name follows it (`gojob_np`), and one button creates the database, the
+tables and the identity row.
+
+Nothing about that is a compromise. These schemas hold the scheduler's own bookkeeping — job
+definitions, execution history, executor registrations — and none of your business data, so
+placing them next to the control database costs no isolation you had. The control credential
+never reaches the browser either: the form asks for a NAME and the DSN is composed server-side.
+
+Pick "另一台数据库" when a tenant genuinely belongs on a different server, and the form asks for
+the full connection as before.
+
+Nothing runs DDL at startup, because MySQL DDL does not roll back and several replicas starting
+together would race to apply it.
 
 The SQL below is the same thing if you would rather run it yourself.
 
@@ -270,10 +280,11 @@ themselves, and dispatch the same job twice.
 
 1. **Disable** the tenant — `PATCH /api/tenants/np` with `{"enabled": false, "reason": "…"}`.
    Every replica stops claiming and drains what it holds.
-2. **Watch quiescence** — `GET /api/tenants/np/quiescence`:
+2. **Watch quiescence** — the 换连接 dialog reads it for you, or `GET
+   /api/tenants/np/quiescence`:
 
    ```json
-   {"generation": 2, "schema_quiescent": true,
+   {"generation": 2, "schema_observed": true, "schema_quiescent": true,
     "held": 0, "in_flight": 0, "queued_and_would_be_abandoned": 0,
     "blockers": [{"InstanceID": "…", "Generation": 1, "Quiesced": true, "ObservedAt": "…"}]}
    ```
@@ -282,6 +293,11 @@ themselves, and dispatch the same job twice.
    that have not yet acknowledged the CURRENT generation; a replica still showing the previous
    one has not polled the disable yet, so wait a poll interval rather than forcing anything.
    `queued_and_would_be_abandoned` is the count step 4 makes you accept explicitly.
+
+   **`schema_observed: false` means the counts are absent, and that is the DRAINED state, not
+   a busy one.** A replica that has fully retired a tenant no longer holds a store to count
+   through — retirement is what draining ends in. Read it as "still busy" and you will wait
+   forever for numbers that are never coming back.
 3. **Copy the data** by whatever means you use, and mint a `schema_identity` row in the new
    schema.
 4. **Re-point** — `PUT /api/tenants/np/dsn` with the new DSN, its `schema_uuid`, and a reason.

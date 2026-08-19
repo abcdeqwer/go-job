@@ -26,7 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
@@ -314,6 +314,7 @@ func run() error {
 		OpenDB: func(dsn string) (*sql.DB, error) {
 			return sql.Open("mysql", withDefaults(dsn, loc))
 		},
+		ControlServer: controlServer(c.controlDSN),
 	}, reg, ctl, reg, admin.NewAuth(controlDB, clock, c.sessionTTL, admin.TrustedHeader{
 		Enabled:    c.trustedUserHeader != "",
 		UserHeader: c.trustedUserHeader,
@@ -509,4 +510,31 @@ func certPool(path string) (*x509.CertPool, error) {
 		return nil, fmt.Errorf("%s contains no certificates", path)
 	}
 	return pool, nil
+}
+
+// controlServer derives, from the control DSN, what is needed to put a tenant schema beside it.
+//
+// The credential is captured in the closure and never crosses the API boundary: the UI asks for
+// a database NAME and this composes the DSN, so adding a tenant does not mean typing the control
+// password into a browser form. Address and user are exposed only so an operator can see where a
+// schema would land.
+//
+// An unparseable DSN yields a zero value rather than an error. This is a convenience; the
+// process must still start, and the UI falls back to asking for a full connection.
+func controlServer(controlDSN string) admin.ControlServer {
+	parsed, err := mysqldriver.ParseDSN(controlDSN)
+	if err != nil {
+		return admin.ControlServer{}
+	}
+	return admin.ControlServer{
+		Address: parsed.Addr,
+		User:    parsed.User,
+		DSNFor: func(database string) string {
+			// Copied per call: ParseDSN returns a pointer, and mutating the shared one would
+			// make two concurrent callers compose each other's database name.
+			cfg := parsed.Clone()
+			cfg.DBName = database
+			return cfg.FormatDSN()
+		},
+	}
 }

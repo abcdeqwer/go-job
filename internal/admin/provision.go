@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	_ "embed"
 	"errors"
@@ -26,22 +27,34 @@ var tenantDDL string
 // error message.
 func (a *API) probeTenant(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
-		DSN string `json:"dsn"`
+		DSN      string `json:"dsn"`
+		Database string `json:"database"`
 	}
 	if err := decode(r, &body); err != nil {
 		return err
 	}
-	if strings.TrimSpace(body.DSN) == "" {
-		return badRequest("dsn is required")
+	dsn, err := a.resolveDSN(body.DSN, body.Database)
+	if err != nil {
+		return err
 	}
 
-	db, err := a.cfg.OpenDB(body.DSN)
+	db, err := a.cfg.OpenDB(dsn)
 	if err != nil {
 		return badRequest("cannot open that DSN: %v", err)
 	}
 	defer db.Close()
 
 	if err := db.PingContext(r.Context()); err != nil {
+		// A database that does not exist yet is a state provisioning can fix, not a failure —
+		// but only when this process can create it, which it can only do on its own server.
+		if body.Database != "" && a.cfg.ControlServer.DSNFor != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"reachable": false, "creatable": true, "tables": 0, "provisioned": false,
+				"expects_version": control.SchemaVersion,
+				"detail":          err.Error(),
+			})
+			return nil
+		}
 		return badRequest("cannot reach that database: %v", err)
 	}
 
@@ -98,9 +111,10 @@ func (a *API) probeTenant(w http.ResponseWriter, r *http.Request) error {
 // schema is a job for whoever can see it, not for a retry loop.
 func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
-		DSN    string `json:"dsn"`
-		Tenant string `json:"tenant"`
-		Reason string `json:"reason"`
+		DSN      string `json:"dsn"`
+		Database string `json:"database"`
+		Tenant   string `json:"tenant"`
+		Reason   string `json:"reason"`
 	}
 	if err := decode(r, &body); err != nil {
 		return err
@@ -112,7 +126,19 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	db, err := a.cfg.OpenDB(body.DSN)
+	dsn, err := a.resolveDSN(body.DSN, body.Database)
+	if err != nil {
+		return err
+	}
+	// Before opening it: connecting to a database that does not exist fails before any of the
+	// checks below can run. Only ever for a name this process composed itself.
+	if body.DSN == "" {
+		if err := a.createDatabase(r.Context(), strings.TrimSpace(body.Database)); err != nil {
+			return err
+		}
+	}
+
+	db, err := a.cfg.OpenDB(dsn)
 	if err != nil {
 		return badRequest("cannot open that DSN: %v", err)
 	}
@@ -193,4 +219,91 @@ func firstLineOf(s string) string {
 		s = s[:80]
 	}
 	return strings.TrimSpace(s)
+}
+
+// resolveDSN turns a request body's connection into a DSN.
+//
+// Two shapes are accepted: a full `dsn`, or a bare `database` meaning "beside the control
+// database". The second exists because the first made adding a tenant a five-field form whose
+// hardest field is a password an operator has to fetch from somewhere — and typing the control
+// credential into a browser form is exactly what this avoids: the name comes from the request,
+// the credential never leaves the process.
+func (a *API) resolveDSN(dsn, database string) (string, error) {
+	dsn, database = strings.TrimSpace(dsn), strings.TrimSpace(database)
+	if dsn != "" {
+		return dsn, nil
+	}
+	if database == "" {
+		return "", badRequest("either dsn or database is required")
+	}
+	if a.cfg.ControlServer.DSNFor == nil {
+		return "", badRequest("this deployment cannot place a schema beside the control " +
+			"database; supply a full dsn")
+	}
+	if err := checkDatabaseName(database); err != nil {
+		return "", err
+	}
+	return a.cfg.ControlServer.DSNFor(database), nil
+}
+
+// checkDatabaseName bounds what may be interpolated into a CREATE DATABASE.
+//
+// Deliberately narrower than MySQL allows. The name reaches DDL that cannot be parameterised, so
+// the defence is the character set, not quoting — and no legitimate coordination schema needs a
+// character outside this range.
+func checkDatabaseName(name string) error {
+	if len(name) == 0 || len(name) > 64 {
+		return badRequest("database name must be 1 to 64 characters")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_':
+		default:
+			return badRequest("database name may contain only letters, digits and underscore")
+		}
+	}
+	if name[0] >= '0' && name[0] <= '9' {
+		return badRequest("database name must not start with a digit")
+	}
+	return nil
+}
+
+// createDatabase creates the schema itself when it does not exist yet.
+//
+// Connecting to a database that does not exist fails before any of the provisioning checks run,
+// so this is done first, on a connection to the SERVER rather than to the database. It is
+// idempotent, and it only ever runs for a name this process composed from the control
+// connection — never for one an operator pasted, because that path has no server to create on.
+func (a *API) createDatabase(ctx context.Context, database string) error {
+	if a.cfg.ControlServer.DSNFor == nil {
+		return nil
+	}
+	if err := checkDatabaseName(database); err != nil {
+		return err
+	}
+	// The empty database name opens the server without selecting a schema.
+	server, err := a.cfg.OpenDB(a.cfg.ControlServer.DSNFor(""))
+	if err != nil {
+		return badRequest("cannot reach the control server: %v", err)
+	}
+	defer server.Close()
+	if _, err := server.ExecContext(ctx,
+		"CREATE DATABASE IF NOT EXISTS `"+database+"` DEFAULT CHARACTER SET utf8mb4"); err != nil {
+		return fmt.Errorf("%w: creating database %s: %v", gojob.ErrProtocol, database, err)
+	}
+	return nil
+}
+
+// controlConnection tells the UI where a schema would be placed, and under which account.
+//
+// No password, and nothing here is accepted back as input — it exists so an operator adding a
+// tenant can see that "gojob_bp" means "on mysql:3306, as gojob" rather than having to trust it.
+func (a *API) controlConnection(w http.ResponseWriter, r *http.Request) error {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": a.cfg.ControlServer.DSNFor != nil,
+		"address":   a.cfg.ControlServer.Address,
+		"user":      a.cfg.ControlServer.User,
+	})
+	return nil
 }
