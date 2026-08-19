@@ -596,15 +596,36 @@ function render() {
 
 async function renderOnce() {
   showError(null);
-  if (!state.tenant) { table(["tenant"], []); return; }
+
+  // The two INSTALLATION-wide views first. They are not about a tenant, and gating them on one
+  // being selected is what made a fresh installation a dead end: with no tenants there is no
+  // selection, so the tenants page — the only place to create the first one — refused to draw
+  // and the button that creates it never existed. Every new deployment hit it.
+  try {
+    if (state.view === "tenants") return await renderTenants();
+    if (state.view === "identities") return await renderIdentities();
+  } catch (e) { showError(e); return; }
+
+  if (!state.tenant) {
+    // "No tenants" and "tenants, none admitted yet" look identical from here and are not the
+    // same thing: the second is a tenant that was just added and is waiting for the next
+    // registry poll, and telling that operator to go and add one is wrong AND confusing.
+    table(["tenant"], []);
+    const any = (state.tenants || []).length > 0;
+    $("#controls").innerHTML = any
+      ? '<span class="dim">租户还未被接纳——每个实例按注册表轮询间隔（默认 10 秒）拉取一次。'
+        + '稍等，或到「租户」页看它的最近错误。</span>'
+      : state.role === "OPERATOR"
+        ? '<span class="dim">还没有租户。到「租户」页添加第一个。</span>'
+        : '<span class="dim">还没有租户。</span>';
+    return;
+  }
   const t = encodeURIComponent(state.tenant);
   try {
     if (state.view === "jobs") return await renderJobs(t);
     if (state.view === "executions") return await renderExecutions(t);
     if (state.view === "executors") return await renderExecutors(t);
     if (state.view === "audit") return await renderAudit(t);
-    if (state.view === "identities") return await renderIdentities();
-    if (state.view === "tenants") return await renderTenants();
   } catch (e) { showError(e); }
 }
 
@@ -900,6 +921,14 @@ $("#tenantForm").addEventListener("submit", async ev => {
     $("#tenantDlg").close();
     await loadTenants();
     render();
+    // Admission happens on the next registry poll, so the tenant is listed before it is
+    // usable. Re-read a few times rather than leaving the operator on a page that says
+    // nothing is here until they reload by hand.
+    for (let i = 0; i < 8 && !state.tenant; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      await loadTenants();
+      render();
+    }
   } catch (e) {
     $("#tenantErr").textContent = String(e.message || e);
     $("#tenantErr").hidden = false;
@@ -1289,6 +1318,9 @@ async function boot() {
     state.role = me.role;
     $("#who").textContent = `${me.actor} · ${me.role}`;
     await loadTenants();
+    // A fresh installation opens where the only useful action is, rather than on an empty job
+    // list for a tenant that does not exist.
+    if (!state.tenant) state.view = "tenants";
     setView(state.view);
   } catch (e) {
     if (String(e.message).includes("signed in")) return;
