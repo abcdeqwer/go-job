@@ -38,8 +38,20 @@ type Executor struct {
 	Running         int
 	Capabilities    string
 	Handlers        []string
-	StartedAt       time.Time
-	HeartbeatAt     time.Time
+	// StartedAt and HeartbeatAt are OWNERSHIP columns: written with UTC_TIMESTAMP(), so the
+	// values in them are UTC wall clock. The driver tags whatever it reads with the DSN's
+	// `loc`, which is the BUSINESS location — so a value read straight out of the scan is
+	// labelled with an offset it does not have. asUTC re-tags it, which is the only reason
+	// these two fields can be compared or formatted at all.
+	StartedAt   time.Time
+	HeartbeatAt time.Time
+
+	// Live is decided in SQL, against the database's own clock, exactly as dispatch decides
+	// it. Deriving it in Go from HeartbeatAt and a business-clock "now" compared a UTC instant
+	// against a business one: in any deployment whose location is not UTC, every live executor
+	// reported dead, by the size of the offset. It is invisible in UTC, which is what every
+	// test ran in.
+	Live bool
 }
 
 // Register records an executor and the handlers it declares, replacing any previous
@@ -220,11 +232,12 @@ func (s *Store) LiveExecutors(ctx context.Context, handlerKey, group string, liv
 
 // AllExecutors lists every registration for the admin UI, live or not, so an operator can see
 // a process that stopped heartbeating rather than merely see it vanish.
-func (s *Store) AllExecutors(ctx context.Context) ([]Executor, error) {
+func (s *Store) AllExecutors(ctx context.Context, livenessSeconds int) ([]Executor, error) {
 	const q = `
 		SELECT e.executor_id, e.executor_group, e.address, e.contract_version, e.revision,
 		       e.capacity, e.running, COALESCE(e.capabilities, ''), e.identity,
 		       e.started_at, e.heartbeat_at,
+		       e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP()),
 		       COALESCE(GROUP_CONCAT(h.handler_key ORDER BY h.handler_key SEPARATOR ','), '')
 		FROM job_executor e
 		LEFT JOIN job_executor_handler h ON h.executor_id = e.executor_id
@@ -232,7 +245,7 @@ func (s *Store) AllExecutors(ctx context.Context) ([]Executor, error) {
 		         e.capacity, e.running, e.capabilities, e.identity, e.started_at, e.heartbeat_at
 		ORDER BY e.executor_group, e.executor_id`
 
-	rows, err := s.db.QueryContext(ctx, q)
+	rows, err := s.db.QueryContext(ctx, q, -livenessSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("list executors: %w", err)
 	}
@@ -246,9 +259,10 @@ func (s *Store) AllExecutors(ctx context.Context) ([]Executor, error) {
 		)
 		if err := rows.Scan(&e.ExecutorID, &e.Group, &e.Address, &e.ContractVersion, &e.Revision,
 			&e.Capacity, &e.Running, &e.Capabilities, &e.Identity,
-			&e.StartedAt, &e.HeartbeatAt, &handlers); err != nil {
+			&e.StartedAt, &e.HeartbeatAt, &e.Live, &handlers); err != nil {
 			return nil, fmt.Errorf("scan executor: %w", err)
 		}
+		e.StartedAt, e.HeartbeatAt = asUTC(e.StartedAt), asUTC(e.HeartbeatAt)
 		if handlers != "" {
 			e.Handlers = strings.Split(handlers, ",")
 		}

@@ -49,6 +49,7 @@ type harness struct {
 	exec    *testexec.Executor
 	disp    *dispatch.Client
 	sched   *server.Server
+	schema  string
 	cancel  context.CancelFunc
 	dial    func(string) (*grpc.ClientConn, error)
 	connect func()
@@ -115,7 +116,7 @@ func setup(t *testing.T) *harness {
 	clock := gojob.SystemClock{Loc: time.UTC}
 	st := store.New(db, clock)
 
-	h := &harness{t: t, db: db, store: st, clock: clock}
+	h := &harness{t: t, db: db, store: st, clock: clock, schema: schema}
 	h.startExecutorAndScheduler()
 	return h
 }

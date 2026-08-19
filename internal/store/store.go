@@ -28,6 +28,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
 )
@@ -116,6 +117,21 @@ func assertOne(res sql.Result, stmt string) error {
 		return fmt.Errorf("%w: %s affected %d rows, expected exactly 1", gojob.ErrProtocol, stmt, n)
 	}
 	return nil
+}
+
+// asUTC re-tags a timestamp read from an OWNERSHIP column.
+//
+// Those columns are written with UTC_TIMESTAMP(), so the value in them is UTC wall clock. The
+// driver, however, tags every DATETIME it reads with the DSN's `loc` — the BUSINESS location —
+// so the scanned time.Time carries an offset the value never had. Left alone it is wrong by
+// exactly that offset, and the error is invisible in a UTC deployment, which is what tests run
+// in.
+//
+// The protocol paths never hit this, because ownership is compared in SQL and never read into
+// Go. Reporting does read it, to show an operator when something last happened.
+func asUTC(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(),
+		t.Nanosecond(), time.UTC)
 }
 
 // nullString renders an optional column.

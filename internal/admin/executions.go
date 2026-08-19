@@ -212,11 +212,10 @@ func (a *API) listExecutors(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	xs, err := st.AllExecutors(r.Context())
+	xs, err := st.AllExecutors(r.Context(), int((a.cfg.ExecutorLiveness+time.Second-1)/time.Second))
 	if err != nil {
 		return err
 	}
-	cutoff := a.cfg.Clock.Now().Add(-a.cfg.ExecutorLiveness)
 
 	out := make([]map[string]any, 0, len(xs))
 	for _, x := range xs {
@@ -234,7 +233,7 @@ func (a *API) listExecutors(w http.ResponseWriter, r *http.Request) error {
 			// Shown rather than filtered out: an executor that stopped heartbeating is the
 			// thing an operator is looking for, and removing it from the list turns "it died"
 			// into "it was never there".
-			"live": x.HeartbeatAt.After(cutoff),
+			"live": x.Live,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

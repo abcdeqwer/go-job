@@ -845,3 +845,84 @@ func TestCancelRelayReachesLaterRequests(t *testing.T) {
 		t.Fatal("the scan is not deterministic; this test's premise no longer holds")
 	}
 }
+
+// The executors view must report liveness and timestamps correctly in a NON-UTC deployment.
+//
+// started_at and heartbeat_at are ownership columns: written with UTC_TIMESTAMP(), so what is
+// stored is UTC wall clock. The driver tags every DATETIME it reads with the DSN's `loc`, which
+// is the business location — so a scanned value carries an offset it never had, and deriving
+// liveness from it in Go compares a UTC instant against a business one.
+//
+// In a UTC deployment the offset is zero and everything looks right. That is why this bug
+// shipped: every test in this repository runs at UTC. In Asia/Manila every live executor was
+// reported dead, and both timestamps displayed eight hours early.
+func TestExecutorViewIsCorrectOutsideUTC(t *testing.T) {
+	h := setup(t)
+	ctx := context.Background()
+
+	if err := h.store.Register(ctx, store.Executor{
+		ExecutorID: "tz-exec", Group: "main", Address: "host:9000",
+		ContractVersion: "1", Revision: "r1", Capacity: 4,
+		Handlers: []string{"test.handler"},
+	}, 30); err != nil {
+		t.Fatal(err)
+	}
+
+	// A SECOND pool against the same schema, opened the way a Manila deployment opens one.
+	//
+	// This is the whole point of the test. The harness runs at UTC, where the offset is zero
+	// and the defect cannot appear — reading through this pool is the only way to see what an
+	// operator in Asia/Manila would have seen.
+	manilaDB, err := sql.Open("mysql",
+		dsn(t)+h.schema+"?parseTime=true&loc=Asia%2FManila&multiStatements=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manilaDB.Close()
+	manila, err := time.LoadLocation("Asia/Manila")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manilaStore := store.New(manilaDB, gojob.SystemClock{Loc: manila})
+
+	xs, err := manilaStore.AllExecutors(ctx, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(xs) != 1 {
+		t.Fatalf("got %d executors, want 1", len(xs))
+	}
+	x := xs[0]
+
+	// Liveness is the database's answer, so it does not depend on the reader's time zone.
+	if !x.Live {
+		t.Error("an executor that just registered is reported dead")
+	}
+
+	// And the timestamp must be the instant it actually is, within a minute — whatever the
+	// business location is. Compared as instants, which is what the mis-tagging breaks.
+	if skew := time.Since(x.HeartbeatAt); skew < 0 || skew > time.Minute {
+		t.Errorf("heartbeat_at is %s away from now; an ownership column read without being "+
+			"re-tagged as UTC is wrong by the business offset", skew.Round(time.Second))
+	}
+	if x.HeartbeatAt.Location() != time.UTC {
+		t.Errorf("heartbeat_at is tagged %s, want UTC — it holds a UTC wall clock",
+			x.HeartbeatAt.Location())
+	}
+
+	// Now the part that only bites outside UTC: an executor whose heartbeat has lapsed must
+	// read as dead, and one inside the window as live, with the window measured in the
+	// database rather than against a business-clock "now".
+	if _, err := h.db.ExecContext(ctx, `
+		UPDATE job_executor SET heartbeat_at = TIMESTAMPADD(SECOND, -45, UTC_TIMESTAMP())
+		WHERE executor_id = 'tz-exec'`); err != nil {
+		t.Fatal(err)
+	}
+	xs, err = manilaStore.AllExecutors(ctx, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if xs[0].Live {
+		t.Error("an executor whose heartbeat lapsed 45s ago is reported live under a 30s window")
+	}
+}
