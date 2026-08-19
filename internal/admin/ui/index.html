@@ -6,52 +6,123 @@
 <title>go-job</title>
 <style>
   :root {
-    --bg: #0f1115; --panel: #171a21; --line: #262b36; --text: #e6e8ee;
-    --dim: #939bab; --accent: #6ea8fe; --ok: #4ec9a5; --warn: #e0b341; --bad: #e0685f;
+    --bg:#0e1013; --panel:#16191f; --raised:#1d212a; --line:#282d38; --line-soft:#20242d;
+    --text:#e7eaf0; --dim:#98a1b2; --faint:#6b7385;
+    --accent:#5b9cf8; --accent-ink:#0b1220;
+    --ok:#3fbf95; --warn:#dbab3c; --bad:#e2695f;
+    --radius:8px; --radius-lg:12px;
+    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: light) {
     :root {
-      --bg: #f6f7f9; --panel: #fff; --line: #e2e5ea; --text: #1a1d23;
-      --dim: #5f6673; --accent: #2563eb; --ok: #157f5f; --warn: #96690a; --bad: #b3352c;
+      --bg:#f5f6f8; --panel:#fff; --raised:#f0f2f5; --line:#dfe3e9; --line-soft:#ebeef2;
+      --text:#161a20; --dim:#5b6472; --faint:#858d9b;
+      --accent:#2563eb; --accent-ink:#fff;
+      --ok:#0f7a5a; --warn:#8a6008; --bad:#b3352c;
     }
   }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  header { display: flex; gap: 16px; align-items: center; padding: 10px 16px;
-           border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
-  header b { letter-spacing: .5px; }
-  nav button { background: none; border: none; color: var(--dim); cursor: pointer;
-               padding: 6px 10px; font: inherit; border-radius: 6px; }
-  nav button[aria-current="true"] { color: var(--text); background: var(--bg); }
-  main { padding: 16px; }
-  select, input, textarea, button { font: inherit; color: var(--text);
-    background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; cursor: pointer; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
-  table { border-collapse: collapse; width: 100%; min-width: 720px; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
-           white-space: nowrap; }
-  th { color: var(--dim); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
-  tr:last-child td { border-bottom: none; }
-  td.wrap { white-space: normal; max-width: 420px; }
-  .tag { padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); font-size: 12px; }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-  .dim { color: var(--dim); }
-  .err { color: var(--bad); margin: 8px 0; }
-  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line);
-           border-radius: 10px; padding: 16px; min-width: min(560px, 92vw); }
-  dialog::backdrop { background: rgba(0,0,0,.5); }
-  label { display: block; margin: 8px 0 2px; color: var(--dim); }
-  input, textarea, select { width: 100%; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
-  code { color: var(--accent); }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.55 var(--ui); -webkit-font-smoothing:antialiased; }
+
+  /* ---------- chrome ---------- */
+  /* min-height, not height. A fixed height with flex-wrap:wrap clips whatever wraps — on a
+     narrow window the nav wrapped to a second line that was cut off, leaving the tabs
+     present in the DOM, invisible, and unclickable. */
+  header { display:flex; gap:14px 14px; align-items:center; padding:8px 18px; min-height:52px;
+           border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
+  header .brand { font-weight:650; font-size:15px; letter-spacing:-.01em; }
+  header .brand span { color:var(--accent); }
+  nav { display:flex; gap:2px; }
+  nav button { background:none; border:none; color:var(--dim); cursor:pointer;
+               padding:7px 12px; font:inherit; font-weight:500; border-radius:var(--radius);
+               transition:background .12s, color .12s; }
+  nav button:hover { color:var(--text); background:var(--raised); }
+  nav button[aria-current="true"] { color:var(--text); background:var(--raised);
+                                    box-shadow:inset 0 0 0 1px var(--line); }
+  main { padding:18px; max-width:1600px; }
+
+  /* ---------- controls ---------- */
+  select, input, textarea, button { font:inherit; color:var(--text); background:var(--bg);
+    border:1px solid var(--line); border-radius:var(--radius); padding:6px 9px; }
+  select { cursor:pointer; }
+  input, textarea { font-family:var(--mono); font-size:13px; }
+  input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible {
+    outline:2px solid var(--accent); outline-offset:1px; }
+  button { cursor:pointer; transition:background .12s, border-color .12s; }
+  button:hover { background:var(--raised); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink);
+                   font-weight:550; }
+  button.primary:hover { filter:brightness(1.08); background:var(--accent); }
+  button.danger { color:var(--bad); border-color:var(--line); }
+  button.danger:hover { border-color:var(--bad); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+
+  /* ---------- table ---------- */
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius-lg);
+            background:var(--panel); }
+  table { border-collapse:collapse; width:100%; min-width:760px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line-soft);
+           white-space:nowrap; }
+  th { color:var(--dim); font-weight:550; font-size:12px; letter-spacing:.03em;
+       text-transform:uppercase; position:sticky; top:0; background:var(--panel);
+       border-bottom-color:var(--line); }
+  tbody tr:hover { background:var(--raised); }
+  tr:last-child td { border-bottom:none; }
+  td.wrap { white-space:normal; max-width:460px; }
+  td:first-child { font-weight:550; }
+  code { font-family:var(--mono); font-size:12.5px; color:var(--text);
+         background:var(--raised); border:1px solid var(--line-soft);
+         padding:1px 5px; border-radius:5px; }
+
+  /* ---------- status ---------- */
+  .tag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px;
+         font-weight:550; border:1px solid currentColor; }
+  .tag.ok { color:var(--ok); } .tag.warn { color:var(--warn); } .tag.bad { color:var(--bad); }
+  .tag:not(.ok):not(.warn):not(.bad) { color:var(--dim); }
+  .ok{color:var(--ok);} .warn{color:var(--warn);} .bad{color:var(--bad);} .dim{color:var(--dim);}
+  .err { color:var(--bad); margin:10px 0; padding:9px 12px; border-radius:var(--radius);
+         background:color-mix(in srgb, var(--bad) 12%, transparent);
+         border:1px solid color-mix(in srgb, var(--bad) 35%, transparent); }
+
+  /* ---------- dialogs ---------- */
+  dialog { background:var(--panel); color:var(--text); border:1px solid var(--line);
+           border-radius:var(--radius-lg); padding:0; min-width:min(620px, 94vw);
+           max-height:88vh; box-shadow:0 24px 60px rgba(0,0,0,.45); }
+  dialog::backdrop { background:rgba(6,8,11,.62); backdrop-filter:blur(2px); }
+  dialog.wide { min-width:min(880px, 96vw); }
+  .dlg-head { padding:16px 20px 12px; border-bottom:1px solid var(--line); }
+  .dlg-head h3 { margin:0; font-size:16px; font-weight:600; letter-spacing:-.01em; }
+  .dlg-head p { margin:6px 0 0; color:var(--dim); font-size:13px; line-height:1.5; }
+  .dlg-body { padding:16px 20px; overflow-y:auto; }
+  .dlg-foot { display:flex; gap:8px; justify-content:flex-end; align-items:center;
+              padding:12px 20px; border-top:1px solid var(--line); background:var(--raised);
+              border-radius:0 0 var(--radius-lg) var(--radius-lg); }
+
+  /* ---------- forms ---------- */
+  fieldset { border:none; margin:0 0 18px; padding:0; }
+  fieldset:last-of-type { margin-bottom:4px; }
+  legend { padding:0; margin-bottom:10px; font-size:11px; font-weight:650;
+           letter-spacing:.08em; text-transform:uppercase; color:var(--faint); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px 16px; }
+  @media (max-width:640px) { .grid2 { grid-template-columns:1fr; } }
+  .f { display:flex; flex-direction:column; gap:3px; min-width:0; }
+  .f > label { font-family:var(--mono); font-size:12.5px; color:var(--text); font-weight:500; }
+  .f > .hint { color:var(--dim); font-size:12px; line-height:1.45; }
+  .f > .hint b { color:var(--text); font-weight:600; font-family:var(--mono); font-size:11.5px; }
+  .f input, .f select, .f textarea { width:100%; }
+  label { display:block; }
+  /* Scoped to forms. A blanket width:100% also hit the tenant picker in the header, which
+     then took a whole row to itself. */
+  form input, form textarea, form select { width:100%; }
+  header select { width:auto; min-width:120px; }
+  textarea { resize:vertical; }
 </style>
 </head>
 <body>
 <header>
-  <b>go-job</b>
+  <span class="brand">go<span>·</span>job</span>
   <select id="tenant" title="tenant"></select>
   <nav>
     <button data-view="jobs" aria-current="true">jobs</button>
@@ -72,56 +143,183 @@
 
 <dialog id="login">
   <form method="dialog" id="loginForm">
-    <h3 style="margin-top:0">Sign in</h3>
-    <label>username</label><input name="username" autocomplete="username" required>
-    <label>password</label><input name="password" type="password" autocomplete="current-password" required>
-    <div class="err" id="loginErr" hidden></div>
-    <div class="row" style="margin-top:12px;justify-content:flex-end">
-      <button class="primary" value="go">sign in</button>
+    <div class="dlg-head"><h3>Sign in</h3></div>
+    <div class="dlg-body">
+      <div class="f">
+        <label for="lu">username</label>
+        <input id="lu" name="username" autocomplete="username" required>
+      </div>
+      <div class="f" style="margin-top:14px">
+        <label for="lp">password</label>
+        <input id="lp" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="err" id="loginErr" hidden></div>
     </div>
+    <div class="dlg-foot"><button class="primary" value="go">sign in</button></div>
   </form>
 </dialog>
 
 <dialog id="prompt">
   <form method="dialog" id="promptForm">
-    <h3 id="promptTitle" style="margin-top:0"></h3>
-    <p id="promptNote" class="dim"></p>
-    <label>reason (recorded in the audit log)</label>
-    <input name="reason" required>
-    <div class="row" style="margin-top:12px;justify-content:flex-end">
-      <button value="cancel">cancel</button>
+    <div class="dlg-head">
+      <h3 id="promptTitle"></h3>
+      <p id="promptNote"></p>
+    </div>
+    <div class="dlg-body">
+      <div class="f">
+        <label for="promptReason">reason</label>
+        <input id="promptReason" name="reason" required placeholder="what you are doing, and why">
+        <span class="hint">Recorded in the audit log against your account. Required.</span>
+      </div>
+    </div>
+    <div class="dlg-foot">
+      <!-- formnovalidate, or the required field above blocks cancel and the browser shows
+           "please fill in this field" on a dialog the operator is trying to abandon. -->
+      <button value="cancel" formnovalidate>cancel</button>
       <button class="primary" value="ok">confirm</button>
     </div>
   </form>
 </dialog>
 
-<dialog id="jobDlg">
+<dialog id="jobDlg" class="wide">
   <form method="dialog" id="jobForm">
-    <h3 id="jobTitle" style="margin-top:0">New job</h3>
-    <div class="grid2">
-      <div><label>job_name</label><input name="job_name" required></div>
-      <div><label>handler_key</label><input name="handler_key" list="handlers" required></div>
-      <div><label>schedule_kind</label>
-        <select name="schedule_kind"><option>CRON</option><option>FIXED_DELAY</option></select></div>
-      <div><label>schedule_expr</label><input name="schedule_expr" placeholder="0 0 2 * * *" required></div>
-      <div><label>executor_group</label><input name="executor_group" placeholder="any"></div>
-      <div><label>concurrency_policy</label>
-        <select name="concurrency_policy"><option>QUEUE</option><option>FORBID</option></select></div>
-      <div><label>misfire_policy</label>
-        <select name="misfire_policy"><option>FIRE_ONCE</option><option>SKIP</option></select></div>
-      <div><label>enabled</label>
-        <select name="enabled"><option value="true">true</option><option value="false">false</option></select></div>
-      <div><label>max_attempts</label><input name="max_attempts" type="number" value="3"></div>
-      <div><label>max_recoveries</label><input name="max_recoveries" type="number" value="3"></div>
-      <div><label>lease_seconds</label><input name="lease_seconds" type="number" value="60"></div>
-      <div><label>timeout_seconds</label><input name="timeout_seconds" type="number" value="900"></div>
+    <div class="dlg-head">
+      <h3 id="jobTitle">New job</h3>
+      <p>A job is a schedule plus the name of a handler. Nothing runs it until an executor
+         registers that handler key.</p>
     </div>
-    <label>params (JSON object)</label><textarea name="params" rows="3">{}</textarea>
-    <label>description</label><input name="description">
-    <label>reason (recorded in the audit log)</label><input name="reason" required>
-    <div class="err" id="jobErr" hidden></div>
-    <div class="row" style="margin-top:12px;justify-content:flex-end">
-      <button value="cancel">cancel</button>
+    <div class="dlg-body">
+
+      <fieldset>
+        <legend>Identity</legend>
+        <div class="grid2">
+          <div class="f">
+            <label>job_name</label>
+            <input name="job_name" required placeholder="nightly-report">
+            <span class="hint">Unique within the tenant. Names the job in every log line,
+              audit entry and execution key.</span>
+          </div>
+          <div class="f">
+            <label>handler_key</label>
+            <input name="handler_key" list="handlers" required placeholder="report.nightly">
+            <span class="hint">Must match a key an executor declares, <b>exactly</b>. No match
+              means the job materializes and is never dispatched.</span>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Schedule</legend>
+        <div class="grid2">
+          <div class="f">
+            <label>schedule_kind</label>
+            <select name="schedule_kind"><option>CRON</option><option>FIXED_DELAY</option></select>
+            <span class="hint"><b>CRON</b> — one execution per fire instant, so a missed one is
+              still a missed occurrence. <b>FIXED_DELAY</b> — one pass at a time, the next
+              scheduled a fixed delay after the last finishes.</span>
+          </div>
+          <div class="f">
+            <label>schedule_expr</label>
+            <input name="schedule_expr" required placeholder="0 0 3 * * *">
+            <span class="hint">Six fields, <b>seconds first</b>: sec min hour dom month dow.
+              Evaluated in the deployment's business time zone. For FIXED_DELAY, the delay in
+              seconds.</span>
+          </div>
+          <div class="f">
+            <label>misfire_policy</label>
+            <select name="misfire_policy"><option>FIRE_ONCE</option><option>SKIP</option></select>
+            <span class="hint">What happens to instants missed while nothing was running.
+              <b>FIRE_ONCE</b> catches up with a single run. <b>SKIP</b> advances to the next
+              future instant and runs nothing — a five-minute outage costs a daily job its
+              whole day.</span>
+          </div>
+          <div class="f">
+            <label>enabled</label>
+            <select name="enabled"><option value="true">true</option><option value="false">false</option></select>
+            <span class="hint">Disabled keeps the configuration and the schedule but is never
+              claimed. Use it to stage a job before cutting over to it.</span>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Routing and concurrency</legend>
+        <div class="grid2">
+          <div class="f">
+            <label>executor_group</label>
+            <input name="executor_group" placeholder="any">
+            <span class="hint">Empty means any executor serving the handler. Naming a group
+              confines the job to it — how a canary takes a slice of traffic without taking
+              production's.</span>
+          </div>
+          <div class="f">
+            <label>concurrency_policy</label>
+            <select name="concurrency_policy"><option>QUEUE</option><option>FORBID</option></select>
+            <span class="hint"><b>QUEUE</b> — a due occurrence waits for the running one.
+              <b>FORBID</b> — it is skipped outright and recorded as skipped.</span>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Limits</legend>
+        <div class="grid2">
+          <div class="f">
+            <label>timeout_seconds</label>
+            <input name="timeout_seconds" type="number" value="900" min="1">
+            <span class="hint">Runtime cap for <b>one attempt</b>, started at the claim. Passing
+              it is terminal and is <b>not</b> retried — a run that used its whole budget will
+              most likely use it again.</span>
+          </div>
+          <div class="f">
+            <label>lease_seconds</label>
+            <input name="lease_seconds" type="number" value="60" min="10">
+            <span class="hint">How long this scheduler may go without renewing before another
+              may recover the work. Minimum 10, and must not exceed the timeout. Leave it
+              alone unless you know why.</span>
+          </div>
+          <div class="f">
+            <label>max_attempts</label>
+            <input name="max_attempts" type="number" value="3" min="1">
+            <span class="hint">Tries per occurrence, including the first. A failure whose
+              failure_kind starts with <b>permanent</b> stops early instead of burning the
+              budget.</span>
+          </div>
+          <div class="f">
+            <label>max_recoveries</label>
+            <input name="max_recoveries" type="number" value="3" min="1">
+            <span class="hint">A separate budget for attempts lost to a crashed scheduler or an
+              unreachable executor — where nobody knows whether the work ran. Spending it does
+              not consume an attempt.</span>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Payload</legend>
+        <div class="f">
+          <label>params</label>
+          <textarea name="params" rows="3">{}</textarea>
+          <span class="hint">A JSON object handed to the handler. A manual trigger's overrides
+            are <b>merged</b> over these, not substituted. <b>No secrets</b> — these are stored
+            in the tenant schema, shown here, and sent over the wire.</span>
+        </div>
+        <div class="f" style="margin-top:14px">
+          <label>description</label>
+          <input name="description" placeholder="what this job is for">
+          <span class="hint">For whoever reads this list at 3am.</span>
+        </div>
+        <div class="f" style="margin-top:14px">
+          <label>reason</label>
+          <input name="reason" required placeholder="why you are creating or changing this">
+          <span class="hint">Recorded in the audit log against your account. Required.</span>
+        </div>
+      </fieldset>
+
+      <div class="err" id="jobErr" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>cancel</button>
       <button class="primary" value="ok">save</button>
     </div>
   </form>
@@ -202,7 +400,28 @@ async function loadTenants() {
   if (state.tenant) sel.value = state.tenant;
 }
 
-async function render() {
+// Renders are SERIALIZED, and at most one is queued behind the running one.
+//
+// Every view fetches before it draws, so without this two can be in flight at once: switch
+// tenant and click a tab before the first finishes, and the slower one lands last — leaving the
+// table showing a view nobody asked for, with the right tab highlighted, until the five-second
+// refresh corrects it. During an incident that is worse than showing nothing.
+//
+// Serializing is enough because a queued render reads state.view and state.tenant when it
+// RUNS, not when it was queued, so the last draw is always the current state. Coalescing to one
+// pending render keeps a burst of clicks from queuing a fetch per click.
+let renderRunning = null, renderPending = false;
+
+function render() {
+  if (renderRunning) { renderPending = true; return renderRunning; }
+  renderRunning = renderOnce().finally(() => {
+    renderRunning = null;
+    if (renderPending) { renderPending = false; render(); }
+  });
+  return renderRunning;
+}
+
+async function renderOnce() {
   showError(null);
   if (!state.tenant) { table(["tenant"], []); return; }
   const t = encodeURIComponent(state.tenant);
@@ -421,7 +640,11 @@ function openJob(name) {
 
 $("#jobForm").addEventListener("submit", async ev => {
   const f = ev.target;
-  if (f.returnValue === "cancel") return;
+  // ev.submitter, not f.returnValue: `returnValue` belongs to the DIALOG, so the old check
+  // read undefined and never matched. It was masked by the missing formnovalidate above —
+  // validation blocked cancel before submit fired — so fixing only one of the two would have
+  // turned cancel into save.
+  if (ev.submitter && ev.submitter.value === "cancel") return;
   ev.preventDefault();
   $("#jobErr").hidden = true;
 
