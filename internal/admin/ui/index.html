@@ -274,42 +274,6 @@
   </form>
 </dialog>
 
-<dialog id="bootstrap" class="wide">
-  <form method="dialog" id="bootstrapForm">
-    <div class="dlg-head">
-      <h3>配置控制数据库</h3>
-      <p>这个进程还不知道自己的控制库在哪。填好之后会写进配置文件并自动重启——
-         你不用再去改启动参数。</p>
-    </div>
-    <div class="dlg-body">
-      <div class="f">
-        <label>setup token</label>
-        <input name="token" required placeholder="从启动日志里复制">
-        <span class="hint">在容器日志开头的方框里（<code>docker logs</code>）。
-          <b>这是这一步唯一的门</b>：在控制库存在之前没有任何账号，而一个不设防的
-          「连到这个数据库」接口等于把整套系统交出去——指向攻击者自己的 MySQL，
-          他就能创建管理员并读到之后所有租户的连接串。</span>
-      </div>
-      <div class="grid2" style="margin-top:16px">
-        <div class="f"><label>host</label><input name="host" required placeholder="127.0.0.1"></div>
-        <div class="f"><label>port</label><input name="port" value="3306"></div>
-        <div class="f"><label>database</label><input name="database" required placeholder="gojob_control"></div>
-        <div class="f"><label>user</label><input name="user" required placeholder="gojob"></div>
-        <div class="f"><label>password</label><input name="password" type="password"></div>
-      </div>
-      <div class="row" style="margin:16px 0 0">
-        <button type="button" id="bsProbe">测试连接</button>
-        <span id="bsMsg" class="dim"></span>
-      </div>
-      <div id="bsBox" class="preview"></div>
-      <div class="err" id="bsErr" hidden></div>
-    </div>
-    <div class="dlg-foot">
-      <button class="primary" value="ok" id="bsApply" disabled>先测试连接</button>
-    </div>
-  </form>
-</dialog>
-
 <dialog id="setup">
   <form method="dialog" id="setupForm">
     <div class="dlg-head">
@@ -1169,99 +1133,6 @@ $("#jobForm").addEventListener("submit", async ev => {
 
 function openLogin() { $("#loginErr").hidden = true; $("#login").showModal(); }
 
-function bsDSN(f) {
-  const port = (f.port.value || "3306").trim();
-  const pw = f.password.value ? ":" + f.password.value : "";
-  return `${f.user.value}${pw}@tcp(${f.host.value}:${port})/${f.database.value}`;
-}
-
-async function bsPost(path, body) {
-  const r = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json",
-               "X-Setup-Token": $("#bootstrapForm").token.value.trim() },
-    body: JSON.stringify(body),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-  return j;
-}
-
-$("#bsProbe").onclick = async () => {
-  const f = $("#bootstrapForm");
-  if (!f.token.value || !f.host.value || !f.user.value || !f.database.value) {
-    $("#bsMsg").textContent = "先填 token / host / user / database"; return;
-  }
-  $("#bsMsg").textContent = "连接中…"; $("#bsBox").innerHTML = "";
-  $("#bsApply").disabled = true; $("#bsApply").textContent = "先测试连接";
-  try {
-    const r = await bsPost("/api/bootstrap/probe", { dsn: bsDSN(f) });
-    $("#bsMsg").textContent = "";
-    if (r.tables === 4) {
-      $("#bsBox").innerHTML = '<span class="t">已是一个 go-job 控制库</span>，直接接管即可。';
-      f.dataset.create = "false";
-    } else if (r.tables === 0) {
-      $("#bsBox").innerHTML = '连接成功，<span class="t">这是一个空库</span>，将为它建表。';
-      f.dataset.create = "true";
-    } else {
-      $("#bsBox").innerHTML = `<span class="bad">这个库里有 ${r.tables} 张控制表（共 4 张），`
-        + `是个建了一半的 schema。手工处理干净再来。</span>`;
-      return;
-    }
-    $("#bsApply").disabled = false;
-    $("#bsApply").textContent = f.dataset.create === "true" ? "建表并启动" : "接管并启动";
-  } catch (e) {
-    $("#bsMsg").textContent = "";
-    $("#bsBox").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
-  }
-};
-
-$("#bootstrapForm").addEventListener("submit", async ev => {
-  ev.preventDefault();
-  const f = ev.target;
-  $("#bsErr").hidden = true;
-  $("#bsApply").disabled = true;
-  $("#bsBox").innerHTML = "写入配置并重启…";
-  try {
-    const r = await bsPost("/api/bootstrap/apply",
-      { dsn: bsDSN(f), create_tables: f.dataset.create === "true" });
-
-    // Say how to make this stick, HERE, while it is the thing being done.
-    //
-    // The setting is written to a file inside the process's filesystem. In a container that
-    // survives a restart and not a recreate — `compose up -d` after a rebuild starts from a
-    // clean image — so without either a mounted path or the environment variable, the next
-    // deploy lands back on this page. Finding that out by having to do it again is a bad way
-    // to learn it, and it is the one thing this screen knows and the operator does not.
-    $("#bsBox").innerHTML =
-      `<div style="line-height:1.7">已写入 <code>${esc(r.config_path || "")}</code>，正在重启…
-       <br><br><b>要让它活过容器重建</b>，二选一：
-       <br>① 在 compose 里直接给环境变量（推荐，多副本也只能这样）：
-       <br><code style="user-select:all">GOJOB_CONTROL_DSN=${esc(r.control_dsn || "")}</code>
-       <br>② 或者把 <code>${esc((r.config_path || "").replace(/\/[^/]*$/, ""))}</code> 挂成卷。
-       <br><br><span class="dim">只 restart 容器不受影响；重建（rebuild / up -d）才会丢。</span></div>`;
-
-    // The process re-execs, so poll until the ordinary UI answers rather than reloading into
-    // a connection refused. Deliberately not reloading the moment it is up: the note above is
-    // the only time this information appears.
-    let back = false;
-    for (let i = 0; i < 60 && !back; i++) {
-      await new Promise(r2 => setTimeout(r2, 1000));
-      try { back = (await fetch("/api/setup", { cache: "no-store" })).ok; } catch (e) { /* down */ }
-    }
-    $("#bsApply").disabled = false;
-    $("#bsApply").textContent = back ? "已记下，继续" : "重启超时，看容器日志";
-    if (back) {
-      $("#bsApply").onclick = () => location.reload();
-      $("#bootstrapForm").onsubmit = ev2 => { ev2.preventDefault(); location.reload(); };
-    }
-  } catch (e) {
-    $("#bsErr").textContent = String(e.message || e);
-    $("#bsErr").hidden = false;
-    $("#bsApply").disabled = false;
-  }
-});
-
 $("#setupForm").addEventListener("submit", async ev => {
   ev.preventDefault();
   const f = ev.target;
@@ -1318,13 +1189,6 @@ document.querySelector("nav").onclick = ev => {
 $("#tenant").onchange = ev => { state.tenant = ev.target.value; render(); };
 
 async function boot() {
-  // Before anything else: is there a control database at all? In setup mode nothing else on
-  // this page can work, and every other request would fail in a way that says nothing.
-  try {
-    const bs = await api("GET", "/api/bootstrap");
-    if (bs.bootstrap_needed) { $("#bootstrap").showModal(); return; }
-  } catch (e) { /* configured: /api/bootstrap is not mounted */ }
-
   // Ask before trying to identify: on a fresh installation there is nobody to be, and the
   // login form is a door with no key behind it.
   try {

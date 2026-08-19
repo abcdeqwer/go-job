@@ -131,7 +131,7 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 			gojob.ErrProtocol, tables)
 	}
 
-	for _, stmt := range SplitDDL(tenantDDL) {
+	for _, stmt := range splitDDL(tenantDDL) {
 		if _, err := db.ExecContext(r.Context(), stmt); err != nil {
 			return fmt.Errorf("%w: applying the schema failed at %q: %v",
 				gojob.ErrProtocol, firstLineOf(stmt), err)
@@ -159,13 +159,13 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// SplitDDL cuts a schema file into statements.
+// splitDDL cuts a schema file into statements.
 //
 // Comments come out FIRST. This file's own comments contain semicolons — "…business Location;
 // admission asserts it." and "-- defaults; merged with trigger overrides" — so splitting on
 // `;` before stripping them cuts a column definition in half, and the error you get names a
 // table that looks fine.
-func SplitDDL(ddl string) []string {
+func splitDDL(ddl string) []string {
 	var kept []string
 	for _, l := range strings.Split(ddl, "\n") {
 		if i := strings.Index(l, "--"); i >= 0 {

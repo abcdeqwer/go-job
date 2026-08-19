@@ -27,27 +27,14 @@ handler code — see `doc/executor-guide.md`.
 
 ## 1. Databases
 
-**You can do all of this from the browser.** Start with no `-control-dsn` and go-job comes up in
-setup mode: it prints a one-time token to its log, and the page behind that token takes a
-database address, creates the control tables if the database is empty, writes the DSN to its
-config file and restarts into normal operation. From there the UI handles the first
-administrator, tenants (including their schemas), jobs and executor credentials.
+The **control** database is the one thing you provision before starting: go-job cannot serve a
+page without it, and it is told where to find it by `-control-dsn` or `GOJOB_CONTROL_DSN`.
 
-The token is the whole gate, and it has to be: before a control database exists there are no
-accounts, and an unauthenticated endpoint that accepts a database address and connects to it is
-not a convenience — point it at a MySQL the caller controls and they own the installation.
-Printing it to the log means whoever can read the container's output is who can configure it.
-
-**The file has to survive, and in a container it does not by default.** The image writes it to
-`/var/lib/gojob/gojob.json`, which is a declared volume — enough for `docker restart`, and not
-enough for a RECREATE: `compose up -d` after a rebuild starts from a clean image and setup runs
-again. Either mount that path, or take the `GOJOB_CONTROL_DSN=…` line the setup page prints and
-put it in your compose file. The page prints it for exactly this reason.
-
-With several replicas the environment variable is the only workable answer anyway: only the one
-you configured has the file.
-
-The rest of this section is the same thing done by hand.
+An earlier version could take that address through a setup page instead. It was removed. The
+setting has to reach every replica and survive every container rebuild, which means it belongs
+in whatever already configures the deployment — and a browser form that still leaves you editing
+the deployment afterwards buys nothing, while a setup endpoint that accepts a database address
+is a real attack surface for a path nobody ends up using.
 
 **Tenant schemas you can create from the UI.** Add-tenant asks for host, database, user and
 password, tests the connection, and — if the database is empty — offers to create the tables

@@ -18,10 +18,6 @@ var uiFS embed.FS
 // Anything that is not a known asset returns index.html, so a deep link the operator pasted
 // into a chat still opens — but only for GET, and never for a path under /api, so a mistyped
 // API route gets a 404 rather than a page of HTML the client then fails to parse.
-// UI serves the operator interface without an API behind it, for the setup server — which has
-// no control database yet, and so no API to build.
-func UI() http.Handler { return (&API{}).ui() }
-
 func (a *API) ui() http.Handler {
 	index, err := uiFS.ReadFile("ui/index.html")
 	if err != nil {
