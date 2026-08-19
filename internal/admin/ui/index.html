@@ -146,6 +146,29 @@
   <div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
 </main>
 
+<dialog id="setup">
+  <form method="dialog" id="setupForm">
+    <div class="dlg-head">
+      <h3>初始化</h3>
+      <p>这个安装还没有管理员。创建第一个账号——它拥有 OPERATOR 权限，可以管理租户、任务和执行器。
+         创建之后这个页面就关闭了，再要加人得由已登录的管理员来做。</p>
+    </div>
+    <div class="dlg-body">
+      <div class="f">
+        <label for="su">用户名</label>
+        <input id="su" name="username" autocomplete="username" required>
+      </div>
+      <div class="f" style="margin-top:14px">
+        <label for="sp">密码</label>
+        <input id="sp" name="password" type="password" autocomplete="new-password" required minlength="12">
+        <span class="hint">至少 12 位。这个账号能触发生产任务、改租户的数据库连接。</span>
+      </div>
+      <div class="err" id="setupErr" hidden></div>
+    </div>
+    <div class="dlg-foot"><button class="primary" value="go">创建并登录</button></div>
+  </form>
+</dialog>
+
 <dialog id="login">
   <form method="dialog" id="loginForm">
     <div class="dlg-head"><h3>Sign in</h3></div>
@@ -745,6 +768,24 @@ $("#jobForm").addEventListener("submit", async ev => {
 
 function openLogin() { $("#loginErr").hidden = true; $("#login").showModal(); }
 
+$("#setupForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const f = ev.target;
+  $("#setupErr").hidden = true;
+  try {
+    await api("POST", "/api/setup",
+      { username: f.username.value, password: f.password.value });
+    // Straight in, rather than "now please log in with what you just typed".
+    await api("POST", "/api/login",
+      { username: f.username.value, password: f.password.value });
+    $("#setup").close();
+    location.reload();
+  } catch (e) {
+    $("#setupErr").textContent = String(e.message || e);
+    $("#setupErr").hidden = false;
+  }
+});
+
 $("#loginForm").addEventListener("submit", async ev => {
   ev.preventDefault();
   const f = ev.target;
@@ -783,6 +824,13 @@ document.querySelector("nav").onclick = ev => {
 $("#tenant").onchange = ev => { state.tenant = ev.target.value; render(); };
 
 async function boot() {
+  // Ask before trying to identify: on a fresh installation there is nobody to be, and the
+  // login form is a door with no key behind it.
+  try {
+    const st = await api("GET", "/api/setup");
+    if (st.setup_needed) { $("#setup").showModal(); return; }
+  } catch (e) { /* older build, or the control database is unreachable — fall through */ }
+
   try {
     const me = await api("GET", "/api/me");
     state.role = me.role;

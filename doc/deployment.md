@@ -68,18 +68,20 @@ tenant with its DSN again.
 
 ## 3. The first admin account
 
-The password must be **at least 12 characters** — `-hash-password` refuses a shorter one rather
-than hashing it, which is worth knowing because the refusal prints to stderr and an unquoted
-`$(…)` around it produces an empty hash, an account nobody can sign in to, and a 401 that looks
-like a configuration problem somewhere else.
+**Open the UI and create it there.** An installation with no administrator shows a setup form
+instead of a login: name, password, done, and you are signed in. Nothing to run, nothing to
+INSERT.
 
-```sh
-gojob -hash-password 'a-long-password-123'      # prints a bcrypt hash, exits
+The endpoint behind it refuses the moment an administrator exists, and the check is part of the
+insert rather than a query before it — so it is not an account-creation endpoint that happens
+to be guarded, and a dozen simultaneous callers still produce exactly one account.
 
-mysql -e "INSERT INTO gojob_control.admin_user
-          (username, password_hash, role, created_at, updated_at)
-          VALUES ('admin', '<hash>', 'OPERATOR', NOW(), NOW())"
-```
+Passwords must be **at least 12 characters**.
+
+If you would rather provision it from a script, `-hash-password` still prints a bcrypt hash to
+put in `admin_user` yourself. Note that it prints its refusal to stderr, so an unquoted `$(…)`
+around a short password yields an empty hash, an account nobody can sign in to, and a 401 that
+looks like a problem somewhere else.
 
 Roles are `OPERATOR` (can change things) and `VIEWER` (can look). Disabling or demoting an
 account takes effect on the **next request**, not at session expiry — `UPDATE admin_user SET

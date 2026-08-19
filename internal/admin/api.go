@@ -76,6 +76,11 @@ func (a *API) Handler() http.Handler {
 	// Unauthenticated: probes and login.
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
+	// First-run setup, unauthenticated by necessity: there is nobody to authenticate as yet.
+	// Both handlers refuse the moment an administrator exists — see Auth.CreateFirstAdmin.
+	mux.HandleFunc("GET /api/setup", a.wrapPublic(a.setupState))
+	mux.HandleFunc("POST /api/setup", a.wrapPublic(a.createFirstAdmin))
+
 	mux.HandleFunc("POST /api/login", a.login)
 	mux.HandleFunc("POST /api/logout", a.logout)
 
@@ -173,6 +178,43 @@ func (a *API) previewSchedule(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	return badRequest("kind must be CRON or FIXED_DELAY")
+}
+
+// wrapPublic is wrap without an authorization requirement, for the two setup endpoints.
+func (a *API) wrapPublic(h handlerFunc) http.HandlerFunc {
+	return a.wrap(h).ServeHTTP
+}
+
+// setupState says whether this installation still needs its first administrator.
+//
+// It leaks one bit to an unauthenticated caller — "nobody has set this up yet" — and that bit
+// is already observable: on a fresh installation every login fails, which says the same thing
+// more slowly. What it buys is a UI that offers the setup form instead of a login nobody can
+// pass.
+func (a *API) setupState(w http.ResponseWriter, r *http.Request) error {
+	needed, err := a.auth.SetupNeeded(r.Context())
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"setup_needed": needed})
+	return nil
+}
+
+func (a *API) createFirstAdmin(w http.ResponseWriter, r *http.Request) error {
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := a.auth.CreateFirstAdmin(r.Context(), body.Username, body.Password); err != nil {
+		return err
+	}
+	a.log.Warn("first administrator created through setup", "username", body.Username,
+		"remote", r.RemoteAddr)
+	writeJSON(w, http.StatusCreated, map[string]any{"username": body.Username, "role": "OPERATOR"})
+	return nil
 }
 
 func (a *API) read(mux *http.ServeMux, pattern string, h handlerFunc) {

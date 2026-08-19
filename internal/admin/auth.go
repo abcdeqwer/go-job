@@ -296,6 +296,64 @@ func (a *Auth) revoke(ctx context.Context, token string) {
 		`DELETE FROM admin_session WHERE token_sha256 = ?`, hashToken(token))
 }
 
+// SetupNeeded reports whether this installation has no usable administrator yet.
+//
+// A fresh deployment otherwise ends at a login form nobody can pass: the account has to be
+// INSERTed by hand after running -hash-password, and nothing on the screen or in the startup
+// log says so. "It is installed and I cannot get in" is the worst possible first five minutes,
+// and it is the one every operator meets first.
+func (a *Auth) SetupNeeded(ctx context.Context) (bool, error) {
+	var n int
+	if err := a.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM admin_user WHERE disabled = 0`).Scan(&n); err != nil {
+		return false, fmt.Errorf("count administrators: %w", err)
+	}
+	return n == 0, nil
+}
+
+// CreateFirstAdmin creates the initial OPERATOR, and only while there is none.
+//
+// ONE statement, not a check followed by an insert. The insert carries its own condition, so
+// "is there an administrator" and "create one" cannot be separated — and the loser learns it
+// lost from the affected-row count rather than from a second query that could itself race.
+//
+// It replaces a transaction that read `SELECT COUNT(*) ... FOR UPDATE` first. That was correct
+// but unusable: on an empty table the locking read takes the whole gap, so a dozen concurrent
+// callers queue behind each other until innodb_lock_wait_timeout — fifty seconds by default —
+// and answer 500. Exactly one account was still created, but a double-submitted form is enough
+// to produce that, and "the setup page hung and then errored" is not a first five minutes
+// anyone should have.
+func (a *Auth) CreateFirstAdmin(ctx context.Context, username, password string) error {
+	if username == "" {
+		return fmt.Errorf("%w: a username is required", gojob.ErrProtocol)
+	}
+	hash, err := HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("%w: %v", gojob.ErrProtocol, err)
+	}
+	now := a.clock.Now()
+
+	res, err := a.db.ExecContext(ctx, `
+		INSERT INTO admin_user (username, password_hash, role, created_at, updated_at)
+		SELECT ?, ?, 'OPERATOR', ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM admin_user)`,
+		username, hash, now, now)
+	if err != nil {
+		return fmt.Errorf("create the first administrator: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Deliberately not "already exists": this is the door closing, and it must read as
+		// refused rather than as a naming collision somebody could work around.
+		return fmt.Errorf("%w: this installation already has an administrator; first-run setup is closed",
+			gojob.ErrProtocol)
+	}
+	return nil
+}
+
 // HashPassword produces a stored credential, for provisioning the first account.
 func HashPassword(password string) (string, error) {
 	if len(password) < 12 {
