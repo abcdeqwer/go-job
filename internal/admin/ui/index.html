@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>go-job</title>
 <style>
+  /* The `hidden` attribute loses to any explicit display.
+     A .grid2 is `display: grid`, which beats the user-agent's `[hidden] { display: none }` —
+     so `el.hidden = true` set the property, reported true when asked, and left the element on
+     screen. The add- and move-tenant dialogs both shipped with their remote-connection fields
+     permanently visible, and a test asserting `el.hidden` passed the whole time because it read
+     the property rather than the rendering.
+     Stated once, here, so no future use of `hidden` has to remember. */
+  [hidden] { display: none !important; }
+
   :root {
     --bg:#0e1013; --panel:#16191f; --raised:#1d212a; --line:#282d38; --line-soft:#20242d;
     --text:#e7eaf0; --dim:#98a1b2; --faint:#6b7385;
@@ -145,6 +154,7 @@
 <main>
   <div id="error" class="err" hidden></div>
   <div id="controls" class="row"></div>
+  <div id="unusedBox" class="preview" hidden></div>
   <div class="scroll"><table><thead id="head"></thead><tbody id="body"></tbody></table></div>
 </main>
 
@@ -217,6 +227,29 @@
   </form>
 </dialog>
 
+<dialog id="copyJobDlg" class="wide">
+  <form method="dialog" id="copyJobForm">
+    <div class="dlg-head">
+      <h3>把 <span id="copyJobName"></span> 复制到其他租户</h3>
+      <p>同一份定义，在每个选中的租户里各建一行。任务是<b>每租户一行</b>的——
+         这也是「哪些租户跑这个任务」的唯一决定处，所以没选的租户就是不会跑。</p>
+    </div>
+    <div class="dlg-body">
+      <div id="copyTargets" class="preview">读取租户…</div>
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么在这些租户建这个任务">
+      </div>
+      <div class="err" id="copyJobErr" hidden></div>
+      <div id="copyJobResult" class="preview" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok" id="copyJobGo">创建</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="tenantEditDlg">
   <form method="dialog" id="tenantEditForm">
     <div class="dlg-head">
@@ -268,10 +301,11 @@
         <div class="f">
           <label>database</label>
           <input name="database" required placeholder="gojob_np">
+          <span class="hint" id="moveCurrent"></span>
         </div>
         <div class="f">
           <label>schema_uuid</label>
-          <input name="schema_uuid" required placeholder="新 schema 必须出示的 uuid">
+          <input name="schema_uuid" required placeholder="测试连接后自动填上">
           <span class="hint">没有它，一个打错的 DSN 是检测不出来的。</span>
         </div>
       </div>
@@ -281,6 +315,12 @@
         <div class="f"><label>user</label><input name="user" placeholder="gojob"></div>
         <div class="f"><label>password</label><input name="password" type="password"></div>
       </div>
+
+      <div class="row" style="margin:16px 0 0">
+        <button type="button" id="moveProbeBtn">测试连接</button>
+        <span id="moveProbeMsg" class="dim"></span>
+      </div>
+      <div id="moveProbeBox" class="preview"></div>
 
       <div class="f" style="margin-top:14px">
         <label>reason</label>
@@ -691,7 +731,18 @@ async function renderOnce() {
     if (state.view === "executions") return await renderExecutions(t);
     if (state.view === "executors") return await renderExecutors(t);
     if (state.view === "audit") return await renderAudit(t);
-  } catch (e) { showError(e); }
+  } catch (e) {
+    // CLEAR the table, do not just show the error above it.
+    //
+    // A tenant whose schema is unreachable used to leave the PREVIOUS tenant's rows on screen
+    // under the new tenant's name — an error banner at the top and, below it, another tenant's
+    // jobs presented as this one's. In a multi-tenant console that is the single worst thing a
+    // table can do, and it is exactly what a switch to a broken tenant produced.
+    table(["—"], []);
+    $("#controls").innerHTML = "";
+    $("#unusedBox").hidden = true;
+    showError(e);
+  }
 }
 
 async function renderJobs(t) {
@@ -703,12 +754,49 @@ async function renderJobs(t) {
   $("#handlers").innerHTML = handlers.map(h => `<option value="${esc(h)}">`).join("");
   const orphaned = new Set(orphans.map(o => o.job_name));
 
-  $("#controls").innerHTML = operator()
-    ? `<button class="primary" id="newJob">new job</button>
-       <span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`
-    : `<span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`;
+  // Handlers that live executors declare for this tenant but no job uses.
+  //
+  // The alternative people ask for is auto-creating a job per handler. That gets three things
+  // wrong: a handler backs SEVERAL jobs (a daily rebuild and a monthly backfill share one), a
+  // worker declares its handlers to EVERY tenant it serves so auto-creation would create the
+  // job in tenants that must not have it, and a job needs a valid schedule before it can exist
+  // at all — so "created but disabled" would be a state the schema does not have.
+  //
+  // Discovery gives the same benefit — never typing a handler_key from memory — and leaves the
+  // decision where it belongs: one explicit creation, per tenant.
+  // Retired jobs do NOT keep a handler in use. Retirement is terminal — there is no path back,
+  // the store only ever moves retired 0 → 1 — so a handler whose only jobs are retired has no
+  // job, and hiding it here is how a migrated handler silently stops being offered.
+  //
+  // A DISABLED job does count: it exists, an operator turned it off, and surfacing it as
+  // "missing" would invite creating a second job for the same handler.
+  const used = new Set(jobs.filter(j => !j.retired).map(j => j.handler_key));
+  const unused = handlers.filter(h => !used.has(h));
+
+  $("#controls").innerHTML = (operator()
+    ? `<button class="primary" id="newJob">new job</button>` : "")
+    + `<span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`
+    + (unused.length ? ` <span class="dim">·</span> <button id="showUnused">${unused.length} 个 handler 还没有任务</button>` : "");
   const nj = $("#newJob");
   if (nj) nj.onclick = () => openJob(null);
+  const su = $("#showUnused");
+  if (su) su.onclick = () => {
+    const box = $("#unusedBox");
+    box.hidden = !box.hidden;
+    if (!box.hidden) {
+      box.innerHTML = `<div class="dim" style="margin-bottom:8px">`
+        + `有执行器在为 <b>${esc(t)}</b> 声明这些 handler，但这个租户还没有对应的任务。`
+        + `没有任务就不会跑——这是正常的，除非你本来就想让它跑。</div>`
+        + unused.map(h => `<div class="row" style="margin:4px 0">`
+            + `<code>${esc(h)}</code>`
+            + (operator() ? ` <button data-newfor="${esc(h)}">创建任务</button>` : "")
+            + `</div>`).join("");
+      box.onclick = ev => {
+        const b = ev.target.closest("[data-newfor]");
+        if (b) openJob(null, b.dataset.newfor);
+      };
+    }
+  };
 
   table(
     ["job", "handler", "schedule", "state", "next", "last ok", "actions"],
@@ -729,6 +817,7 @@ async function renderJobs(t) {
           ? `<button data-act="resume" data-job="${esc(j.job_name)}">resume</button>`
           : `<button data-act="pause" data-job="${esc(j.job_name)}">pause</button>`,
         `<button data-act="edit" data-job="${esc(j.job_name)}">edit</button>`,
+        `<button data-act="copy" data-job="${esc(j.job_name)}">复制到…</button>`,
       ].join(" ") : '<span class="dim">—</span>';
 
       return [
@@ -749,6 +838,7 @@ async function renderJobs(t) {
     const job = b.dataset.job, act = b.dataset.act;
     try {
       if (act === "edit") return openJob(job);
+      if (act === "copy") return openCopyJob(job);
       if (act === "trigger") {
         const reason = await ask(`Run ${job} now?`,
           "A manual run is queued immediately and suspends this job's scheduled materialization until it finishes.");
@@ -937,6 +1027,16 @@ async function openTenantMove(name) {
   $("#moveTenantName").textContent = name;
   $("#tenantMoveErr").hidden = true;
   $("#moveQuiesce").textContent = "读取排空状态…";
+  $("#moveProbeBox").innerHTML = "";
+  $("#moveProbeMsg").textContent = "";
+
+  // Show what it is moving FROM, and default the new database to the current name. For the
+  // common case — the same schema on a different server — that is already right; for a rename
+  // it is one edit. An empty field would make the operator go and look the name up.
+  const t = (state.tenants || []).find(x => x.tenant === name);
+  const current = t ? databaseOf(t.dsn) : "";
+  f.database.value = current;
+  $("#moveCurrent").textContent = current ? `当前是 ${current}` : "";
   applyMovePlacement();
   $("#tenantMoveDlg").showModal();
   try {
@@ -971,6 +1071,87 @@ function quiescenceView(q) {
   return { ready, busy, blockers: blockers.length, html };
 }
 window.quiescenceView = quiescenceView;
+
+// databaseOf pulls the schema name out of a masked DSN. The list shows
+// `gojob_cp:***@tcp(mysql:3306)/gojob_cp` — the password is starred, the database is not, which
+// is what makes this safe to do in the page.
+function databaseOf(dsn) {
+  const m = /\/([^/?]+)(\?|$)/.exec(String(dsn || ""));
+  return m ? m[1] : "";
+}
+
+// The move dialog runs the same probe → provision flow as add-tenant.
+//
+// Without it a cutover meant: create the database by hand, apply the DDL by hand, query
+// schema_identity for the uuid, come back and paste it. That is exactly the friction that was
+// just removed from adding a tenant, left in place for the operation that is more dangerous.
+$("#moveProbeBtn").onclick = async () => {
+  const f = $("#tenantMoveForm");
+  const placement = $("#movePlacement").value;
+  if (!f.database.value || (placement === "remote" && (!f.host.value || !f.user.value))) {
+    $("#moveProbeMsg").textContent = placement === "remote"
+      ? "先填 host / user / database" : "先填 database";
+    return;
+  }
+  $("#moveProbeMsg").textContent = "连接中…";
+  $("#moveProbeBox").innerHTML = "";
+  try {
+    const r = await api("POST", "/api/tenants/probe", connectionOf(f, placement));
+    $("#moveProbeMsg").textContent = "";
+    if (r.creatable) {
+      $("#moveProbeBox").innerHTML = `<span class="dim">这个库还不存在。</span>`
+        + `<button type="button" id="moveProvisionBtn" style="margin-left:8px">建库并建表</button>`;
+      $("#moveProvisionBtn").onclick = moveProvision;
+      return;
+    }
+    if (r.provisioned) {
+      if (!r.version_ok) {
+        $("#moveProbeBox").innerHTML = `<span class="bad">这个库的 schema 版本是 ${esc(r.schema_version)}，`
+          + `本程序要求 ${esc(r.expects_version)}。</span>`;
+        return;
+      }
+      // A schema already claimed by ANOTHER tenant is the mistake this whole uuid mechanism
+      // exists to catch, so it is refused here rather than at admission.
+      if (r.tenant !== f.dataset.tenant) {
+        $("#moveProbeBox").innerHTML = `<span class="bad">这个库属于租户 <b>${esc(r.tenant)}</b>，`
+          + `不是 ${esc(f.dataset.tenant)}。两个租户共用一个 schema 会互相踩。</span>`;
+        return;
+      }
+      f.schema_uuid.value = r.schema_uuid;
+      $("#moveProbeBox").innerHTML = `<span class="t">可以切</span>：schema `
+        + `${esc(r.schema_uuid.slice(0, 8))}，版本 ${esc(r.schema_version)}，uuid 已填好。`;
+      return;
+    }
+    if (r.tables > 0) {
+      $("#moveProbeBox").innerHTML = `<span class="bad">这个库里有 ${r.tables} 张 go-job 的表，`
+        + `但没有 schema_identity —— 是个建了一半的 schema。手工确认后再继续。</span>`;
+      return;
+    }
+    $("#moveProbeBox").innerHTML = `连接成功，<span class="t">这是一个空库</span>。`
+      + `<button type="button" id="moveProvisionBtn" style="margin-left:8px">在这里建表</button>`;
+    $("#moveProvisionBtn").onclick = moveProvision;
+  } catch (e) {
+    $("#moveProbeMsg").textContent = "";
+    $("#moveProbeBox").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+};
+
+async function moveProvision() {
+  const f = $("#tenantMoveForm");
+  if (!f.reason.value) { $("#moveProbeBox").innerHTML = '<span class="bad">先填 reason</span>'; return; }
+  $("#moveProbeBox").innerHTML = "建表中…";
+  try {
+    const r = await api("POST", "/api/tenants/provision", {
+      ...connectionOf(f, $("#movePlacement").value),
+      tenant: f.dataset.tenant, reason: f.reason.value,
+    });
+    f.schema_uuid.value = r.schema_uuid;
+    $("#moveProbeBox").innerHTML = `<span class="t">建表完成</span>：schema `
+      + `${esc(r.schema_uuid.slice(0, 8))}，uuid 已填好。`;
+  } catch (e) {
+    $("#moveProbeBox").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+}
 
 function applyMovePlacement() {
   const remote = $("#movePlacement").value === "remote";
@@ -1352,7 +1533,7 @@ $("#cronPreset").onchange = ev => {
 $("#jobForm").schedule_expr.addEventListener("input", schedulePreview);
 $("#jobForm").schedule_kind.addEventListener("change", () => { fillPresets(); previewNow(); });
 
-function openJob(name) {
+function openJob(name, handlerKey) {
   const f = $("#jobForm");
   f.reset();
   $("#jobErr").hidden = true;
@@ -1361,7 +1542,16 @@ function openJob(name) {
   f.dataset.version = "";
 
   const show = () => { fillPresets(); previewNow(); $("#jobDlg").showModal(); };
-  if (!name) { f.job_name.disabled = false; return show(); }
+  if (!name) {
+    f.job_name.disabled = false;
+    if (handlerKey) {
+      // Arrived from the discovery panel. The handler is the part nobody remembers exactly;
+      // the job name is a guess the operator will usually keep, and always sees before saving.
+      f.handler_key.value = handlerKey;
+      f.job_name.value = handlerKey.replace(/[^a-zA-Z0-9]+/g, "-");
+    }
+    return show();
+  }
 
   const t = encodeURIComponent(state.tenant);
   api("GET", `/api/tenants/${t}/jobs/${encodeURIComponent(name)}`).then(j => {
@@ -1418,6 +1608,105 @@ $("#jobForm").addEventListener("submit", async ev => {
     $("#jobErr").textContent = String(e.message || e);
     $("#jobErr").hidden = false;
   }
+});
+
+// Copying a job across tenants.
+//
+// At ten tenants, a job that eight of them run is eight identical creations, and a timeout
+// change is eight more. There is no server-side bulk endpoint on purpose: each tenant's job is
+// its own row with its own audit entry and its own reason, and one request per tenant keeps
+// that true — a partial failure leaves the tenants that succeeded correct rather than leaving
+// a half-applied batch nobody can name.
+async function openCopyJob(name) {
+  const f = $("#copyJobForm");
+  f.reset();
+  f.dataset.job = name;
+  f.dataset.from = state.tenant;
+  $("#copyJobName").textContent = name;
+  $("#copyJobErr").hidden = true;
+  $("#copyJobResult").hidden = true;
+  $("#copyTargets").textContent = "读取租户…";
+  $("#copyJobDlg").showModal();
+
+  try {
+    const source = await api("GET",
+      `/api/tenants/${encodeURIComponent(state.tenant)}/jobs/${encodeURIComponent(name)}`);
+    f.dataset.source = JSON.stringify(source);
+
+    const others = (state.tenants || []).filter(t => t.tenant !== state.tenant && t.admitted);
+    if (!others.length) {
+      $("#copyTargets").innerHTML = '<span class="dim">没有其他已接纳的租户。</span>';
+      return;
+    }
+    // Per target: does it already have this job, and does anything there serve the handler?
+    // Creating a job into a tenant with no executor is legal and produces an orphan — visible
+    // in that tenant's own orphan count, and not something to discover next week.
+    const rows = await Promise.all(others.map(async t => {
+      const [jobs, handlers] = await Promise.all([
+        api("GET", `/api/tenants/${encodeURIComponent(t.tenant)}/jobs`).catch(() => []),
+        api("GET", `/api/tenants/${encodeURIComponent(t.tenant)}/handlers`).catch(() => []),
+      ]);
+      return {
+        tenant: t.tenant,
+        has: jobs.some(j => j.job_name === name),
+        served: handlers.includes(source.handler_key),
+      };
+    }));
+    $("#copyTargets").innerHTML = rows.map(r => `
+      <label class="row" style="margin:6px 0; gap:8px">
+        <input type="checkbox" data-tenant="${esc(r.tenant)}" ${r.has ? "disabled" : ""}>
+        <b>${esc(r.tenant)}</b>
+        ${r.has ? '<span class="tag dim">已有这个任务</span>' : ""}
+        ${r.served ? '<span class="tag ok">有执行器</span>'
+                   : '<span class="tag bad">没有执行器声明这个 handler，建了会是 orphan</span>'}
+      </label>`).join("");
+  } catch (e) {
+    $("#copyTargets").innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+$("#copyJobForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#copyJobErr").hidden = true;
+
+  const targets = [...document.querySelectorAll("#copyTargets input[type=checkbox]:checked")]
+    .map(c => c.dataset.tenant);
+  if (!targets.length) {
+    $("#copyJobErr").textContent = "先选至少一个租户";
+    $("#copyJobErr").hidden = false;
+    return;
+  }
+  const j = JSON.parse(f.dataset.source);
+  const body = {
+    job_name: j.job_name, handler_key: j.handler_key, executor_group: j.executor_group,
+    schedule_kind: j.schedule_kind, schedule_expr: j.schedule_expr,
+    concurrency_policy: j.concurrency_policy, misfire_policy: j.misfire_policy,
+    max_attempts: j.max_attempts, max_recoveries: j.max_recoveries,
+    lease_seconds: j.lease_seconds, timeout_seconds: j.timeout_seconds,
+    params: j.params ?? {}, description: j.description,
+    // Copied ENABLED as the source is, deliberately not forced off: a job created disabled
+    // needs a second pass to turn on, and the pass that never happens is the one that makes a
+    // report quietly stop existing for a tenant.
+    enabled: !!j.enabled,
+    reason: f.reason.value,
+  };
+
+  const results = [];
+  for (const tenant of targets) {
+    try {
+      await api("POST", `/api/tenants/${encodeURIComponent(tenant)}/jobs`, body);
+      results.push(`<div><span class="t">✓</span> ${esc(tenant)}</div>`);
+    } catch (e) {
+      results.push(`<div><span class="bad">✗ ${esc(tenant)}</span> — ${esc(String(e.message || e))}</div>`);
+    }
+  }
+  // Shown rather than closed: a batch where one tenant failed is exactly the case an operator
+  // must see, and closing the dialog on the first success would hide it.
+  $("#copyJobResult").innerHTML = results.join("");
+  $("#copyJobResult").hidden = false;
+  render();
 });
 
 function openLogin() { $("#loginErr").hidden = true; $("#login").showModal(); }
