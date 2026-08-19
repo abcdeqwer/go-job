@@ -105,8 +105,74 @@ func (a *API) Handler() http.Handler {
 	a.write(mux, "POST /api/tenants/{tenant}/executions/{key}/retry", a.retryExecution)
 	a.write(mux, "POST /api/tenants/{tenant}/executions/{key}/cancel", a.cancelExecution)
 
+	a.read(mux, "GET /api/schedule/preview", a.previewSchedule)
+
 	mux.Handle("/", a.ui())
 	return mux
+}
+
+// previewSchedule answers "when would this actually run", using the SAME engine that will run
+// it.
+//
+// Computing it in the browser would mean a second cron implementation, and the two would
+// disagree — this one resolves DOM/DOW as an OR, skips wall times a DST transition never
+// reaches, and searches years ahead for a leap-day expression. A preview that is wrong in
+// exactly those cases is worse than none, because it is confidently wrong about the schedules
+// people get wrong.
+//
+// It exists because six-field cron's first field is SECONDS, and `0 3 * * *` — what everyone
+// types for "3am" — is a valid five-field-looking expression that this parser rejects, while
+// `0 3 * * * *` is accepted and means "3 minutes past every hour". Nothing about the string
+// says which one you wrote. The next five instants say it immediately.
+func (a *API) previewSchedule(w http.ResponseWriter, r *http.Request) error {
+	kind := gojob.ScheduleKind(strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("kind"))))
+	expr := strings.TrimSpace(r.URL.Query().Get("expr"))
+	if expr == "" {
+		return badRequest("expr is required")
+	}
+	n := atoiDefault(r.URL.Query().Get("n"), 5)
+	if n < 1 || n > 20 {
+		n = 5
+	}
+
+	switch kind {
+	case gojob.ScheduleFixedDelay:
+		// A poller has no fire instants to list: the next pass is scheduled a delay after the
+		// previous one FINISHES, so when it runs depends on how long it takes. Reporting the
+		// delay it parsed to is the honest answer, and it is also the one that catches the
+		// unit mistake — the field is MILLISECONDS.
+		d, err := gojob.Definition{
+			JobName: "preview", ScheduleKind: kind, ScheduleExpr: expr,
+		}.Delay()
+		if err != nil {
+			return badRequest("%v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"kind": string(kind), "delay_ms": d.Milliseconds(), "delay": d.String(),
+		})
+		return nil
+
+	case gojob.ScheduleCron, "":
+		e, err := cron.Parse(expr)
+		if err != nil {
+			return badRequest("%v", err)
+		}
+		out := make([]string, 0, n)
+		at := a.cfg.Clock.Now().Add(-time.Nanosecond)
+		for i := 0; i < n; i++ {
+			next, err := e.Next(at)
+			if err != nil {
+				return badRequest("%v", err)
+			}
+			out = append(out, next.Format("2006-01-02 15:04:05"))
+			at = next
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"kind": "CRON", "next": out, "zone": a.cfg.Clock.Location().String(),
+		})
+		return nil
+	}
+	return badRequest("kind must be CRON or FIXED_DELAY")
 }
 
 func (a *API) read(mux *http.ServeMux, pattern string, h handlerFunc) {

@@ -112,6 +112,10 @@
   .f > label { font-family:var(--mono); font-size:12.5px; color:var(--text); font-weight:500; }
   .f > .hint { color:var(--dim); font-size:12px; line-height:1.6; }
   .f > .hint b { color:var(--text); font-weight:600; font-family:var(--mono); font-size:11.5px; }
+  .preview { margin-top:4px; font-family:var(--mono); font-size:12px; line-height:1.7;
+             color:var(--dim); min-height:1.7em; }
+  .preview .t { color:var(--text); }
+  .preview .bad { color:var(--bad); }
   .f input, .f select, .f textarea { width:100%; }
   label { display:block; }
   /* Scoped to forms. A blanket width:100% also hit the tenant picker in the header, which
@@ -216,8 +220,12 @@
           </div>
           <div class="f">
             <label>schedule_expr</label>
-            <input name="schedule_expr" required placeholder="0 0 3 * * *">
-            <span class="hint">六段，<b>第一段是秒</b>：秒分时日月周。按本部署配置的业务时区求值。FIXED_DELAY 时这里填间隔秒数。</span>
+            <div class="row" style="gap:6px;margin:0">
+              <input name="schedule_expr" required placeholder="0 0 3 * * *" style="flex:1">
+              <select id="cronPreset" style="width:auto;flex:0 0 auto"></select>
+            </div>
+            <span class="hint" id="exprHint"></span>
+            <div id="cronPreview" class="preview"></div>
           </div>
           <div class="f">
             <label>misfire_policy</label>
@@ -588,6 +596,85 @@ async function renderAudit(t) {
   $("#body").onclick = null;
 }
 
+// Presets and a live preview for schedule_expr.
+//
+// Six-field cron puts SECONDS first, and that is the field everyone forgets. `0 3 * * * *`
+// looks like "3am daily" and means "three minutes past every hour" — 24 runs a day instead of
+// one, and nothing about the string says so. The preview says so: 23:03, 00:03, 01:03.
+//
+// It asks the SERVER rather than computing here, because computing here means a second cron
+// implementation, and the two would disagree exactly where this one is careful — DOM/DOW as an
+// OR, wall times a DST transition never reaches, leap-day expressions that need an eight-year
+// search. A preview that is confidently wrong about those is worse than no preview.
+const CRON_PRESETS = [
+  ["", "预设…"],
+  ["0 * * * * *", "每分钟"],
+  ["0 */5 * * * *", "每 5 分钟"],
+  ["0 */15 * * * *", "每 15 分钟"],
+  ["0 */30 * * * *", "每 30 分钟"],
+  ["0 0 * * * *", "每小时整点"],
+  ["0 30 * * * *", "每小时半点"],
+  ["0 0 3 * * *", "每天 03:00"],
+  ["0 30 2 * * *", "每天 02:30"],
+  ["0 0 9 * * 1-5", "工作日 09:00"],
+  ["0 0 4 * * 1", "每周一 04:00"],
+  ["0 0 5 1 * *", "每月 1 号 05:00"],
+];
+const DELAY_PRESETS = [
+  ["", "预设…"],
+  ["5000", "每 5 秒"],
+  ["30000", "每 30 秒"],
+  ["60000", "每 1 分钟"],
+  ["300000", "每 5 分钟"],
+  ["1800000", "每 30 分钟"],
+];
+
+function fillPresets() {
+  const cron = $("#jobForm").schedule_kind.value !== "FIXED_DELAY";
+  const list = cron ? CRON_PRESETS : DELAY_PRESETS;
+  $("#cronPreset").innerHTML = list
+    .map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join("");
+  $("#exprHint").innerHTML = cron
+    ? '六段，<b>第一段是秒</b>：秒 分 时 日 月 周。按本部署配置的业务时区求值。'
+    : '轮询间隔，单位<b>毫秒</b>。上一轮跑完之后再等这么久开下一轮 —— 填 30 是 30 毫秒，不是 30 秒。';
+  $("#jobForm").schedule_expr.placeholder = cron ? "0 0 3 * * *" : "30000";
+}
+
+let previewTimer = null;
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(previewNow, 350);
+}
+
+async function previewNow() {
+  const f = $("#jobForm"), box = $("#cronPreview");
+  const expr = f.schedule_expr.value.trim();
+  if (!expr) { box.textContent = ""; return; }
+  const kind = f.schedule_kind.value;
+  try {
+    const r = await api("GET",
+      `/api/schedule/preview?kind=${encodeURIComponent(kind)}&expr=${encodeURIComponent(expr)}&n=5`);
+    if (r.kind === "FIXED_DELAY") {
+      box.innerHTML = `间隔 <span class="t">${esc(r.delay)}</span>`;
+      return;
+    }
+    box.innerHTML = `接下来 5 次（${esc(r.zone)}）：<span class="t">`
+      + r.next.map(esc).join("</span> · <span class=\"t\">") + "</span>";
+  } catch (e) {
+    box.innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
+}
+
+$("#cronPreset").onchange = ev => {
+  if (!ev.target.value) return;
+  const f = $("#jobForm");
+  f.schedule_expr.value = ev.target.value;
+  ev.target.selectedIndex = 0;
+  previewNow();
+};
+$("#jobForm").schedule_expr.addEventListener("input", schedulePreview);
+$("#jobForm").schedule_kind.addEventListener("change", () => { fillPresets(); previewNow(); });
+
 function openJob(name) {
   const f = $("#jobForm");
   f.reset();
@@ -596,7 +683,7 @@ function openJob(name) {
   f.dataset.editing = name || "";
   f.dataset.version = "";
 
-  const show = () => $("#jobDlg").showModal();
+  const show = () => { fillPresets(); previewNow(); $("#jobDlg").showModal(); };
   if (!name) { f.job_name.disabled = false; return show(); }
 
   const t = encodeURIComponent(state.tenant);
