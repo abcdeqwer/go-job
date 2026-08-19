@@ -11,7 +11,8 @@
     --accent:#5b9cf8; --accent-ink:#0b1220;
     --ok:#3fbf95; --warn:#dbab3c; --bad:#e2695f;
     --radius:8px; --radius-lg:12px;
-    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+           "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: light) {
@@ -109,7 +110,7 @@
   @media (max-width:640px) { .grid2 { grid-template-columns:1fr; } }
   .f { display:flex; flex-direction:column; gap:3px; min-width:0; }
   .f > label { font-family:var(--mono); font-size:12.5px; color:var(--text); font-weight:500; }
-  .f > .hint { color:var(--dim); font-size:12px; line-height:1.45; }
+  .f > .hint { color:var(--dim); font-size:12px; line-height:1.6; }
   .f > .hint b { color:var(--text); font-weight:600; font-family:var(--mono); font-size:11.5px; }
   .f input, .f select, .f textarea { width:100%; }
   label { display:block; }
@@ -168,15 +169,15 @@
     <div class="dlg-body">
       <div class="f">
         <label for="promptReason">reason</label>
-        <input id="promptReason" name="reason" required placeholder="what you are doing, and why">
-        <span class="hint">Recorded in the audit log against your account. Required.</span>
+        <input id="promptReason" name="reason" required placeholder="你在做什么，为什么">
+        <span class="hint">记入审计日志，挂在你的账号下。必填。</span>
       </div>
     </div>
     <div class="dlg-foot">
       <!-- formnovalidate, or the required field above blocks cancel and the browser shows
            "please fill in this field" on a dialog the operator is trying to abandon. -->
-      <button value="cancel" formnovalidate>cancel</button>
-      <button class="primary" value="ok">confirm</button>
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok">确认</button>
     </div>
   </form>
 </dialog>
@@ -184,143 +185,119 @@
 <dialog id="jobDlg" class="wide">
   <form method="dialog" id="jobForm">
     <div class="dlg-head">
-      <h3 id="jobTitle">New job</h3>
-      <p>A job is a schedule plus the name of a handler. Nothing runs it until an executor
-         registers that handler key.</p>
+      <h3 id="jobTitle">新建任务</h3>
+      <p>一个任务 = 一份调度 + 一个 handler 名字。在有执行器注册了这个 handler key 之前，它不会被任何东西执行。</p>
     </div>
     <div class="dlg-body">
 
       <fieldset>
-        <legend>Identity</legend>
+        <legend>标识</legend>
         <div class="grid2">
           <div class="f">
             <label>job_name</label>
             <input name="job_name" required placeholder="nightly-report">
-            <span class="hint">Unique within the tenant. Names the job in every log line,
-              audit entry and execution key.</span>
+            <span class="hint">租户内唯一。日志、审计记录和 execution key 里都用这个名字标识它。</span>
           </div>
           <div class="f">
             <label>handler_key</label>
             <input name="handler_key" list="handlers" required placeholder="report.nightly">
-            <span class="hint">Must match a key an executor declares, <b>exactly</b>. No match
-              means the job materializes and is never dispatched.</span>
+            <span class="hint">必须与某个执行器声明的 key <b>完全一致</b>。对不上的话，任务会正常生成执行记录，但永远不会被派发出去。</span>
           </div>
         </div>
       </fieldset>
 
       <fieldset>
-        <legend>Schedule</legend>
+        <legend>调度</legend>
         <div class="grid2">
           <div class="f">
             <label>schedule_kind</label>
             <select name="schedule_kind"><option>CRON</option><option>FIXED_DELAY</option></select>
-            <span class="hint"><b>CRON</b> — one execution per fire instant, so a missed one is
-              still a missed occurrence. <b>FIXED_DELAY</b> — one pass at a time, the next
-              scheduled a fixed delay after the last finishes.</span>
+            <span class="hint"><b>CRON</b>：每个触发时刻生成一条执行记录，所以漏掉一次就是真的少跑一次。<b>FIXED_DELAY</b>：同时只跑一轮，上一轮结束后再等固定时长开下一轮。</span>
           </div>
           <div class="f">
             <label>schedule_expr</label>
             <input name="schedule_expr" required placeholder="0 0 3 * * *">
-            <span class="hint">Six fields, <b>seconds first</b>: sec min hour dom month dow.
-              Evaluated in the deployment's business time zone. For FIXED_DELAY, the delay in
-              seconds.</span>
+            <span class="hint">六段，<b>第一段是秒</b>：秒分时日月周。按本部署配置的业务时区求值。FIXED_DELAY 时这里填间隔秒数。</span>
           </div>
           <div class="f">
             <label>misfire_policy</label>
             <select name="misfire_policy"><option>FIRE_ONCE</option><option>SKIP</option></select>
-            <span class="hint">What happens to instants missed while nothing was running.
-              <b>FIRE_ONCE</b> catches up with a single run. <b>SKIP</b> advances to the next
-              future instant and runs nothing — a five-minute outage costs a daily job its
-              whole day.</span>
+            <span class="hint">停机期间错过的触发时刻怎么处理。<b>FIRE_ONCE</b>：补跑一次。<b>SKIP</b>：直接跳到下一个未来时刻，一次都不补——五分钟的故障会让日任务整天不跑。</span>
           </div>
           <div class="f">
             <label>enabled</label>
             <select name="enabled"><option value="true">true</option><option value="false">false</option></select>
-            <span class="hint">Disabled keeps the configuration and the schedule but is never
-              claimed. Use it to stage a job before cutting over to it.</span>
+            <span class="hint">关掉后配置和调度都还在，但不会被领取执行。迁移时先建好、验证过，再切过来。</span>
           </div>
         </div>
       </fieldset>
 
       <fieldset>
-        <legend>Routing and concurrency</legend>
+        <legend>路由与并发</legend>
         <div class="grid2">
           <div class="f">
             <label>executor_group</label>
-            <input name="executor_group" placeholder="any">
-            <span class="hint">Empty means any executor serving the handler. Naming a group
-              confines the job to it — how a canary takes a slice of traffic without taking
-              production's.</span>
+            <input name="executor_group" placeholder="任意">
+            <span class="hint">留空表示任何提供该 handler 的执行器都可以。填了组名就只发给那个组 ——灰度就是这么做的：金丝雀只吃自己那一份，不碰生产的。</span>
           </div>
           <div class="f">
             <label>concurrency_policy</label>
             <select name="concurrency_policy"><option>QUEUE</option><option>FORBID</option></select>
-            <span class="hint"><b>QUEUE</b> — a due occurrence waits for the running one.
-              <b>FORBID</b> — it is skipped outright and recorded as skipped.</span>
+            <span class="hint"><b>QUEUE</b>：新一轮到点了就排队，等正在跑的那轮结束。<b>FORBID</b>：直接跳过，并记为 skipped。</span>
           </div>
         </div>
       </fieldset>
 
       <fieldset>
-        <legend>Limits</legend>
+        <legend>限额</legend>
         <div class="grid2">
           <div class="f">
             <label>timeout_seconds</label>
             <input name="timeout_seconds" type="number" value="900" min="1">
-            <span class="hint">Runtime cap for <b>one attempt</b>, started at the claim. Passing
-              it is terminal and is <b>not</b> retried — a run that used its whole budget will
-              most likely use it again.</span>
+            <span class="hint"><b>单次 attempt</b>的运行上限，从领取那一刻开始计时。超时是终态，<b>不会重试</b>——把整个预算跑光的一轮，重试大概率还是跑光。</span>
           </div>
           <div class="f">
             <label>lease_seconds</label>
             <input name="lease_seconds" type="number" value="60" min="10">
-            <span class="hint">How long this scheduler may go without renewing before another
-              may recover the work. Minimum 10, and must not exceed the timeout. Leave it
-              alone unless you know why.</span>
+            <span class="hint">本调度器多久不续租，别的实例就可以接管这份工作。最小 10 秒，且不能超过 timeout。没有明确理由就别动它。</span>
           </div>
           <div class="f">
             <label>max_attempts</label>
             <input name="max_attempts" type="number" value="3" min="1">
-            <span class="hint">Tries per occurrence, including the first. A failure whose
-              failure_kind starts with <b>permanent</b> stops early instead of burning the
-              budget.</span>
+            <span class="hint">每次触发最多尝试几次（含第一次）。如果失败的 failure_kind 以<b>permanent</b>开头，会提前停止，不再浪费剩余次数。</span>
           </div>
           <div class="f">
             <label>max_recoveries</label>
             <input name="max_recoveries" type="number" value="3" min="1">
-            <span class="hint">A separate budget for attempts lost to a crashed scheduler or an
-              unreachable executor — where nobody knows whether the work ran. Spending it does
-              not consume an attempt.</span>
+            <span class="hint">另一份独立预算，用于调度器崩了或执行器失联导致「不知道到底跑没跑」的那些 attempt。花掉它不占用上面的重试次数。</span>
           </div>
         </div>
       </fieldset>
 
       <fieldset>
-        <legend>Payload</legend>
+        <legend>参数</legend>
         <div class="f">
           <label>params</label>
           <textarea name="params" rows="3">{}</textarea>
-          <span class="hint">A JSON object handed to the handler. A manual trigger's overrides
-            are <b>merged</b> over these, not substituted. <b>No secrets</b> — these are stored
-            in the tenant schema, shown here, and sent over the wire.</span>
+          <span class="hint">传给 handler 的 JSON 对象。手工触发时填的参数是<b>合并</b>覆盖在这份之上，不是整体替换。<b>不要放密钥</b>——它存在租户库里、显示在这个页面上、还会经网络传给执行器。</span>
         </div>
         <div class="f" style="margin-top:14px">
           <label>description</label>
-          <input name="description" placeholder="what this job is for">
-          <span class="hint">For whoever reads this list at 3am.</span>
+          <input name="description" placeholder="这个任务是干什么的">
+          <span class="hint">写给凌晨三点来看这个列表的人。</span>
         </div>
         <div class="f" style="margin-top:14px">
           <label>reason</label>
-          <input name="reason" required placeholder="why you are creating or changing this">
-          <span class="hint">Recorded in the audit log against your account. Required.</span>
+          <input name="reason" required placeholder="为什么新建或修改这个任务">
+          <span class="hint">记入审计日志，挂在你的账号下。必填。</span>
         </div>
       </fieldset>
 
       <div class="err" id="jobErr" hidden></div>
     </div>
     <div class="dlg-foot">
-      <button value="cancel" formnovalidate>cancel</button>
-      <button class="primary" value="ok">save</button>
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok">保存</button>
     </div>
   </form>
 </dialog>
@@ -615,7 +592,7 @@ function openJob(name) {
   const f = $("#jobForm");
   f.reset();
   $("#jobErr").hidden = true;
-  $("#jobTitle").textContent = name ? `Edit ${name}` : "New job";
+  $("#jobTitle").textContent = name ? `编辑 ${name}` : "新建任务";
   f.dataset.editing = name || "";
   f.dataset.version = "";
 
