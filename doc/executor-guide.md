@@ -214,25 +214,40 @@ The order matters, because the failure mode of getting it wrong is running the j
 
 1. **Write the handler in the executor**, calling the same code the old scheduler called. Do not
    re-implement the logic; call it.
-2. **Deploy the executor** and confirm it registers: the tenant's handler list should show your
-   `handler_key`.
-3. **Create the job with `"enabled": false`.** There is no `paused` field on creation —
-   pausing is a separate operation (`POST …/jobs/{name}/pause`, `…/resume`) on a job that
-   already exists. A disabled job holds its configuration and is never claimed.
+2. **Deploy the executor** and confirm it registers: `GET /api/tenants/{tenant}/handlers` should
+   list your `handler_key`.
+3. **Create the job enabled, on a schedule that cannot fire before you are finished.** A cron of
+   `0 0 3 29 2 *` — 03:00 on 29 February — is years away and unambiguous.
+
+   Not `"enabled": false`, and not paused. Both are runnability conditions: a disabled or paused
+   job is never claimed, and that includes a manual trigger, so a trigger against one sits in
+   `ready` for ever and tells you nothing. What makes this step safe is the schedule, not a
+   flag.
 4. **Trigger it manually** (`POST /api/tenants/{tenant}/jobs/{name}/trigger` with a
-   `request_id` and a `reason`) and check the execution history: accepted, ran, reported a
+   `request_id` and a `reason`) and check the execution history: dispatched, ran, reported a
    result, correct outcome.
 5. **Turn OFF the old scheduler's copy.** This is the cutover. Both enabled at once is a double
    run, and nothing in go-job can prevent it — the old scheduler is not a participant in its
    protocol.
-6. **Enable** the go-job job (`PATCH …/jobs/{name}` with `"enabled": true` and an
-   `If-Match: <version>` header).
+6. **Set the real schedule** — `PATCH …/jobs/{name}` with an `If-Match: <version>` header.
+
+   `PATCH` here **replaces the whole definition**; it is not a partial edit. Send every field,
+   including `job_name` and `handler_key`, or it answers `400 job_name and handler_key are
+   required`. The safe way is to `GET` the job, change what you meant to change, and send it
+   back with its `version` in `If-Match`.
+
+   The response still shows the OLD `next_fire_at`. That is expected: the new instant is
+   recomputed by the drift scan, inside the same locked transaction shape materialization uses,
+   and appears within a scan interval. Re-read the job to see it before concluding anything.
 7. Watch the first natural fire.
 
 Migrate in small batches and let each batch run through at least one natural fire before
 starting the next. A `request_id` for a manual trigger is an idempotency key **bound to that
 job**: re-using one against a different job is refused, not silently answered with the first
 job's execution.
+
+`"enabled": false` still has a use — staging a definition an operator will turn on later, or
+stopping a job without losing its configuration. It is just not a step in this procedure.
 
 ---
 
