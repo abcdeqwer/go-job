@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -575,5 +576,102 @@ func TestExecutorIdentityLifecycle(t *testing.T) {
 	}
 	if err := auth.Authorize(ctx, server.Identity{Subject: "report-worker"}, "np", "", false); err == nil {
 		t.Fatal("a revoked identity is still authorised")
+	}
+}
+
+// The DSN encryption key is optional, and every combination has to behave.
+//
+// It is optional because of what it does and does not protect. It does NOT protect against
+// someone who can read this process's configuration — the key lives beside the control DSN, so
+// whoever has one has both. It protects against disclosure of the control DATABASE: a backup, a
+// read replica, an engineer with SELECT, where the ciphertext travels and the key does not.
+// Real, common, and not every installation's threat — which is why it stopped being mandatory,
+// and why a key whose loss makes every tenant unreadable is no longer forced on people who did
+// not ask for it.
+//
+// What must not happen is silent degradation: a build without a key must not read an encrypted
+// row as garbage, and must not quietly re-write it in plaintext.
+func TestDSNKeyIsOptionalInBothDirections(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	const secret = "gojob:hunter2@tcp(db:3306)/np_scheduler"
+
+	// Without a key: readable, and stored as typed.
+	plainStore, err := control.New(db, clock, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainStore.Encrypting() {
+		t.Error("a store built with no key reports that it encrypts")
+	}
+	if err := plainStore.AddTenant(ctx, "np", secret, "uuid-1", "test", "no key"); err != nil {
+		t.Fatal(err)
+	}
+	ts, err := plainStore.Tenants(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ts) != 1 || ts[0].DSN != secret {
+		t.Fatalf("plaintext DSN did not round-trip: %+v", ts)
+	}
+
+	// With a key: readable, and NOT stored as typed.
+	sealedStore, err := control.New(db, clock, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sealedStore.Encrypting() {
+		t.Error("a store built with a key reports that it does not encrypt")
+	}
+	if err := sealedStore.AddTenant(ctx, "cp", secret, "uuid-2", "test", "with key"); err != nil {
+		t.Fatal(err)
+	}
+	var stored []byte
+	if err := db.QueryRowContext(ctx,
+		`SELECT coordination_dsn FROM tenant_registry WHERE tenant = 'cp'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if containsBytes(stored, "hunter2") {
+		t.Fatal("a DSN written with a key contains the password in plaintext")
+	}
+
+	// A keyed store reads BOTH — an installation that turns encryption on keeps working.
+	ts, err = sealedStore.Tenants(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tn := range ts {
+		if tn.DSN != secret {
+			t.Errorf("%s did not round-trip through a keyed store: %q (%s)", tn.Name, tn.DSN, tn.LastError)
+		}
+	}
+
+	// A keyless store reads the plaintext one and REFUSES the encrypted one — by name, not by
+	// returning something that looks like a DSN and is not.
+	ts, err = plainStore.Tenants(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tn := range ts {
+		switch tn.Name {
+		case "np":
+			if tn.DSN != secret {
+				t.Errorf("the plaintext tenant stopped being readable: %q", tn.DSN)
+			}
+		case "cp":
+			if tn.DSN == secret {
+				t.Error("an encrypted DSN was read without the key")
+			}
+			if tn.Enabled {
+				t.Error("a tenant whose DSN could not be read is still enabled")
+			}
+			if !strings.Contains(tn.LastError, "dsn-key") {
+				t.Errorf("the failure does not mention the missing key: %q", tn.LastError)
+			}
+		}
 	}
 }

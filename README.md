@@ -280,12 +280,29 @@ go-job never runs DDL. Apply the schemas with whatever migration tool you alread
 Fourteen of the twenty-six flags also read a `GOJOB_`-prefixed environment variable; the
 timing ones are flag-only. Each table below says which.
 
-Required — the process refuses to start without them:
+Required — the process refuses to start without it:
 
 | Flag | Env | Meaning |
 | --- | --- | --- |
 | `-control-dsn` | `GOJOB_CONTROL_DSN` | the control database |
-| `-dsn-key` | `GOJOB_DSN_KEY` | hex key encrypting tenant DSNs at rest — identical on every replica and across restarts, or every stored DSN becomes unreadable |
+
+That is the only one. Everything else has a working default.
+
+| Flag | Env | Meaning |
+| --- | --- | --- |
+| `-dsn-key` | `GOJOB_DSN_KEY` | **optional.** A hex key (16, 24 or 32 bytes) encrypting tenant DSNs at rest. Without it they are stored as typed, and startup says so. |
+
+It is optional because of what it does and does not protect. It does **not** protect against
+someone who can read this process's configuration — the key sits beside the control DSN, so
+whoever has one has both. What it protects against is disclosure of the control **database**: a
+backup file, a read replica, an engineer with SELECT, where the ciphertext travels and the key
+does not. Set it if that is a threat you have; skip it if the key you would then have to never
+lose is the bigger risk.
+
+Turning it on later works: a keyed process reads rows written without a key. Turning it off
+does not — the encrypted rows stay encrypted, and those tenants report that they need the key
+rather than failing obscurely.
+
 
 Identity and addresses:
 

@@ -59,19 +59,25 @@ the migration, not for the process.
 
 ---
 
-## 2. The DSN encryption key
+## 2. The DSN encryption key — optional
 
 ```sh
-openssl rand -hex 32
+openssl rand -hex 32        # only if you want it
 ```
 
-Tenant DSNs contain database passwords and the tenant table is visible in the admin UI, so they
-are encrypted at rest under this key.
+Tenant DSNs contain database passwords. With `-dsn-key` they are encrypted at rest; without it
+they are stored as typed and startup warns.
 
-**It must be identical on every replica and across every restart.** A key that changes makes
-every registered tenant unreadable — not a degraded mode, a scheduler that cannot open a single
-tenant. Store it wherever you keep your other secrets; losing it means re-registering every
-tenant with its DSN again.
+Worth understanding before choosing. The key does **not** protect against someone who can read
+this process's configuration: it sits beside the control DSN, so whoever has one has both. What
+it protects against is disclosure of the control **database** — a backup file, a read replica,
+an engineer with SELECT — where the ciphertext travels and the key does not.
+
+Against that it costs a secret you can never lose: **identical on every replica and across every
+restart**, because a key that changes makes every registered tenant unreadable.
+
+Turning it on later works — a keyed process reads rows written without one. Turning it off does
+not: the encrypted rows stay encrypted, and those tenants report that they need the key.
 
 ---
 

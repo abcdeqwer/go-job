@@ -66,32 +66,91 @@ type Store struct {
 	aead  cipher.AEAD
 }
 
-// New opens a control store. key must be 16, 24 or 32 bytes; DSNs are encrypted under it with
-// AES-GCM because they contain database passwords and this table is reachable from a UI.
+// Stored DSNs carry a one-byte tag saying how they are stored, so a reader can tell a
+// ciphertext from a password that happens to contain unusual bytes. Without it, making
+// encryption optional would mean guessing, and guessing wrong on a DSN is an installation that
+// cannot open a single tenant.
+const (
+	dsnPlain  = 0x00
+	dsnSealed = 0x01
+)
+
+// New opens a control store. key may be nil.
+//
+// With a key, DSNs are encrypted at rest with AES-GCM. Without one they are stored as they
+// were typed, and the caller is expected to have said so at startup.
+//
+// The key is optional because of what it does and does not protect. It does NOT protect
+// against someone who can read this process's configuration: the key lives beside the control
+// DSN, so whoever has one has both. What it protects against is disclosure of the control
+// DATABASE — a backup file, a read replica, a support engineer with SELECT — where the
+// ciphertext travels and the key does not. That is a real threat and a common one, but it is
+// not every installation's threat, and making it mandatory bought that protection at the price
+// of a key whose loss makes every tenant unreadable.
 func New(db *sql.DB, clock gojob.Clock, key []byte) (*Store, error) {
+	s := &Store{db: db, clock: clock}
+	if len(key) == 0 {
+		return s, nil
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("control: DSN encryption key must be 16, 24 or 32 bytes: %w", err)
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
+	if s.aead, err = cipher.NewGCM(block); err != nil {
 		return nil, fmt.Errorf("control: build AEAD: %w", err)
 	}
-	return &Store{db: db, clock: clock, aead: aead}, nil
+	return s, nil
 }
+
+// Encrypting reports whether this store seals what it writes.
+func (s *Store) Encrypting() bool { return s.aead != nil }
 
 // DB exposes the pool for the admin API's own queries.
 func (s *Store) DB() *sql.DB { return s.db }
 
 func (s *Store) seal(plain string) ([]byte, error) {
+	if s.aead == nil {
+		return append([]byte{dsnPlain}, plain...), nil
+	}
 	nonce := make([]byte, s.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("control: read nonce: %w", err)
 	}
-	return s.aead.Seal(nonce, nonce, []byte(plain), nil), nil
+	return append([]byte{dsnSealed}, s.aead.Seal(nonce, nonce, []byte(plain), nil)...), nil
 }
 
-func (s *Store) open(sealed []byte) (string, error) {
+// open reads a stored DSN, whichever way it was stored.
+//
+// Rows written before the tag existed are all sealed, and are recognised by not carrying a
+// tag byte this code wrote — an AES-GCM ciphertext begins with a random nonce, so the first
+// byte is 0x01 only by chance. That ambiguity is why the untagged path is tried second and
+// only when a key is configured: an installation with a key can still read everything it
+// wrote before, and one without a key is told plainly that it needs one.
+func (s *Store) open(stored []byte) (string, error) {
+	if len(stored) == 0 {
+		return "", errors.New("control: stored DSN is empty")
+	}
+	switch stored[0] {
+	case dsnPlain:
+		return string(stored[1:]), nil
+	case dsnSealed:
+		if s.aead == nil {
+			return "", errors.New("control: this installation's DSNs are encrypted, but no " +
+				"-dsn-key was given; start with the key they were stored under")
+		}
+		if v, err := s.unseal(stored[1:]); err == nil {
+			return v, nil
+		}
+	}
+	// Untagged: written by a build from before encryption was optional. Always sealed.
+	if s.aead == nil {
+		return "", errors.New("control: this installation's DSNs are encrypted, but no " +
+			"-dsn-key was given; start with the key they were stored under")
+	}
+	return s.unseal(stored)
+}
+
+func (s *Store) unseal(sealed []byte) (string, error) {
 	n := s.aead.NonceSize()
 	if len(sealed) < n {
 		return "", errors.New("control: stored DSN is shorter than a nonce")

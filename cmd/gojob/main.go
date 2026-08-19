@@ -97,7 +97,8 @@ func run() error {
 	flag.StringVar(&c.controlDSN, "control-dsn", env("GOJOB_CONTROL_DSN", ""),
 		"MySQL DSN for the control database")
 	flag.StringVar(&c.dsnKeyHex, "dsn-key", env("GOJOB_DSN_KEY", ""),
-		"hex-encoded 16, 24 or 32 byte key that tenant DSNs are encrypted with")
+		"OPTIONAL hex-encoded 16, 24 or 32 byte key encrypting tenant DSNs at rest; "+
+			"without it they are stored as typed")
 	flag.StringVar(&c.location, "location", env("GOJOB_LOCATION", "UTC"),
 		"business time zone; cron expressions are evaluated in it")
 	flag.StringVar(&c.instanceID, "instance-id", env("GOJOB_INSTANCE_ID", ""),
@@ -197,6 +198,14 @@ func run() error {
 	}
 
 	ctl, err := control.New(controlDB, clock, key)
+	if err == nil && !ctl.Encrypting() {
+		// Beside the plaintext-gRPC and no-credential warnings, and for the same reason:
+		// nobody should learn months later, from the table, that the passwords in it are
+		// readable to anything that can read the control database — a backup, a replica, a
+		// support engineer with SELECT.
+		log.Warn("tenant DSNs are stored WITHOUT encryption; -dsn-key is unset, so anything " +
+			"that can read the control database can read the passwords in it")
+	}
 	if err != nil {
 		return err
 	}
@@ -354,8 +363,9 @@ func env(key, def string) string {
 // "no tenants" rather than as anything pointing at the key.
 func decodeKey(hexKey string) ([]byte, error) {
 	if hexKey == "" {
-		return nil, errors.New("-dsn-key is required; it decrypts the DSNs in the registry, " +
-			"and it must be the same key across every instance and every restart")
+		// Optional. run() warns when it is absent, because storing a database password as it
+		// was typed is a choice an operator should see made, not discover in a table.
+		return nil, nil
 	}
 	key, err := hex.DecodeString(hexKey)
 	if err != nil {
