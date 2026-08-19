@@ -151,96 +151,105 @@ the execution history it reads, and structured logs.
 
 ---
 
-## 4. How to use it
+## 4. Getting it running
 
-Three things happen once, in this order: run the scheduler, add a tenant, connect an
-executor.
+From nothing to a scheduler running a job. Every command here has been executed as written.
 
-### Run the scheduler
+### 1. A database, and one empty schema for it
+
+go-job runs no DDL of its own at startup — it holds a lock in your production database, and a
+scheduler that migrates itself on start is a surprise nobody wants at 3am. So the **control**
+schema is the one thing you create first:
 
 ```sh
-go-job \
-  --control-dsn  "user:pass@tcp(mysql:3306)/gojob_control" \
-  --location     "Asia/Manila" \
-  --listen       ":8090"          # admin UI, gRPC, health, metrics
+mysql -e "CREATE DATABASE gojob_control"
+mysql gojob_control < schema/mysql/control/001_control.sql
 ```
 
-Everything else — which tenants exist, which jobs they run, on what schedule — is data.
-The binary takes no job list and no tenant list.
+Tenant schemas you do **not** need to prepare — the UI creates them when you add a tenant.
 
-### Add a tenant
+### 2. Start it
 
-One audited row in the control database, through the UI or the API:
-
-```text
-tenant   coordination_dsn
-np       …/np_scheduler
-np2      …/np2
+```sh
+gojob -control-dsn 'gojob:PASSWORD@tcp(mysql:3306)/gojob_control'
 ```
 
-Schedulers pick it up within one poll — **no restart**. Adding another site later is the same
-one row. DSNs are encrypted at rest and never read back in plaintext.
+**That is the only required flag.** Everything else has a working default; `README §6` lists
+them all. The ones most deployments set:
 
-Only the scheduler's own coordination schema is named here. Executors reach their business
-databases with their own configuration; the scheduler never holds a business credential.
-
-### Connect an executor
-
-An executor implements the four `JobExecutor` RPCs from
-`proto/gojob/v1/executor.proto`, registers, and starts receiving work. In Go, with the
-generated stubs and **without** embedding the `Unimplemented` struct, a missing method is a
-compile error:
-
-```go
-func (e *MyExecutor) Run(ctx context.Context, r *gojobv1.RunRequest) (*gojobv1.RunResponse, error) {
-    if !e.claim(r.ExecutionKey) {
-        return nil, status.Error(codes.AlreadyExists, "already running")
-    }
-    go e.run(r)                       // returns immediately; reports later
-    return &gojobv1.RunResponse{ExecutionKey: r.ExecutionKey}, nil
-}
+```sh
+gojob \
+  -control-dsn 'gojob:PASSWORD@tcp(mysql:3306)/gojob_control' \
+  -location    'Asia/Manila' \       # cron expressions are evaluated in this zone
+  -admin-addr  ':8080' \             # operator UI and API
+  -grpc-addr   ':9090' \             # executors connect here
+  -tls-cert /certs/server.crt -tls-key /certs/server.key \
+  -tls-client-ca /certs/executor-ca.crt
 ```
 
-The handler reads its parameters from `RunRequest.Params` and its business date from
-`RunRequest.ScheduledAt` — business time, not the executor's wall clock:
+Each flag also reads a `GOJOB_`-prefixed environment variable — `GOJOB_CONTROL_DSN` and so on
+— which is usually the better way to carry them in a container.
 
-```go
-func (e *MyExecutor) run(r *gojobv1.RunRequest) {
-    day := parseDay(r.ScheduledAt).AddDate(0, 0, -1)
-    size := int(r.Params.Values.Fields["batch_size"].GetNumberValue())
+**Read the startup log once.** Four warnings mean you are running something you may not have
+intended, and each names what it costs. Two appear by default — TLS and DSN encryption are both
+opt-in — and two only if you asked for them:
 
-    n, err := rebuild(day, size)
-    e.report(r, ok(err), fmt.Sprintf("rows=%d", n), n > 0)   // last arg: did_work
-}
+```
+the executor gRPC service is PLAINTEXT            ← unless -tls-cert/-tls-key
+tenant DSNs are stored WITHOUT encryption         ← unless -dsn-key
+executor calls are accepted WITHOUT a credential  ← only with -allow-unauthenticated-executors
+authenticated executors are accepted for tenants
+  they are NOT listed for                         ← only with -allow-unlisted-executors
 ```
 
-While it runs, the executor's framework calls `ReportProgress` on a timer — the handler
-does not have to remember to. A `proceed=false` response means ownership was lost or the
-run was cancelled, and the handler must stop without further writes.
+In production the log should have none of them.
 
-Executors in other languages implement the same four methods from the same `.proto`.
-`doc/dispatch.md` §9 is the complete list of what any of them must guarantee — six items.
+### 3. Everything else is in the browser
 
-### Apply the schema
+Open `http://host:8080`. There is nothing more to configure on the command line.
 
-`schema/mysql` holds the required DDL, embedded and versioned. Copy or wrap those files
-into whatever migration sequence you already use, and apply them to every schema the
-scheduler will use before first start. `schema.Version` declares the schema version the
-library requires; a mismatch is a startup error, never a silent degradation.
+| Step | Where |
+| --- | --- |
+| **First administrator** | The page offers it when no account exists yet. Twelve characters minimum. It refuses once an account exists, so this is not an open door. |
+| **Add a tenant** | 租户 → 添加租户. Enter host, database, user, password; **test the connection**; if the database is empty it offers to create the tables. Then save. |
+| **Authorise an executor** | 凭证 → 授权执行器. mTLS by certificate subject, or a generated token shown **once**. Nothing registers without a row here. |
+| **Create jobs** | jobs → new job. Every field carries an explanation, and the schedule shows the next five fire instants as you type. |
+
+The tenant appears in the picker within one registry poll (10s by default) — no restart.
+
+### 4. Connect an executor
+
+An executor is **your** process, in any language, implementing the four `JobExecutor` RPCs from
+`proto/gojob/v1/executor.proto`. `doc/executor-guide.md` is written to be handed to whoever —
+or whatever — writes it: the rules that are enforced, what breaks when each is ignored, and the
+order to migrate an existing scheduled job in.
+
+The short version: mint a fresh executor id every start, run a handler at most once per
+`run_token`, refuse with `refused=true` rather than a status code, answer `GetExecution` about
+the attempt you were asked about, and report the result until it lands.
+
+### 5. Check it works
+
+Create a job with the handler key your executor declares, press **run** on it, and watch the
+executions tab. A dispatched execution that stays `ready` means no executor declares that
+handler key — the jobs list flags it `no executor`.
 
 ---
 
 ## 5. Admin UI
 
-The library serves its own operations surface on `Listen`. There is nothing to deploy
-separately and nothing to build.
+Served on `-admin-addr`, from the binary itself. Nothing to deploy separately, nothing to
+build, and no assets fetched from the internet — a strict CSP forbids it, which is what keeps it
+working on an isolated network.
 
 - **Jobs** — every job with its schedule, owner deployment, and effective state. When a
   job will not run, the UI names every failed condition rather than showing one misleading
   boolean.
 - **Executions** — ready, running, retry-delayed, dead, skipped and cancelled, with owner,
   attempt number, lease and heartbeat age, failure kind and result summary.
-- **Workers** — live processes, their build revision, uptime and handler sets.
+- **Executors** — live processes, their build revision, uptime and handler sets.
+- **Tenants** — admission state, generation, and the last error for one that will not start.
+- **Credentials** — who may register as an executor, for which tenant and group.
 - **Actions** — manual trigger, pause and resume, edit schedule and policy, retry a dead
   execution, cancel a running one. Each is audited with actor and reason.
 
