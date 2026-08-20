@@ -675,3 +675,69 @@ func TestDSNKeyIsOptionalInBothDirections(t *testing.T) {
 		}
 	}
 }
+
+// The same defect, on the column the executor fix missed.
+//
+// tenant_observation.observed_at is an ownership column — written with UTC_TIMESTAMP() — and the
+// driver tags it with the DSN's `loc`, the business location. Left alone, the scanned value
+// claims an offset it never had and the instant it reports is wrong by exactly that offset: the
+// API served a timestamp eight hours in the past, labelled +08:00.
+//
+// The executor path had asUTC() from an earlier round of this. This one did not, which is why
+// the helper now lives in the root package where both packages can see it.
+//
+// The harness runs at UTC, where the offset is zero and the defect cannot appear. A second pool
+// opened the way a Manila deployment opens one is the only way to see it.
+func TestBlockerObservationIsCorrectOutsideUTC(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+
+	store, err := control.New(db, clock, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddTenant(ctx, "np", "u:p@tcp(h:3306)/np_sched", "uuid-1", "tester", "why"); err != nil {
+		t.Fatal(err)
+	}
+	// An instance that has acknowledged an OLD generation: that is what a blocker is.
+	if err := store.Observe(ctx, "np", "instance-a", 1, true); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().UTC()
+
+	manila, err := time.LoadLocation("Asia/Manila")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	manilaDB, err := sql.Open("mysql", dsn(t)+schema+
+		"?parseTime=true&loc=Asia%2FManila&multiStatements=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manilaDB.Close()
+	manilaStore, err := control.New(manilaDB, gojob.SystemClock{Loc: manila}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blockers, err := manilaStore.Blockers(ctx, "np", 2, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blockers) != 1 {
+		t.Fatalf("got %d blockers, want 1", len(blockers))
+	}
+
+	// The instant, not the wall-clock digits. Read through a Manila pool the value used to be
+	// eight hours in the past — which is what made an operator's "when did this instance last
+	// report" answer wrong.
+	got := blockers[0].ObservedAt
+	if skew := got.Sub(before); skew < -2*time.Minute || skew > 2*time.Minute {
+		t.Fatalf("ObservedAt is %s away from now (%s vs %s); an ownership column read through a "+
+			"non-UTC pool was not re-tagged", skew, got.UTC(), before)
+	}
+}

@@ -129,10 +129,7 @@ func assertOne(res sql.Result, stmt string) error {
 //
 // The protocol paths never hit this, because ownership is compared in SQL and never read into
 // Go. Reporting does read it, to show an operator when something last happened.
-func asUTC(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(),
-		t.Nanosecond(), time.UTC)
-}
+func asUTC(t time.Time) time.Time { return gojob.AsUTC(t) }
 
 // nullString renders an optional column.
 func nullString(s string) any {

@@ -598,6 +598,11 @@ func (s *Store) Blockers(ctx context.Context, tenant string, generation int64, l
 		if err := rows.Scan(&b.InstanceID, &b.Generation, &b.Quiesced, &b.ObservedAt); err != nil {
 			return nil, fmt.Errorf("scan blocker: %w", err)
 		}
+		// observed_at is written with UTC_TIMESTAMP(), but the driver parses a bare DATETIME
+		// using the DSN's loc — so without this the value claims the business location while
+		// holding UTC digits, and the instant it reports is wrong by the offset. Not a display
+		// problem: the API served a timestamp eight hours in the past, labelled +08:00.
+		b.ObservedAt = gojob.AsUTC(b.ObservedAt)
 		out = append(out, b)
 	}
 	return out, rows.Err()

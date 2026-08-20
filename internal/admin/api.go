@@ -727,7 +727,17 @@ func (a *API) quiescence(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	body := map[string]any{"generation": generation, "blockers": blockers}
+	// Blockers carry an ownership timestamp, so it is expressed in the business location here
+	// for the same reason the executor list is: one API, one clock, as far as a reader is
+	// concerned.
+	shown := make([]map[string]any, 0, len(blockers))
+	for _, b := range blockers {
+		shown = append(shown, map[string]any{
+			"InstanceID": b.InstanceID, "Generation": b.Generation, "Quiesced": b.Quiesced,
+			"ObservedAt": b.ObservedAt.In(a.cfg.Clock.Location()).Format(time.RFC3339),
+		})
+	}
+	body := map[string]any{"generation": generation, "blockers": shown}
 
 	// schema_observed says whether the counts below are present, EXPLICITLY.
 	//

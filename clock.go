@@ -94,3 +94,22 @@ func (c *FixedClock) Advance(d time.Duration) {
 	c.at = c.at.Add(d)
 	c.mu.Unlock()
 }
+
+// AsUTC re-tags an OWNERSHIP timestamp that a driver mislabelled.
+//
+// Ownership columns are written with UTC_TIMESTAMP(), so their digits are UTC. The MySQL driver,
+// however, tags every bare DATETIME it reads with the DSN's `loc` — the BUSINESS location — so
+// the scanned time.Time carries an offset the value never had, and the instant it reports is
+// wrong by exactly that offset.
+//
+// It lives here, exported, because forgetting to call it has now been the same bug twice: once
+// on job_executor.heartbeat_at and once on tenant_observation.observed_at. Both packages that
+// read ownership columns already depend on this one, and a helper nobody can find is a helper
+// the next reader will not call.
+//
+// The error is invisible in a UTC deployment — which is what the test harness runs in — so a
+// test that proves anything here has to open its connection in a non-UTC location.
+func AsUTC(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(),
+		t.Nanosecond(), time.UTC)
+}

@@ -820,8 +820,12 @@ async function renderJobs(t) {
         `<button data-act="copy" data-job="${esc(j.job_name)}">复制到…</button>`,
       ].join(" ") : '<span class="dim">—</span>';
 
+      // The description sits UNDER the name rather than in a column of its own. It is prose —
+      // a column either wraps it into three lines or truncates the half that says why the job
+      // exists — and the actions column is already the first thing a narrow window clips.
       return [
-        esc(j.job_name),
+        `<b>${esc(j.job_name)}</b>`
+          + (j.description ? `<div class="dim" style="font-weight:400;margin-top:2px">${esc(j.description)}</div>` : ""),
         esc(j.handler_key) + (j.executor_group ? ` <span class="dim">@${esc(j.executor_group)}</span>` : ""),
         `<code>${esc(j.schedule_expr)}</code>`,
         flags.join(" "),

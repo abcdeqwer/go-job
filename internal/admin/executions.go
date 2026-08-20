@@ -228,8 +228,14 @@ func (a *API) listExecutors(w http.ResponseWriter, r *http.Request) error {
 			"capacity":         x.Capacity,
 			"running":          x.Running,
 			"handlers":         x.Handlers,
-			"started_at":       x.StartedAt.Format(time.RFC3339),
-			"heartbeat_at":     x.HeartbeatAt.Format(time.RFC3339),
+			// Rendered in the BUSINESS location, like every other timestamp this API emits.
+			//
+			// These two are ownership columns and therefore UTC; the rest of the API is business
+			// time. Emitting both families raw put two clocks on one page with nothing to tell
+			// them apart — and the UI strips the offset, so a UTC value displayed as local read
+			// eight hours behind. The instant is unchanged; only the offset it is expressed in.
+			"started_at":   x.StartedAt.In(a.cfg.Clock.Location()).Format(time.RFC3339),
+			"heartbeat_at": x.HeartbeatAt.In(a.cfg.Clock.Location()).Format(time.RFC3339),
 			// Shown rather than filtered out: an executor that stopped heartbeating is the
 			// thing an operator is looking for, and removing it from the list turns "it died"
 			// into "it was never there".
