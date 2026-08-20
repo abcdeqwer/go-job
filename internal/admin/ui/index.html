@@ -80,7 +80,18 @@
        border-bottom-color:var(--line); }
   tbody tr:hover { background:var(--raised); }
   tr:last-child td { border-bottom:none; }
-  td.wrap { white-space:normal; max-width:460px; }
+  /* Opt-in wrapping for cells that hold a LIST or prose.
+     th/td are nowrap by default and must stay that way: a timestamp or a cron expression broken
+     across two lines is worse than a scrollbar. But a comma-joined handler list forced the whole
+     table wider than the window, and the executors view scrolled horizontally with screen space
+     to spare.
+     A `td.wrap` rule existed for this and NOTHING ever used it — the class was never applied to
+     a cell, so every column stayed nowrap. It is a class on an inner block now, because
+     max-width on a table cell is advisory in auto layout while on a block child it is honoured.
+     overflow-wrap:anywhere is for the single long token — a masked DSN, a uuid — that has no
+     space to break at. */
+  td .wrap { white-space:normal; overflow-wrap:anywhere; max-width:52ch; }
+  td .wrap.narrow { max-width:34ch; }
   td:first-child { font-weight:550; }
   code { font-family:var(--mono); font-size:12.5px; color:var(--text);
          background:var(--raised); border:1px solid var(--line-soft);
@@ -623,6 +634,9 @@ function esc(v) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// wrap marks a cell's content as safe to break across lines. See the `td .wrap` rule.
+const wrap = (html, narrow) => `<div class="wrap${narrow ? " narrow" : ""}">${html}</div>`;
+
 function table(cols, rows) {
   $("#head").innerHTML = "<tr>" + cols.map(c => `<th>${esc(c)}</th>`).join("") + "</tr>";
   $("#body").innerHTML = rows.length
@@ -825,8 +839,11 @@ async function renderJobs(t) {
       // exists — and the actions column is already the first thing a narrow window clips.
       return [
         `<b>${esc(j.job_name)}</b>`
-          + (j.description ? `<div class="dim" style="font-weight:400;margin-top:2px">${esc(j.description)}</div>` : ""),
-        esc(j.handler_key) + (j.executor_group ? ` <span class="dim">@${esc(j.executor_group)}</span>` : ""),
+          + (j.description
+              ? `<div class="wrap dim" style="font-weight:400;margin-top:2px">${esc(j.description)}</div>`
+              : ""),
+        wrap(esc(j.handler_key)
+          + (j.executor_group ? ` <span class="dim">@${esc(j.executor_group)}</span>` : ""), true),
         `<code>${esc(j.schedule_expr)}</code>`,
         flags.join(" "),
         when(j.next_fire_at || j.next_poll_at),
@@ -898,7 +915,7 @@ async function renderExecutions(t) {
                 : '<span class="dim">—</span>'))
         : '<span class="dim">—</span>';
       return [
-        `<span class="dim">${esc(e.execution_key)}</span>`,
+        wrap(`<span class="dim">${esc(e.execution_key)}</span>`, true),
         esc(e.job_name),
         esc(e.trigger_type),
         // The label, not the bare status: `cancelled` alone cannot say whether side effects
@@ -907,7 +924,7 @@ async function renderExecutions(t) {
         `${e.attempt_no}/${e.max_attempts}${e.recovery_count ? ` <span class="dim">+${e.recovery_count}r</span>` : ""}`,
         when(e.scheduled_at),
         when(e.finished_at),
-        `<span class="dim">${esc(e.result_summary || e.error_message || "")}</span>`,
+        wrap(`<span class="dim">${esc(e.result_summary || e.error_message || "")}</span>`),
         acts,
       ];
     })
@@ -940,12 +957,12 @@ async function renderExecutors(t) {
   table(
     ["executor", "group", "address", "state", "load", "handlers", "last heartbeat"],
     xs.map(x => [
-      esc(x.executor_id),
+      wrap(esc(x.executor_id), true),
       esc(x.group),
       `<span class="dim">${esc(x.address)}</span>`,
       x.live ? '<span class="tag ok">live</span>' : '<span class="tag bad">stale</span>',
       `${x.running}/${x.capacity || "?"}`,
-      `<span class="dim">${esc((x.handlers || []).join(", "))}</span>`,
+      wrap(`<span class="dim">${esc((x.handlers || []).join(", "))}</span>`),
       when(x.heartbeat_at),
     ])
   );
@@ -972,8 +989,8 @@ async function renderTenants() {
         : '<span class="tag bad">未接纳</span>',
       String(t.generation),
       `<code>${esc((t.schema_uuid || "").slice(0, 8))}</code>`,
-      `<span class="dim">${esc(t.dsn)}</span>`,
-      t.last_error ? `<span class="bad">${esc(t.last_error)}</span>` : '<span class="dim">—</span>',
+      wrap(`<span class="dim">${esc(t.dsn)}</span>`, true),
+      t.last_error ? wrap(`<span class="bad">${esc(t.last_error)}</span>`) : '<span class="dim">—</span>',
     ].concat(canEdit ? [
       `<button type="button" data-edit="${esc(t.tenant)}">编辑</button>`
       + ` <button type="button" data-move="${esc(t.tenant)}">换连接</button>`,
@@ -1451,8 +1468,8 @@ async function renderAudit(t) {
     ["when", "actor", "action", "job", "execution", "reason"],
     rows.map(a => [
       when(a.created_at), esc(a.actor), esc(a.action),
-      esc(a.job_name), `<span class="dim">${esc(a.execution)}</span>`,
-      `<span class="dim">${esc(a.detail)}</span>`,
+      esc(a.job_name), wrap(`<span class="dim">${esc(a.execution)}</span>`, true),
+      wrap(`<span class="dim">${esc(a.detail)}</span>`),
     ])
   );
   $("#body").onclick = null;
