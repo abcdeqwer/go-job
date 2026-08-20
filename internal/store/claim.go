@@ -409,7 +409,7 @@ func (s *Store) applyContention(ctx context.Context, tx *sql.Tx, out *ClaimResul
 			    status = 'skipped', terminal_reason = ?, finished_at = ?,
 				    result_summary = ?, lease_until = NULL, updated_at = ?
 				WHERE id = ? AND status = 'ready'`,
-				string(gojob.ReasonOperator), now,
+				string(gojob.ReasonConcurrencySkipped), now,
 				fmt.Sprintf("skipped by FORBID; job held by %s", st.ActiveExecution.String),
 				now, p.ExecutionID)
 			if err != nil {

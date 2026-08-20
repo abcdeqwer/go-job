@@ -118,7 +118,15 @@ const (
 	ReasonBudgetExhausted  TerminalReason = "budget_exhausted"
 	ReasonPermanentFailure TerminalReason = "permanent_failure"
 	ReasonRetired          TerminalReason = "retired"
-	ReasonOperator         TerminalReason = "operator"
+	// ReasonConcurrencySkipped is an occurrence FORBID declined because the previous one was
+	// still running.
+	//
+	// It replaces a ReasonOperator that this was the only writer of — "operator" reads as "a
+	// human did this", the opposite of the truth, and whether a skipped run was policy or a
+	// person is the only thing anyone looking at one wants to know. The old constant is gone
+	// rather than left unused: a reason with no writer and a plausible name is how the next
+	// terminal path gets mislabelled too.
+	ReasonConcurrencySkipped TerminalReason = "concurrency_skipped"
 )
 
 // AttemptOutcome is one attempt's recorded result. `unknown` exists because it is the

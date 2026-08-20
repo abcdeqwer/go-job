@@ -64,18 +64,18 @@ CREATE TABLE tenant_observation (
     KEY idx_tenant_observation_seen (observed_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- ---------------------------------------------------------------------------
--- Named leases for cluster-wide periodic work: retention sweeps, orphan scans.
--- A lease, not an election — no instance is promoted and nothing waits for consensus.
--- ---------------------------------------------------------------------------
-CREATE TABLE control_lease (
-    lease_name   VARCHAR(64)  NOT NULL,
-    holder_id    VARCHAR(128) NOT NULL,
-    run_token    CHAR(36)     NOT NULL,
-    lease_until  DATETIME     NOT NULL,
-    heartbeat_at DATETIME     NOT NULL,
-    PRIMARY KEY (lease_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+-- There is deliberately no lease table for periodic work.
+--
+-- An earlier revision declared control_lease, for "cluster-wide periodic work: retention
+-- sweeps, orphan scans". Nothing ever read or wrote it: every instance runs those passes on its
+-- own engine loop, and every one of them is idempotent — reaping a stale registration that is
+-- already gone deletes nothing, and an orphan scan is a read. So the table sat empty through
+-- every release while the documentation described a mechanism that did not exist.
+--
+-- The cost of having no lease is duplicated work and duplicated alert lines at N replicas, not
+-- incorrectness. If a periodic pass ever stops being idempotent, or becomes expensive enough
+-- that running it N times matters, this is where a lease would go — and it should be added
+-- then, with a writer, rather than declared in advance.
 
 -- ---------------------------------------------------------------------------
 -- Which authenticated identity may register as what.

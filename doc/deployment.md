@@ -212,7 +212,12 @@ later. In production the log should have none of them.
 ### Health
 
 - `GET /healthz` — the process is alive
-- `GET /readyz` — it has admitted its tenants and holds a fresh control-plane lease
+- `GET /readyz` — it has admitted its tenants and read the tenant registry recently enough
+
+`/readyz` is a **staleness** check, not a lease. Each instance records, in monotonic time, when
+it last read the registry successfully; past `-control-staleness` it reports itself unready and
+stops claiming. There is no lease table and nothing to acquire — an instance fences ITSELF, which
+is what makes step 2 of §9 reachable rather than a guess.
 
 Point your load balancer at `/readyz`. It goes false when the instance loses the control
 database, which is also when the instance stops claiming — that is the fence working, not a
@@ -334,10 +339,33 @@ It also covered the tenant lifecycle in §9: disable through the API, and a quie
 showing the schema quiet with the acknowledging replica listed — the JSON above is that
 response, not an invention.
 
-**Not rehearsed:** TLS and mTLS wiring (the flags exist and are covered by tests, but no
-certificate has been through this path end to end), a multi-replica installation, a DSN cutover
-onto a second database with real data, and `docker build` — which stalls fetching the
-`golang:1.26-alpine` image on the machine this was written on, a network problem rather than a
-Dockerfile one.
+**Two replicas have now been rehearsed**, as two processes against one control database with
+distinct `-instance-id`, a fast cron and a handler slower than its period:
 
-Treat those five as steps to walk through once in a staging environment before trusting them.
+- a job with `concurrency_policy: FORBID` fired repeatedly and ran **exactly once per
+  occurrence** — six handler runs, zero duplicate `execution_key`, zero keys with more than one
+  attempt, every other occurrence recorded `skipped`;
+- contention resolved by fencing rather than by double-writing: the losing instance logged
+  `fence lost; abandoning execution`;
+- `kill -9` on the instance holding a running execution left the other claiming, and it
+  recovered the finished result by asking the executor — the row reached `success` with
+  `terminal_reason = handler_confirmed` without the dead instance ever reporting it;
+- admin sessions worked across both, and each instance admitted the tenant and recorded its own
+  `tenant_observation` row.
+
+**What that rehearsal also showed, and is a deployment requirement rather than a caveat:** an
+executor pinned to ONE replica's address defeats the whole arrangement. Killing the replica its
+gRPC client had connected to left the survivor healthy and claiming while the executor kept
+heartbeating into a dead socket; its registration went stale and the survivor logged `no live
+executor for a ready execution` 249 times with the tenant running nothing. Point executors at a
+name that resolves to every replica, and use a balancer that spreads across them —
+`round_robin`, not the default `pick_first`. Register, Heartbeat, ReportProgress and ReportResult
+all write to the tenant schema every replica shares, so spreading them is safe by construction.
+
+**Still not rehearsed:** TLS and mTLS wiring (the flags exist and are covered by tests, but no
+certificate has been through this path end to end), a DSN cutover onto a second database with
+real data, an instance losing the control database and fencing itself on `-control-staleness`,
+and `docker build` — which stalls fetching the `golang:1.26-alpine` image on the machine this was
+written on, a network problem rather than a Dockerfile one.
+
+Treat those four as steps to walk through once in a staging environment before trusting them.

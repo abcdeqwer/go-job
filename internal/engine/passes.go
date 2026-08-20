@@ -804,6 +804,15 @@ func (e *Engine) adoptResult(ctx context.Context, v store.Stale, rec dispatch.Re
 		JobName: v.JobName, ExecutionID: v.ID, ExecutionKey: v.ExecutionKey,
 		Owner: e.cfg.InstanceID, RunToken: v.RunToken, FenceEpoch: epoch,
 	}
+	// Logged, because the row it produces is indistinguishable from a normally reported one.
+	//
+	// The RUNNING branch above says when it adopts; this one used to say nothing, so a result
+	// that reached the database only because a surviving instance went and asked for it looked
+	// exactly like a result the executor had reported. That hides the fact that a scheduler was
+	// lost — which is the one thing an operator reading this history needs to know.
+	e.log.Info("recovered a finished result from the executor a lost scheduler had dispatched to",
+		"execution", v.ExecutionKey, "executor", v.DispatchedTo,
+		"disposition", rec.Outcome.GetDisposition().String(), "epoch", epoch)
 	e.applyOutcome(ctx, h, rec.Outcome, v.DispatchedTo)
 	return true
 }

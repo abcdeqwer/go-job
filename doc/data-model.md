@@ -17,7 +17,7 @@ Table names carry a configurable prefix, shown here as `job_`.
 
 | Database | How many | Holds |
 | --- | --- | --- |
-| **control** | exactly one | the tenant registry, admin accounts, control-plane leases and control audit |
+| **control** | exactly one | the tenant registry, admin accounts, instance observations and control audit |
 | **coordination** | one per tenant | everything else in this document — jobs, state, executions, executor registrations |
 
 The control database is the only place in this system that knows more than one tenant
@@ -225,19 +225,12 @@ alerted as such.
 
 ### 0.3 The rest of the control database
 
-```sql
--- Named leases for periodic work that should run once per cluster per interval:
--- retention sweeps, orphan scans, expired-registration cleanup.
--- A lease, not an election — see protocol.md §9.
-CREATE TABLE control_lease (
-    lease_name   VARCHAR(64)  NOT NULL,
-    holder_id    VARCHAR(128) NOT NULL,
-    run_token    CHAR(36)     NOT NULL,
-    lease_until  DATETIME     NOT NULL,
-    heartbeat_at DATETIME     NOT NULL,
-    PRIMARY KEY (lease_name)
-);
+There is **no lease table for periodic work**, and this document used to say there was. Every
+instance runs the retention sweep and the orphan scan on its own engine loop; both are
+idempotent, so N replicas produce duplicated work and duplicated alert lines rather than a wrong
+answer. A lease belongs here the day a periodic pass stops being idempotent — not before.
 
+```sql
 -- Admin accounts are global: an operator logs in once and works across tenants.
 -- Present only when built-in authentication is used.
 CREATE TABLE admin_user (
