@@ -155,18 +155,156 @@ the execution history it reads, and structured logs.
 
 From nothing to a scheduler running a job. Every command here has been executed as written.
 
-### 1. A database, and one empty schema for it
+### 1. Initialise MySQL
 
-go-job runs no DDL of its own at startup — it holds a lock in your production database, and a
-scheduler that migrates itself on start is a surprise nobody wants at 3am. So the **control**
-schema is the one thing you create first:
+go-job has one control database per installation and one coordination database per tenant.
+Use the naming convention `gojob_<tenant>` for tenant databases, for example `gojob_cp`,
+`gojob_bp` and `gojob_app`.
 
-```sh
-mysql -e "CREATE DATABASE gojob_control"
-mysql gojob_control < schema/mysql/control/001_control.sql
+The scheduler does not migrate schemas during ordinary startup. A tenant can be provisioned
+explicitly from the UI, but that operation applies the embedded tenant DDL once to an empty
+database. Therefore the account used by `GOJOB_CONTROL_DSN` needs DDL privileges if operators
+will use the UI provisioning flow.
+
+#### Simple single-account setup
+
+Run the following as a MySQL DBA. Replace the password placeholder before executing it.
+The escaped underscore in `` `gojob\_%` `` is intentional: it grants access to current and
+future databases whose names start with `gojob_`, without granting access to unrelated
+databases.
+
+```sql
+CREATE USER IF NOT EXISTS 'gojob'@'%'
+  IDENTIFIED BY '<CHANGE_ME_STRONG_PASSWORD>';
+
+CREATE DATABASE IF NOT EXISTS `gojob_control`
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_0900_ai_ci;
+
+-- Control database: runtime DML plus one-time schema installation.
+GRANT SELECT, INSERT, UPDATE, DELETE,
+      CREATE, ALTER, INDEX, REFERENCES
+ON `gojob_control`.*
+TO 'gojob'@'%';
+
+-- Tenant databases: also covers future gojob_cp, gojob_bp, gojob_app, ... databases.
+-- CREATE permits CREATE DATABASE gojob_<tenant>; REFERENCES is required by the foreign keys
+-- in schema/mysql/tenant/001_tenant.sql. DROP is deliberately not granted.
+GRANT SELECT, INSERT, UPDATE, DELETE,
+      CREATE, ALTER, INDEX, REFERENCES
+ON `gojob\_%`.*
+TO 'gojob'@'%';
 ```
 
-Tenant schemas you do **not** need to prepare — the UI creates them when you add a tenant.
+`REFERENCES` is required: without it, tenant schema installation fails while creating
+`job_state` with `REFERENCES command denied ... for table job_definition`.
+
+Install the control schema once:
+
+```sh
+mysql -h <mysql-host> -u gojob -p gojob_control \
+  < schema/mysql/control/001_control.sql
+```
+
+The process DSN is then:
+
+```text
+gojob:<PASSWORD>@tcp(<mysql-host>:3306)/gojob_control
+```
+
+Do not commit the real password or DSN to this repository.
+
+#### Create a tenant database
+
+When adding a tenant in the UI with only a database name, go-job can create and initialise the
+empty database with the control account above. The equivalent manual preparation for tenant
+`cp` is:
+
+```sql
+CREATE DATABASE IF NOT EXISTS `gojob_cp`
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sh
+mysql -h <mysql-host> -u gojob -p gojob_cp \
+  < schema/mysql/tenant/001_tenant.sql
+```
+
+Then claim the schema for exactly one tenant. Save the returned `schema_uuid`; tenant admission
+checks it so that a mistyped DSN cannot silently attach another tenant's database.
+
+```sql
+INSERT INTO `gojob_cp`.schema_identity
+  (lock_row, tenant, schema_uuid, schema_version, created_at)
+VALUES
+  (1, 'cp', UUID(), '1', NOW());
+
+SELECT tenant, schema_uuid, schema_version, created_at
+FROM `gojob_cp`.schema_identity
+WHERE lock_row = 1;
+```
+
+For another tenant, replace both `gojob_cp` and `cp`. A database must contain exactly one
+`schema_identity` row and can belong to only one tenant. Do not insert `tenant_registry`
+manually: add the tenant in the UI/API so its DSN is encoded consistently and admission can
+validate the database identity.
+
+#### Optional scripted bootstrap records
+
+The preferred first-admin flow is the setup page shown when `admin_user` is empty. For a
+scripted bootstrap, generate the bcrypt hash and insert it into the control database:
+
+```sh
+gojob -hash-password '<AT_LEAST_12_CHARACTERS>'
+```
+
+```sql
+INSERT INTO `gojob_control`.admin_user
+  (username, password_hash, role, disabled, created_at, updated_at)
+VALUES
+  ('admin', '<BCRYPT_HASH_FROM_THE_COMMAND>', 'OPERATOR', 0, NOW(), NOW());
+```
+
+Executor credentials are normally created in the UI. For a shared-token executor, hash the
+token first and store only its SHA-256 value:
+
+```sh
+gojob -hash-token '<EXECUTOR_TOKEN>'
+```
+
+```sql
+INSERT INTO `gojob_control`.executor_identity
+  (identity, tenant, executor_group, token_sha256, disabled, created_at)
+VALUES
+  ('job-worker-go', 'cp', '', '<SHA256_FROM_THE_COMMAND>', 0, NOW());
+```
+
+#### Verify the installation
+
+```sql
+SHOW GRANTS FOR 'gojob'@'%';
+
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'gojob_control'
+ORDER BY table_name;
+
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'gojob_cp'
+ORDER BY table_name;
+
+SELECT tenant, schema_uuid, schema_version
+FROM `gojob_cp`.schema_identity
+WHERE lock_row = 1;
+```
+
+This setup intentionally omits `DROP`, so the account cannot directly run `DROP DATABASE` or
+`DROP TABLE`. It is not a read-only safety boundary: the account can still change rows and
+schema objects through its granted DML and `ALTER` privileges. If operations require a stricter
+split, apply both schema files with a separate migration account and leave the scheduler account
+only `SELECT, INSERT, UPDATE, DELETE` on `gojob_control` and `gojob\_%`.
 
 ### 2. Start it
 
@@ -277,12 +415,14 @@ it named do not exist, and following it would have wasted an afternoon.
 | Thing | How |
 | --- | --- |
 | control database | `mysql gojob_control < schema/mysql/control/001_control.sql`, once per installation |
-| one schema per tenant | `mysql np_scheduler < schema/mysql/tenant/001_tenant.sql`, plus its `schema_identity` row — see `schema/README.md` |
+| one schema per tenant | provision an empty database once through the UI, or import `schema/mysql/tenant/001_tenant.sql` and add its `schema_identity` row manually — see §4.1 |
 | a DSN encryption key | 32 bytes of hex; identical on every replica and across restarts, or the stored tenant DSNs become unreadable |
 | the first admin account | `gojob -hash-password '…'` prints a bcrypt hash; INSERT it into `admin_user` |
 | executor credentials | `gojob -hash-token '…'` prints the SHA-256 for `executor_identity.token_sha256` |
 
-go-job never runs DDL. Apply the schemas with whatever migration tool you already use.
+go-job never runs DDL automatically during process startup. The explicit UI tenant-provisioning
+action is the exception: it applies the tenant schema once to an empty database. You may instead
+apply both schema files with the migration tool you already use.
 
 ### Configuration
 
