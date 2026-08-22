@@ -54,6 +54,18 @@ const DefaultConcurrencyPolicy = PolicyQueue
 // "unreachable" means this elapsed. A defined outcome, not a vague one.
 const ReconcileDeadline = 5 * time.Second
 
+// DefaultExecutionSuccessRetention is how long successful executions remain visible in
+// history. Success is the high-volume ordinary case, so it has the shorter window.
+const DefaultExecutionSuccessRetention = 15 * 24 * time.Hour
+
+// DefaultExecutionOtherRetention is the audit window for every other terminal outcome:
+// dead, cancelled and skipped. Non-terminal executions are never eligible for retention.
+const DefaultExecutionOtherRetention = 30 * 24 * time.Hour
+
+// DefaultRetentionBatchSize bounds the rows removed by one tenant retention pass. Cleanup
+// runs repeatedly, so a backlog drains without turning one sweep into a long transaction.
+const DefaultRetentionBatchSize = 100
+
 // MisfireHorizon bounds how far back a catch-up fire may be found. Far past any outage worth
 // catching up on, and it stops a job dormant for years from materializing an execution dated
 // to when it was last enabled.

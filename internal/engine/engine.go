@@ -30,12 +30,14 @@ type Config struct {
 	InstanceID string
 	Tenant     string
 
-	ScanInterval      time.Duration
-	RecoverInterval   time.Duration
-	ReapInterval      time.Duration
-	MisfireGrace      time.Duration
-	ExecutorLiveness  time.Duration
-	ExecutorRetention time.Duration
+	ScanInterval              time.Duration
+	RecoverInterval           time.Duration
+	ReapInterval              time.Duration
+	MisfireGrace              time.Duration
+	ExecutorLiveness          time.Duration
+	ExecutorRetention         time.Duration
+	ExecutionSuccessRetention time.Duration
+	ExecutionOtherRetention   time.Duration
 
 	// PageSize bounds every discovery query. Unbounded pages turn a backlog into one very
 	// long transaction and a memory spike at the worst possible moment.
@@ -114,6 +116,15 @@ type Engine struct {
 
 // New builds an engine. It does not start any loops.
 func New(cfg Config, st *store.Store, disp *dispatch.Client, clock gojob.Clock, fence Fence, log *slog.Logger) *Engine {
+	if cfg.ExecutionSuccessRetention <= 0 {
+		cfg.ExecutionSuccessRetention = gojob.DefaultExecutionSuccessRetention
+	}
+	if cfg.ExecutionOtherRetention <= 0 {
+		cfg.ExecutionOtherRetention = gojob.DefaultExecutionOtherRetention
+	}
+	if cfg.PageSize <= 0 {
+		cfg.PageSize = gojob.DefaultRetentionBatchSize
+	}
 	return &Engine{
 		cfg:       cfg,
 		store:     st,
@@ -716,6 +727,13 @@ func (e *Engine) leaseSecondsFor(ctx context.Context, jobName string) int {
 // way anyone learns about it is this log line. That is the difference between noticing in a
 // minute that a job has no executor and noticing next week that it stopped running.
 func (e *Engine) reapPass(ctx context.Context) {
+	if n, err := e.store.ReapExecutions(ctx, e.cfg.ExecutionSuccessRetention,
+		e.cfg.ExecutionOtherRetention, e.cfg.PageSize); err != nil {
+		e.log.Error("reaping execution history failed", "error", err)
+	} else if n > 0 {
+		e.log.Info("reaped execution history", "count", n)
+	}
+
 	if n, err := e.store.ReapExecutors(ctx, e.cfg.ExecutorRetention); err != nil {
 		e.log.Error("reaping dead executors failed", "error", err)
 	} else if n > 0 {

@@ -18,6 +18,8 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -87,19 +89,26 @@ func setup(t *testing.T) *harness {
 		}
 	})
 
-	ddl, err := os.ReadFile("../../schema/mysql/tenant/001_tenant.sql")
-	if err != nil {
-		t.Fatalf("read schema: %v", err)
-	}
 	db, err := sql.Open("mysql", base+schema+"?parseTime=true&loc=UTC&multiStatements=true&time_zone=%27%2B00%3A00%27")
 	if err != nil {
 		t.Fatalf("open tenant: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	for _, stmt := range splitStatements(string(ddl)) {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("apply schema: %v\n%s", err, firstLine(stmt))
+	migrations, err := filepath.Glob("../../schema/mysql/tenant/*.sql")
+	if err != nil || len(migrations) == 0 {
+		t.Fatalf("find tenant migrations: files=%d err=%v", len(migrations), err)
+	}
+	sort.Strings(migrations)
+	for _, migration := range migrations {
+		ddl, err := os.ReadFile(migration)
+		if err != nil {
+			t.Fatalf("read schema migration %s: %v", migration, err)
+		}
+		for _, stmt := range splitStatements(string(ddl)) {
+			if _, err := db.Exec(stmt); err != nil {
+				t.Fatalf("apply schema migration %s: %v\n%s", migration, err, firstLine(stmt))
+			}
 		}
 	}
 	if _, err := db.Exec(`INSERT INTO schema_identity (lock_row, tenant, schema_uuid, schema_version, created_at)

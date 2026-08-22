@@ -19,6 +19,13 @@ import (
 //go:embed schema/001_tenant.sql
 var tenantDDL string
 
+// tenantUpgradeDDL brings the freshly-created v1 schema to the version this build admits.
+// Keeping it as the same migration existing tenants apply means provisioning and upgrades
+// cannot quietly produce different schemas.
+//
+//go:embed schema/002_execution_retention.sql
+var tenantUpgradeDDL string
+
 // probeTenant reports what is actually in a database before anything is written to it.
 //
 // The alternative is what an operator does today: paste a DSN, get "admission failed", and
@@ -157,10 +164,12 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 			gojob.ErrProtocol, tables)
 	}
 
-	for _, stmt := range splitDDL(tenantDDL) {
-		if _, err := db.ExecContext(r.Context(), stmt); err != nil {
-			return fmt.Errorf("%w: applying the schema failed at %q: %v",
-				gojob.ErrProtocol, firstLineOf(stmt), err)
+	for _, ddl := range []string{tenantDDL, tenantUpgradeDDL} {
+		for _, stmt := range splitDDL(ddl) {
+			if _, err := db.ExecContext(r.Context(), stmt); err != nil {
+				return fmt.Errorf("%w: applying the schema failed at %q: %v",
+					gojob.ErrProtocol, firstLineOf(stmt), err)
+			}
 		}
 	}
 

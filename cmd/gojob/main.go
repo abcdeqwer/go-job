@@ -62,9 +62,11 @@ type config struct {
 	pollInterval    time.Duration
 	stalenessLimit  time.Duration
 
-	executorLiveness  time.Duration
-	executorRetention time.Duration
-	sessionTTL        time.Duration
+	executorLiveness          time.Duration
+	executorRetention         time.Duration
+	executionSuccessRetention time.Duration
+	executionOtherRetention   time.Duration
+	sessionTTL                time.Duration
 
 	trustedUserHeader string
 	trustedRoleHeader string
@@ -122,6 +124,12 @@ func run() error {
 		"how long an executor stays routable after its last heartbeat")
 	flag.DurationVar(&c.executorRetention, "executor-retention", time.Hour,
 		"how long a dead executor's registration is kept for the UI before being reaped")
+	flag.DurationVar(&c.executionSuccessRetention, "execution-success-retention",
+		gojob.DefaultExecutionSuccessRetention,
+		"how long successful execution history is kept")
+	flag.DurationVar(&c.executionOtherRetention, "execution-other-retention",
+		gojob.DefaultExecutionOtherRetention,
+		"how long dead, cancelled and skipped execution history is kept")
 	flag.DurationVar(&c.sessionTTL, "session-ttl", 12*time.Hour, "admin session lifetime")
 
 	flag.StringVar(&c.trustedUserHeader, "trusted-user-header", env("GOJOB_TRUSTED_USER_HEADER", ""),
@@ -230,16 +238,18 @@ func run() error {
 			return sql.Open("mysql", withDefaults(dsn, loc))
 		},
 		Engine: engine.Config{
-			ScanInterval:      c.scanInterval,
-			RecoverInterval:   c.recoverInterval,
-			ReapInterval:      c.reapInterval,
-			MisfireGrace:      gojob.DefaultMisfireGrace(c.scanInterval),
-			ExecutorLiveness:  c.executorLiveness,
-			ExecutorRetention: c.executorRetention,
-			PageSize:          100,
-			BackoffBase:       5 * time.Second,
-			BackoffMax:        5 * time.Minute,
-			ReconcileDeadline: gojob.ReconcileDeadline,
+			ScanInterval:              c.scanInterval,
+			RecoverInterval:           c.recoverInterval,
+			ReapInterval:              c.reapInterval,
+			MisfireGrace:              gojob.DefaultMisfireGrace(c.scanInterval),
+			ExecutorLiveness:          c.executorLiveness,
+			ExecutorRetention:         c.executorRetention,
+			ExecutionSuccessRetention: c.executionSuccessRetention,
+			ExecutionOtherRetention:   c.executionOtherRetention,
+			PageSize:                  gojob.DefaultRetentionBatchSize,
+			BackoffBase:               5 * time.Second,
+			BackoffMax:                5 * time.Minute,
+			ReconcileDeadline:         gojob.ReconcileDeadline,
 			// Five attempts or sixty seconds, whichever comes first. Without a bound an
 			// execution can be stranded permanently: an executor whose outbound heartbeats
 			// still succeed stays registration-live, so it keeps being chosen, while its Run

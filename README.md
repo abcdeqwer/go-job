@@ -468,11 +468,13 @@ Timing — **flag-only, no environment variable** — all with working defaults:
 | --- | --- | --- |
 | `-scan-interval` | 5s | how often ready work is discovered |
 | `-recover-interval` | 15s | expired leases, runtime caps, silence, cancels |
-| `-reap-interval` | 1m | how often lapsed executor registrations are removed |
+| `-reap-interval` | 1m | how often execution retention, executor cleanup and orphan detection run |
 | `-registry-poll` | 10s | how often the tenant registry is re-read |
 | `-control-staleness` | 30s | how long an instance may act on an unrefreshed registry read before fencing itself |
 | `-executor-liveness` | 30s | registration TTL, and the silence budget; the progress interval is a third of it |
 | `-executor-retention` | 1h | how long a dead registration is kept for diagnosis |
+| `-execution-success-retention` | 360h (15d) | how long successful execution history is kept |
+| `-execution-other-retention` | 720h (30d) | how long dead, cancelled and skipped execution history is kept |
 | `-session-ttl` | 12h | admin session lifetime |
 
 The tenant drain bound is **not configurable**: it is 15 seconds, in `cmd/gojob/main.go`. If a

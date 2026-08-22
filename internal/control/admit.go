@@ -18,7 +18,7 @@ import (
 // needing new columns is a migration you apply first, and the release notes say so. That is
 // the price of not running DDL at runtime, and it is the right price for a component holding
 // a lock in someone else's production database.
-const SchemaVersion = "1"
+const SchemaVersion = "2"
 
 // Admit verifies that a coordination schema is the one this tenant is supposed to be using,
 // is the version this build understands, and speaks the same wall clock.

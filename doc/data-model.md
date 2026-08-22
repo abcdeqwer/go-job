@@ -1005,19 +1005,20 @@ problem than a bug; it is a bug with a delay.
 
 | Table | Policy |
 | --- | --- |
-| `job_execution` | terminal rows only. `success` and `skipped` on a short window; `dead`, `cancelled` and manual runs kept for the longer audit window. **Non-terminal rows are never deleted.** |
+| `job_execution` | terminal rows only. `success` is kept 15 days by default; `dead`, `cancelled` and `skipped` are kept 30 days by default. Both windows are flag-configurable. **Non-terminal rows are never deleted.** |
+| `job_execution_attempt` | deleted transactionally with its terminal `job_execution`; an execution and its attempt history are retained or removed together |
 | `job_executor`, `job_executor_handler` | rows whose heartbeat is older than the liveness bound |
 | `tenant_observation` | rows whose `observed_at` is older than the liveness bound. Every restart mints a new `instance_id`, so without this the table grows once per process per tenant, forever — the fastest-growing table in the system on a cluster that redeploys often |
 | `control_audit` | the approved audit window, like `job_audit` |
 | `job_audit` | the approved audit window; never truncated silently |
 
-Cleanup is an **internal scheduler task**, not a job: it holds a named control lease
-(`protocol.md` §9), runs inside the scheduler, and needs no executor. It could not be an
-ordinary job — a job requires a handler, and no executor has access to the scheduler's own
-tables, by design.
+Cleanup is an **internal scheduler task**, not a job. It runs inside each scheduler replica
+and needs no executor. Concurrent passes are safe: candidate rows are selected with
+`FOR UPDATE SKIP LOCKED`, and every deletion is idempotent at the fleet level.
 
-It is bounded like one, though: a batch size, a per-run row cap and a business-time cutoff,
-with its runs visible in the UI alongside real jobs.
+Each pass is bounded to 100 execution rows by default and checks the control fence between
+passes. The cutoff is measured from terminal `finished_at` in the tenant's business clock;
+rows exactly on the cutoff remain until the next pass.
 
 ---
 

@@ -724,17 +724,13 @@ executions, track them, recover stale ones, serve the API. None of them is a lea
 - **the admin API is stateless.** Any instance can serve any request; all state is in the
   tables.
 
-### Periodic singleton work
+### Periodic maintenance work
 
-A few background activities should run once per interval across the cluster rather than
-once per instance: retention sweeps, orphan scanning, expired-registration cleanup. They
-are not correctness-critical — running them twice is harmless — but running them on every
-instance every minute is waste.
-
-These take a **named lease** in a small table, acquired with the same guarded CAS used
-everywhere else. A lease, not an election: whoever holds it does the work this interval,
-and if that instance dies the lease expires and another picks it up. No instance is
-promoted, and nothing waits for consensus.
+Retention sweeps, orphan scanning and expired-registration cleanup run on every instance.
+They are idempotent, and retention selects terminal rows with `FOR UPDATE SKIP LOCKED`, so
+replicas divide a backlog without waiting on or deleting each other's candidates. The cost is
+duplicated empty scans and orphan log lines, not incorrect state. There is deliberately no
+lease table until periodic work becomes non-idempotent or expensive enough to need one.
 
 ### What clustering does not change
 
