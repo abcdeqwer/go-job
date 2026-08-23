@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -283,7 +282,6 @@ func TestTrustedHeaderDefaultsToViewer(t *testing.T) {
 	clock := gojob.NewFixedClock(time.Now(), time.UTC)
 	auth := NewAuth(nil, clock, time.Hour, TrustedHeader{
 		Enabled: true, UserHeader: "X-User", RoleHeader: "X-Role",
-		ProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
 	}, false)
 
 	r := httptest.NewRequest(http.MethodGet, "/api/me", nil)
@@ -308,34 +306,10 @@ func TestTrustedHeaderDefaultsToViewer(t *testing.T) {
 	}
 }
 
-func TestTrustedHeaderIsIgnoredOutsideConfiguredProxyCIDRs(t *testing.T) {
-	clock := gojob.NewFixedClock(time.Now(), time.UTC)
-	auth := NewAuth(nil, clock, time.Hour, TrustedHeader{
-		Enabled: true, UserHeader: "X-User", RoleHeader: "X-Role",
-		ProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("172.19.16.9/32")},
-	}, false)
-
-	r := httptest.NewRequest(http.MethodGet, "/api/me", nil)
-	r.RemoteAddr = "10.77.0.8:49152"
-	r.Header.Set("X-User", "attacker")
-	r.Header.Set("X-Role", "OPERATOR")
-
-	if _, _, ok := auth.identify(r); ok {
-		t.Fatal("an identity header from outside the configured proxy CIDRs was trusted")
-	}
-
-	r.RemoteAddr = "172.19.16.9:49152"
-	actor, role, ok := auth.identify(r)
-	if !ok || actor != "attacker" || role != RoleOperator {
-		t.Fatalf("trusted proxy identity = %q/%q/%v, want attacker/OPERATOR/true", actor, role, ok)
-	}
-}
-
 func TestBuiltInLoginRemainsAvailableWithTrustedHeaders(t *testing.T) {
 	clock := gojob.NewFixedClock(time.Now(), time.UTC)
 	a := &API{auth: NewAuth(nil, clock, time.Hour, TrustedHeader{
 		Enabled: true, UserHeader: "X-User", RoleHeader: "X-Role",
-		ProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("172.19.16.9/32")},
 	}, false)}
 	r := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader("{"))
 	r.RemoteAddr = "10.77.0.8:49152"

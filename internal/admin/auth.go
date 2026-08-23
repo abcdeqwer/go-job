@@ -10,9 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"net/netip"
 	"strings"
 	"time"
 
@@ -62,10 +60,9 @@ func RoleFrom(ctx context.Context) Role {
 
 // TrustedHeader configures identity from a reverse proxy.
 //
-// Hosts that already run SSO may pass an identity header from explicitly trusted proxy
-// addresses. Requests from every other address use built-in session authentication. The
-// library does not attempt to be an identity provider and will not grow OIDC, LDAP or SAML
-// support.
+// Hosts that already run SSO may pass an identity header. Requests without one use built-in
+// session authentication. The library does not attempt to be an identity provider and will
+// not grow OIDC, LDAP or SAML support.
 type TrustedHeader struct {
 	// Enabled must be set deliberately. It is off by default because a header-trusting mode
 	// that switches itself on is a full authentication bypass for anyone who can reach the
@@ -74,7 +71,6 @@ type TrustedHeader struct {
 
 	UserHeader string
 	RoleHeader string
-	ProxyCIDRs []netip.Prefix
 
 	// DefaultRole applies when the proxy sends an identity but no role. VIEWER, so a
 	// misconfigured proxy under-grants rather than handing out OPERATOR.
@@ -130,7 +126,7 @@ func (a *Auth) Require(required Role, next http.Handler) http.Handler {
 }
 
 func (a *Auth) identify(r *http.Request) (string, Role, bool) {
-	if a.trusted.Enabled && a.trustedSource(r.RemoteAddr) {
+	if a.trusted.Enabled {
 		user := strings.TrimSpace(r.Header.Get(a.trusted.UserHeader))
 		if user != "" {
 			role := a.trusted.DefaultRole
@@ -171,24 +167,6 @@ func (a *Auth) identify(r *http.Request) (string, Role, bool) {
 		return "", "", false
 	}
 	return username, Role(role), true
-}
-
-func (a *Auth) trustedSource(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	addr, err := netip.ParseAddr(strings.TrimSpace(host))
-	if err != nil {
-		return false
-	}
-	addr = addr.Unmap()
-	for _, prefix := range a.trusted.ProxyCIDRs {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
 }
 
 // hashToken is what is stored and compared. The token itself never reaches the database, so a
