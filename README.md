@@ -229,6 +229,8 @@ CREATE DATABASE IF NOT EXISTS `gojob_cp`
 ```sh
 mysql -h <mysql-host> -u gojob -p gojob_cp \
   < schema/mysql/tenant/001_tenant.sql
+mysql -h <mysql-host> -u gojob -p gojob_cp \
+  < schema/mysql/tenant/002_execution_retention.sql
 ```
 
 Then claim the schema for exactly one tenant. Save the returned `schema_uuid`; tenant admission
@@ -238,7 +240,7 @@ checks it so that a mistyped DSN cannot silently attach another tenant's databas
 INSERT INTO `gojob_cp`.schema_identity
   (lock_row, tenant, schema_uuid, schema_version, created_at)
 VALUES
-  (1, 'cp', UUID(), '1', NOW());
+  (1, 'cp', UUID(), '2', NOW());
 
 SELECT tenant, schema_uuid, schema_version, created_at
 FROM `gojob_cp`.schema_identity
@@ -415,7 +417,7 @@ it named do not exist, and following it would have wasted an afternoon.
 | Thing | How |
 | --- | --- |
 | control database | `mysql gojob_control < schema/mysql/control/001_control.sql`, once per installation |
-| one schema per tenant | provision an empty database once through the UI, or import `schema/mysql/tenant/001_tenant.sql` and add its `schema_identity` row manually — see §4.1 |
+| one schema per tenant | provision an empty database once through the UI (it applies every embedded tenant migration), or import every `schema/mysql/tenant/*.sql` file in filename order and add its `schema_identity` row manually — see §4.1 |
 | a DSN encryption key | 32 bytes of hex; identical on every replica and across restarts, or the stored tenant DSNs become unreadable |
 | the first admin account | `gojob -hash-password '…'` prints a bcrypt hash; INSERT it into `admin_user` |
 | executor credentials | `gojob -hash-token '…'` prints the SHA-256 for `executor_identity.token_sha256` |

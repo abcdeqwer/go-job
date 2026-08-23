@@ -3,28 +3,51 @@ package admin
 import (
 	"context"
 	"database/sql"
-	_ "embed"
+	"embed"
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	gojob "github.com/abcdeqwer/go-job"
 	"github.com/abcdeqwer/go-job/internal/control"
 )
 
-// tenantDDL is the schema this build requires, embedded so what the UI applies is exactly what
-// ships — not a file on disk that may be a different version than the binary reading it.
+// tenantSchemaFS contains the complete ordered tenant migration stream shipped by this build.
+// New-tenant provisioning applies every file, so adding a migration cannot leave newly created
+// coordination schemas one version behind the binary that is about to admit them.
 //
-//go:embed schema/001_tenant.sql
-var tenantDDL string
+//go:embed schema/*.sql
+var tenantSchemaFS embed.FS
 
-// tenantUpgradeDDL brings the freshly-created v1 schema to the version this build admits.
-// Keeping it as the same migration existing tenants apply means provisioning and upgrades
-// cannot quietly produce different schemas.
-//
-//go:embed schema/002_execution_retention.sql
-var tenantUpgradeDDL string
+type tenantMigration struct {
+	name string
+	ddl  string
+}
+
+func tenantMigrations() ([]tenantMigration, error) {
+	entries, err := tenantSchemaFS.ReadDir("schema")
+	if err != nil {
+		return nil, fmt.Errorf("read embedded tenant migrations: %w", err)
+	}
+	var migrations []tenantMigration
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sql" {
+			continue
+		}
+		path := "schema/" + entry.Name()
+		ddl, err := tenantSchemaFS.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read embedded tenant migration %s: %w", entry.Name(), err)
+		}
+		migrations = append(migrations, tenantMigration{name: entry.Name(), ddl: string(ddl)})
+	}
+	if len(migrations) == 0 {
+		return nil, errors.New("no embedded tenant migrations")
+	}
+	return migrations, nil
+}
 
 // probeTenant reports what is actually in a database before anything is written to it.
 //
@@ -164,11 +187,15 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 			gojob.ErrProtocol, tables)
 	}
 
-	for _, ddl := range []string{tenantDDL, tenantUpgradeDDL} {
-		for _, stmt := range splitDDL(ddl) {
+	migrations, err := tenantMigrations()
+	if err != nil {
+		return fmt.Errorf("%w: %v", gojob.ErrProtocol, err)
+	}
+	for _, migration := range migrations {
+		for _, stmt := range splitDDL(migration.ddl) {
 			if _, err := db.ExecContext(r.Context(), stmt); err != nil {
-				return fmt.Errorf("%w: applying the schema failed at %q: %v",
-					gojob.ErrProtocol, firstLineOf(stmt), err)
+				return fmt.Errorf("%w: applying tenant migration %s failed at %q: %v",
+					gojob.ErrProtocol, migration.name, firstLineOf(stmt), err)
 			}
 		}
 	}

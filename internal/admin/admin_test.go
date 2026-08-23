@@ -40,6 +40,34 @@ func TestRoleAllows(t *testing.T) {
 	}
 }
 
+// New tenants must be created at the schema version this binary admits. The v2 rollout
+// upgraded the binary while the tenant databases were still v1, which stopped every job;
+// applying the complete embedded migration stream during provisioning prevents the same
+// split for every database created after a schema release.
+func TestEmbeddedTenantMigrationsIncludeCurrentSchema(t *testing.T) {
+	migrations, err := tenantMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var combined strings.Builder
+	for i, migration := range migrations {
+		if i > 0 && migrations[i-1].name >= migration.name {
+			t.Fatalf("tenant migrations are not ordered: %q before %q",
+				migrations[i-1].name, migration.name)
+		}
+		combined.WriteString(migration.ddl)
+		combined.WriteByte('\n')
+	}
+	ddl := combined.String()
+	if !strings.Contains(ddl, "idx_job_execution_retention (status, finished_at, id)") {
+		t.Fatal("new-tenant migration stream lacks the execution-retention index required by v2")
+	}
+	if !strings.Contains(ddl, "SET schema_version = '"+control.SchemaVersion+"'") {
+		t.Fatalf("new-tenant migration stream does not advance schema_identity to required version %s",
+			control.SchemaVersion)
+	}
+}
+
 // "Refused" and "failed" are different things an operator needs told apart: a paused job
 // declining a trigger is not an error condition, and showing it as a 500 sends someone to
 // read scheduler logs for a decision the scheduler made correctly.

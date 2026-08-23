@@ -60,9 +60,10 @@ mysql gojob_control < schema/mysql/control/001_control.sql
 
 # once per tenant
 mysql np_scheduler < schema/mysql/tenant/001_tenant.sql
+mysql np_scheduler < schema/mysql/tenant/002_execution_retention.sql
 mysql -e "INSERT INTO np_scheduler.schema_identity
           (tenant, schema_uuid, schema_version, created_at)
-          VALUES ('np', UUID(), '1', NOW())"
+          VALUES ('np', UUID(), '2', NOW())"
 mysql -N -e "SELECT schema_uuid FROM np_scheduler.schema_identity"   # keep this
 ```
 
