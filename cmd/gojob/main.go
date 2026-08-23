@@ -224,16 +224,21 @@ func run() error {
 		return err
 	}
 	disp := dispatch.NewClient(5*time.Second, 10*time.Second, outbound)
+	tenantMigrations, err := admin.TenantMigrations()
+	if err != nil {
+		return fmt.Errorf("load tenant migrations: %w", err)
+	}
 
 	reg := runtime.NewRegistry(runtime.Options{
-		InstanceID:      c.instanceID,
-		Clock:           clock,
-		PollInterval:    c.pollInterval,
-		StalenessLimit:  c.stalenessLimit,
-		MaxOpenConns:    16,
-		MaxIdleConns:    4,
-		ConnMaxLifetime: 30 * time.Minute,
-		DrainTimeout:    15 * time.Second,
+		InstanceID:       c.instanceID,
+		Clock:            clock,
+		PollInterval:     c.pollInterval,
+		StalenessLimit:   c.stalenessLimit,
+		MaxOpenConns:     16,
+		MaxIdleConns:     4,
+		ConnMaxLifetime:  30 * time.Minute,
+		DrainTimeout:     15 * time.Second,
+		TenantMigrations: tenantMigrations,
 		OpenDB: func(dsn string) (*sql.DB, error) {
 			return sql.Open("mysql", withDefaults(dsn, loc))
 		},

@@ -23,6 +23,7 @@ import (
 	"github.com/abcdeqwer/go-job/internal/engine"
 	"github.com/abcdeqwer/go-job/internal/server"
 	"github.com/abcdeqwer/go-job/internal/store"
+	"github.com/abcdeqwer/go-job/internal/tenantmigration"
 )
 
 // Options is everything the registry needs to admit a tenant and run it.
@@ -30,11 +31,12 @@ type Options struct {
 	InstanceID string
 	Clock      gojob.Clock
 
-	PollInterval    time.Duration
-	StalenessLimit  time.Duration
-	MaxOpenConns    int
-	MaxIdleConns    int
-	ConnMaxLifetime time.Duration
+	PollInterval     time.Duration
+	StalenessLimit   time.Duration
+	MaxOpenConns     int
+	MaxIdleConns     int
+	ConnMaxLifetime  time.Duration
+	TenantMigrations []tenantmigration.Migration
 
 	// DrainTimeout bounds how long retiring a tenant waits for its in-flight work. Zero means
 	// no wait at all, which is only right for a shutdown that is already out of time.
@@ -482,7 +484,7 @@ func (r *Registry) observeAs(ctx context.Context, name string, generation int64,
 	return true
 }
 
-// admit opens a tenant's pool, verifies its schema and starts its engine.
+// admit opens a tenant's pool, upgrades its verified schema when necessary, and starts its engine.
 func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	db, err := r.opts.OpenDB(t.DSN)
 	if err != nil {
@@ -492,11 +494,36 @@ func (r *Registry) admit(ctx context.Context, t control.Tenant) error {
 	db.SetMaxIdleConns(r.opts.MaxIdleConns)
 	db.SetConnMaxLifetime(r.opts.ConnMaxLifetime)
 
-	// Bounded, and bounded well under the staleness limit even though this no longer runs on
-	// the poll loop: an admission that hangs holds a pool open and a goroutine with it.
-	admitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := control.Admit(admitCtx, db, t.Name, t.SchemaUUID, r.opts.Clock.Location()); err != nil {
+	identityCtx, cancelIdentity := context.WithTimeout(ctx, 10*time.Second)
+	version, err := control.IdentityVersion(identityCtx, db, t.Name, t.SchemaUUID)
+	cancelIdentity()
+	if err != nil {
+		_ = db.Close()
+		return err
+	}
+
+	if version != control.SchemaVersion {
+		// MySQL DDL can take longer than the ordinary admission check on a large execution
+		// table. Keep it bounded without making the timeout a deployment setting.
+		migrationCtx, cancelMigration := context.WithTimeout(ctx, 5*time.Minute)
+		err = tenantmigration.Upgrade(migrationCtx, db, r.opts.TenantMigrations,
+			version, control.SchemaVersion)
+		cancelMigration()
+		if err != nil {
+			_ = db.Close()
+			return fmt.Errorf("migrate tenant schema from %s to %s: %w",
+				version, control.SchemaVersion, err)
+		}
+		r.log.Info("tenant schema migrated during admission", "tenant", t.Name,
+			"from_version", version, "to_version", control.SchemaVersion)
+	}
+
+	// Re-read identity and verify the clock after migration; neither a partial DDL run nor an
+	// unexpected version-row update is allowed to reach the engine.
+	admitCtx, cancelAdmit := context.WithTimeout(ctx, 10*time.Second)
+	err = control.Admit(admitCtx, db, t.Name, t.SchemaUUID, r.opts.Clock.Location())
+	cancelAdmit()
+	if err != nil {
 		_ = db.Close()
 		return err
 	}

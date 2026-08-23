@@ -126,7 +126,8 @@ into a distributed-systems project:
 - routing-strategy families — a job runs on a deployment whose assignment includes its
   handler;
 - exactly-once external side effects;
-- DDL at runtime.
+- arbitrary/operator-supplied DDL at runtime; the binary only applies its own ordered,
+  embedded additive tenant migrations during admission.
 
 ---
 
@@ -136,7 +137,7 @@ into a distributed-systems project:
 | --- | --- | --- |
 | **MySQL** | 8.0 or later, one coordination schema per tenant | durability and coordination authority; `SELECT ... FOR UPDATE SKIP LOCKED` is required |
 | **Go** | 1.26 or later — for the scheduler only | executors may be written in any language with gRPC support |
-| A migration tool | any — Flyway, golang-migrate, plain scripts, your own | go-job exports versioned DDL and never executes it |
+| A migration tool | optional — Flyway, golang-migrate, plain scripts, your own | useful for control-schema setup or manually managed tenant upgrades |
 
 That is the complete list. There is no broker, no coordination service and no separate
 scheduler daemon.
@@ -161,10 +162,12 @@ go-job has one control database per installation and one coordination database p
 Use the naming convention `gojob_<tenant>` for tenant databases, for example `gojob_cp`,
 `gojob_bp` and `gojob_app`.
 
-The scheduler does not migrate schemas during ordinary startup. A tenant can be provisioned
-explicitly from the UI, but that operation applies the embedded tenant DDL once to an empty
-database. Therefore the account used by `GOJOB_CONTROL_DSN` needs DDL privileges if operators
-will use the UI provisioning flow.
+The first complete tenant schema is version 1. A tenant can be provisioned explicitly from the
+UI, which applies the complete embedded migration stream to an empty database. On later starts,
+admission verifies the tenant and schema UUID, then applies any missing embedded additive tenant
+migrations before starting that tenant's engine. Therefore every tenant DSN account needs the
+DDL privileges required by those migrations; the control account also needs DDL privileges if
+operators use UI provisioning beside the control database.
 
 #### Simple single-account setup
 
@@ -422,9 +425,11 @@ it named do not exist, and following it would have wasted an afternoon.
 | the first admin account | `gojob -hash-password '…'` prints a bcrypt hash; INSERT it into `admin_user` |
 | executor credentials | `gojob -hash-token '…'` prints the SHA-256 for `executor_identity.token_sha256` |
 
-go-job never runs DDL automatically during process startup. The explicit UI tenant-provisioning
-action is the exception: it applies the tenant schema once to an empty database. You may instead
-apply both schema files with the migration tool you already use.
+For an existing tenant, go-job validates identity first and then applies missing embedded
+additive migrations during admission. An already-current schema performs no DDL, and a schema
+newer than the binary is refused rather than downgraded. The explicit UI provisioning action
+remains the path for creating an empty schema. You may instead apply the schema files with the
+migration tool you already use.
 
 ### Configuration
 
@@ -598,7 +603,7 @@ The DSN needs no database name. Each test creates and drops its own schema.
 | `internal/testexec` | a conforming reference executor, ~450 lines |
 | `internal/e2e` | the database-backed tests |
 | `proto/`, `gen/` | the contract, and its committed generated code |
-| `schema/` | the SQL to apply; go-job never runs DDL |
+| `schema/` | versioned SQL embedded for tenant admission and exported for manual application |
 
 ### Two conventions that are enforced by tests
 

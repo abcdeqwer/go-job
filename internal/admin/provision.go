@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	gojob "github.com/abcdeqwer/go-job"
 	"github.com/abcdeqwer/go-job/internal/control"
+	"github.com/abcdeqwer/go-job/internal/tenantmigration"
 )
 
 // tenantSchemaFS contains the complete ordered tenant migration stream shipped by this build.
@@ -21,17 +23,15 @@ import (
 //go:embed schema/*.sql
 var tenantSchemaFS embed.FS
 
-type tenantMigration struct {
-	name string
-	ddl  string
-}
-
-func tenantMigrations() ([]tenantMigration, error) {
+// TenantMigrations returns the validated, ordered migration stream embedded in this build.
+// It is shared by empty-schema provisioning and existing-tenant admission so both paths
+// converge on exactly the same schema version.
+func TenantMigrations() ([]tenantmigration.Migration, error) {
 	entries, err := tenantSchemaFS.ReadDir("schema")
 	if err != nil {
 		return nil, fmt.Errorf("read embedded tenant migrations: %w", err)
 	}
-	var migrations []tenantMigration
+	var migrations []tenantmigration.Migration
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sql" {
 			continue
@@ -41,10 +41,22 @@ func tenantMigrations() ([]tenantMigration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read embedded tenant migration %s: %w", entry.Name(), err)
 		}
-		migrations = append(migrations, tenantMigration{name: entry.Name(), ddl: string(ddl)})
+		prefix, _, ok := strings.Cut(entry.Name(), "_")
+		if !ok {
+			return nil, fmt.Errorf("tenant migration %q has no numeric version prefix", entry.Name())
+		}
+		version, err := strconv.Atoi(prefix)
+		if err != nil {
+			return nil, fmt.Errorf("tenant migration %q has invalid version prefix: %w", entry.Name(), err)
+		}
+		migrations = append(migrations, tenantmigration.Migration{
+			Version: version,
+			Name:    entry.Name(),
+			DDL:     string(ddl),
+		})
 	}
-	if len(migrations) == 0 {
-		return nil, errors.New("no embedded tenant migrations")
+	if err := tenantmigration.Validate(migrations); err != nil {
+		return nil, err
 	}
 	return migrations, nil
 }
@@ -131,14 +143,9 @@ func (a *API) probeTenant(w http.ResponseWriter, r *http.Request) error {
 
 // provisionTenant applies the schema and mints the identity row, once, on an EMPTY database.
 //
-// Deliberately not something that happens at startup. MySQL DDL does not roll back, so a
-// migration interrupted half way leaves a schema that is neither the old one nor the new one;
-// and several replicas starting together would race to apply it. Both problems disappear when
-// it is one operator pressing one button on a database they just named — which is the only
-// form of automatic schema management this will ever have.
-//
-// It refuses a database that already holds any of our tables. Recovering a half-provisioned
-// schema is a job for whoever can see it, not for a retry loop.
+// This endpoint remains the only path that creates an empty schema and mints its identity.
+// Admission-time migration handles only an already-provisioned schema whose tenant and UUID
+// have first been verified.
 func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		DSN      string `json:"dsn"`
@@ -187,15 +194,15 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 			gojob.ErrProtocol, tables)
 	}
 
-	migrations, err := tenantMigrations()
+	migrations, err := TenantMigrations()
 	if err != nil {
 		return fmt.Errorf("%w: %v", gojob.ErrProtocol, err)
 	}
 	for _, migration := range migrations {
-		for _, stmt := range splitDDL(migration.ddl) {
+		for _, stmt := range tenantmigration.SplitDDL(migration.DDL) {
 			if _, err := db.ExecContext(r.Context(), stmt); err != nil {
 				return fmt.Errorf("%w: applying tenant migration %s failed at %q: %v",
-					gojob.ErrProtocol, migration.name, firstLineOf(stmt), err)
+					gojob.ErrProtocol, migration.Name, firstLineOf(stmt), err)
 			}
 		}
 	}
@@ -219,32 +226,6 @@ func (a *API) provisionTenant(w http.ResponseWriter, r *http.Request) error {
 		"tenant": body.Tenant, "schema_uuid": uuid, "schema_version": control.SchemaVersion,
 	})
 	return nil
-}
-
-// splitDDL cuts a schema file into statements.
-//
-// Comments come out FIRST. This file's own comments contain semicolons — "…business Location;
-// admission asserts it." and "-- defaults; merged with trigger overrides" — so splitting on
-// `;` before stripping them cuts a column definition in half, and the error you get names a
-// table that looks fine.
-func splitDDL(ddl string) []string {
-	var kept []string
-	for _, l := range strings.Split(ddl, "\n") {
-		if i := strings.Index(l, "--"); i >= 0 {
-			l = l[:i]
-		}
-		if strings.TrimSpace(l) == "" {
-			continue
-		}
-		kept = append(kept, l)
-	}
-	var out []string
-	for _, raw := range strings.Split(strings.Join(kept, "\n"), ";") {
-		if s := strings.TrimSpace(raw); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 func firstLineOf(s string) string {

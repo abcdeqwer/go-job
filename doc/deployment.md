@@ -49,8 +49,10 @@ never reaches the browser either: the form asks for a NAME and the DSN is compos
 Pick "另一台数据库" when a tenant genuinely belongs on a different server, and the form asks for
 the full connection as before.
 
-Nothing runs DDL at startup, because MySQL DDL does not roll back and several replicas starting
-together would race to apply it.
+For an already-provisioned tenant, admission verifies the tenant name and schema UUID before
+applying missing embedded additive migrations. Version 1 is the starting schema; this build
+upgrades it to version 2 and re-verifies admission before starting the engine. A tenant already
+at version 2 performs no DDL, while a schema newer than the binary is refused.
 
 The SQL below is the same thing if you would rather run it yourself.
 
@@ -71,8 +73,8 @@ That `schema_uuid` is what stops a mistyped DSN from adopting another tenant's s
 one, or a restored snapshot. You will be asked for it when registering the tenant, and admission
 refuses a DSN whose schema does not present exactly it.
 
-**The MySQL user needs no DDL rights at runtime** — only DML on its own schema. Grant DDL for
-the migration, not for the process.
+**The tenant MySQL user needs DDL rights at runtime** for automatic admission migration. The
+control schema is not automatically migrated.
 
 ---
 

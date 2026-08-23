@@ -5,8 +5,8 @@
 -- without any possibility of interference, and a query that forgets a tenant predicate
 -- cannot leak across tenants because no such predicate exists.
 --
--- go-job never executes DDL. Apply this with whatever migration tool you already run,
--- before adding the tenant to the control database's registry.
+-- Version 1 is applied when explicitly provisioning an empty schema. Later embedded additive
+-- migrations are applied automatically during admission after tenant identity is verified.
 --
 -- Requires MySQL 8.0 or later. The session time zone of every connection to this schema
 -- must equal the scheduler's configured business Location; admission asserts it.

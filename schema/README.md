@@ -1,7 +1,8 @@
 # Schema
 
-go-job **never executes DDL**. These files are exported for you to apply with whatever
-migration tool you already run — Flyway, golang-migrate, plain scripts, anything.
+go-job embeds the tenant files and applies missing additive versions during tenant admission,
+after verifying the tenant name and schema UUID. The files remain exported so you can inspect
+or apply them with Flyway, golang-migrate, plain scripts, or your own tooling.
 
 ```text
 control/001_control.sql   one per installation
@@ -29,9 +30,10 @@ INSERT INTO np_scheduler.schema_identity
 VALUES (1, 'np', UUID(), '2', NOW());
 ```
 
-For an existing version 1 tenant, apply only `002_execution_retention.sql` before starting
-this binary. The migration adds the bounded-retention index and advances `schema_identity` to
-version 2; admission deliberately refuses the tenant until that succeeds.
+For an existing version 1 tenant, starting this binary applies
+`002_execution_retention.sql`, verifies version 2, and then admits the tenant. If the index DDL
+committed but the process stopped before the version row advanced, the next admission verifies
+the exact index definition and resumes. Applying the file manually remains supported.
 
 Record that `schema_uuid` in the tenant's `tenant_registry` row. Admission checks identity
 before version, which is what stops a mistyped DSN from adopting another tenant's schema, an
@@ -39,14 +41,12 @@ empty one, or a restored snapshot.
 
 ## Version compatibility
 
-`schema.Version` in the library states the version it requires, and admission **fails closed**
-on a mismatch — no silent degradation, no partial feature set, no writing to a column that
-may not exist.
+`schema.Version` in the library states the version it requires. Admission upgrades an older
+recognized version through the ordered embedded stream, then **fails closed** unless the exact
+required version is present — no silent degradation, no partial feature set, no downgrade.
 
-The consequence is a real contract: an upgrade needing new columns is a migration you apply
-first, and the release notes will say so. That is the price of not running DDL at runtime,
-and it is the right price for a component holding a lock in someone else's production
-database.
+Tenant migrations must be additive and restart-safe because MySQL DDL is not transactional.
+The runtime database user needs the DDL privileges required by each new migration.
 
 ## Requirements
 

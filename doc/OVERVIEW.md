@@ -72,7 +72,8 @@ A multi-tenant, database-durable **job scheduling platform**.
 
 Refusals, not gaps: job DAGs or sub-tasks; sharded broadcast; script/shell jobs and
 dynamically registered handlers; a routing-strategy family; exactly-once external effects;
-DDL at runtime.
+arbitrary/operator-supplied DDL at runtime. The only runtime DDL is the binary's ordered,
+embedded additive tenant migration stream during admission.
 
 ---
 

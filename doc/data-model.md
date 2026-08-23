@@ -1024,18 +1024,20 @@ rows exactly on the cutoff remain until the next pass.
 
 ## 10. Schema versioning
 
-`schema/mysql` holds the DDL as versioned files — `control/` and `tenant/`. This library **never executes
-DDL**: the host applies it with whatever migration tool it already runs.
+`schema/mysql` holds the DDL as versioned files — `control/` and `tenant/`. The binary embeds
+the tenant stream and applies missing additive versions during admission. The host still owns
+control-schema setup and may apply tenant files manually with its existing migration tool.
 
 Admission verifies **identity before version**: the schema must present a `schema_identity`
 row naming the tenant being admitted, with the `schema_uuid` the registry expects. A schema
 that is merely the right *version* can still be the wrong *database*.
 
-`schema.Version` declares the version the running scheduler requires. Admission compares it
-with what the database carries and **fails closed on a mismatch** — no silent degradation,
-no partial feature set, no writing to a column that may not exist.
+`schema.Version` declares the version the running scheduler requires. After identity is
+verified, admission upgrades a recognized older version through the embedded stream and then
+**fails closed** unless the exact required version is present — no silent degradation, no
+partial feature set, and no downgrade by an older binary.
 
-The consequence is a real compatibility contract: a library upgrade that needs new columns
-is a schema migration the host must apply first, and the release notes must say so. That is
-the cost of not running DDL at runtime, and it is the right trade for a component that
-holds a lock on someone else's production database.
+The first complete schema is version 1. Every later tenant migration must be additive and
+restart-safe: MySQL may commit one DDL statement before a process stops, so the next admission
+must be able to verify that exact object and continue. The tenant runtime account therefore
+needs the DDL privileges required by the embedded migrations.

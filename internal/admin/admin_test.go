@@ -45,17 +45,17 @@ func TestRoleAllows(t *testing.T) {
 // applying the complete embedded migration stream during provisioning prevents the same
 // split for every database created after a schema release.
 func TestEmbeddedTenantMigrationsIncludeCurrentSchema(t *testing.T) {
-	migrations, err := tenantMigrations()
+	migrations, err := TenantMigrations()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var combined strings.Builder
 	for i, migration := range migrations {
-		if i > 0 && migrations[i-1].name >= migration.name {
+		if i > 0 && migrations[i-1].Name >= migration.Name {
 			t.Fatalf("tenant migrations are not ordered: %q before %q",
-				migrations[i-1].name, migration.name)
+				migrations[i-1].Name, migration.Name)
 		}
-		combined.WriteString(migration.ddl)
+		combined.WriteString(migration.DDL)
 		combined.WriteByte('\n')
 	}
 	ddl := combined.String()

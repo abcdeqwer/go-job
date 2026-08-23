@@ -13,11 +13,8 @@ import (
 
 // SchemaVersion is the coordination schema this build requires.
 //
-// Admission fails CLOSED on a mismatch: no silent degradation, no partial feature set, no
-// writing to a column that may not exist. The consequence is a real contract — an upgrade
-// needing new columns is a migration you apply first, and the release notes say so. That is
-// the price of not running DDL at runtime, and it is the right price for a component holding
-// a lock in someone else's production database.
+// Admission fails CLOSED on a mismatch after the runtime has had an opportunity to apply the
+// embedded additive migrations. A schema newer than this binary is never downgraded.
 const SchemaVersion = "2"
 
 // Admit verifies that a coordination schema is the one this tenant is supposed to be using,
@@ -27,6 +24,21 @@ const SchemaVersion = "2"
 // catches a mistyped DSN, and a mistyped DSN pointing at another tenant's schema would pass
 // both of the others.
 func Admit(ctx context.Context, db *sql.DB, tenant, expectUUID string, loc *time.Location) error {
+	gotVersion, err := IdentityVersion(ctx, db, tenant, expectUUID)
+	if err != nil {
+		return err
+	}
+	if gotVersion != SchemaVersion {
+		return fmt.Errorf("%w: %s is schema version %s, this build requires %s",
+			gojob.ErrSchemaVersion, tenant, gotVersion, SchemaVersion)
+	}
+
+	return assertClockContract(ctx, db, tenant, loc)
+}
+
+// IdentityVersion validates that the registry points at the intended tenant schema and
+// returns its current version. Runtime migration calls this before executing any DDL.
+func IdentityVersion(ctx context.Context, db *sql.DB, tenant, expectUUID string) (string, error) {
 	var (
 		gotTenant  string
 		gotUUID    string
@@ -36,27 +48,22 @@ func Admit(ctx context.Context, db *sql.DB, tenant, expectUUID string, loc *time
 		`SELECT tenant, schema_uuid, schema_version FROM schema_identity WHERE lock_row = 1`).
 		Scan(&gotTenant, &gotUUID, &gotVersion)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: %s has no identity row; it is an empty or unprovisioned schema",
+		return "", fmt.Errorf("%w: %s has no identity row; it is an empty or unprovisioned schema",
 			gojob.ErrSchemaIdentity, tenant)
 	}
 	if err != nil {
-		return fmt.Errorf("%w: reading identity of %s: %v", gojob.ErrSchemaIdentity, tenant, err)
+		return "", fmt.Errorf("%w: reading identity of %s: %v", gojob.ErrSchemaIdentity, tenant, err)
 	}
 
 	if gotTenant != tenant {
-		return fmt.Errorf("%w: registry says %q, the schema says %q — the DSN points at another tenant",
+		return "", fmt.Errorf("%w: registry says %q, the schema says %q — the DSN points at another tenant",
 			gojob.ErrSchemaIdentity, tenant, gotTenant)
 	}
 	if gotUUID != expectUUID {
-		return fmt.Errorf("%w: %s expects schema %s, found %s — a restored snapshot, or a schema re-provisioned without updating the registry",
+		return "", fmt.Errorf("%w: %s expects schema %s, found %s — a restored snapshot, or a schema re-provisioned without updating the registry",
 			gojob.ErrSchemaIdentity, tenant, expectUUID, gotUUID)
 	}
-	if gotVersion != SchemaVersion {
-		return fmt.Errorf("%w: %s is schema version %s, this build requires %s; apply the migration first",
-			gojob.ErrSchemaVersion, tenant, gotVersion, SchemaVersion)
-	}
-
-	return assertClockContract(ctx, db, tenant, loc)
+	return gotVersion, nil
 }
 
 // assertClockContract checks the two things the clock model actually depends on.
