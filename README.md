@@ -498,9 +498,11 @@ Security — a plaintext, uncredentialed gRPC port is refused unless you say so 
 `-tls-cert`, `-tls-key`, `-tls-client-ca`, `-executor-ca` and `-executor-token` each read the
 matching `GOJOB_`-prefixed variable.
 
-If your admin UI sits behind an SSO proxy, `-trusted-user-header` and `-trusted-role-header`
-(`GOJOB_TRUSTED_USER_HEADER`, `GOJOB_TRUSTED_ROLE_HEADER`) let it supply the identity instead of
-the built-in login. Only set them when the proxy is the only route to the port.
+If an SSO proxy calls the admin API, `-trusted-user-header`, `-trusted-role-header` and the
+required `-trusted-proxy-cidrs` (`GOJOB_TRUSTED_USER_HEADER`, `GOJOB_TRUSTED_ROLE_HEADER`,
+`GOJOB_TRUSTED_PROXY_CIDRS`) let it supply identity only from explicitly trusted source
+addresses. Requests from every other address ignore those headers and use built-in login.
+Use stable proxy or host addresses, not ephemeral container addresses.
 
 ### Not process configuration
 

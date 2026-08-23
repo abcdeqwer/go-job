@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -70,6 +71,7 @@ type config struct {
 
 	trustedUserHeader string
 	trustedRoleHeader string
+	trustedProxyCIDRs string
 	cookieSecure      bool
 
 	tlsCert       string
@@ -136,6 +138,8 @@ func run() error {
 		"trust this header for identity instead of built-in login; empty disables the mode")
 	flag.StringVar(&c.trustedRoleHeader, "trusted-role-header", env("GOJOB_TRUSTED_ROLE_HEADER", ""),
 		"header carrying VIEWER or OPERATOR when trusted-user-header is set")
+	flag.StringVar(&c.trustedProxyCIDRs, "trusted-proxy-cidrs", env("GOJOB_TRUSTED_PROXY_CIDRS", ""),
+		"comma-separated source CIDRs allowed to supply trusted identity headers")
 	flag.BoolVar(&c.cookieSecure, "cookie-secure", env("GOJOB_COOKIE_SECURE", "") != "",
 		"mark the session cookie Secure; set this when serving over TLS")
 
@@ -185,6 +189,10 @@ func run() error {
 	loc, err := time.LoadLocation(c.location)
 	if err != nil {
 		return fmt.Errorf("-location %q: %w", c.location, err)
+	}
+	trustedProxyCIDRs, err := parseTrustedProxyCIDRs(c.trustedUserHeader, c.trustedProxyCIDRs)
+	if err != nil {
+		return err
 	}
 	if c.instanceID == "" {
 		c.instanceID = defaultInstanceID()
@@ -329,6 +337,7 @@ func run() error {
 		Enabled:    c.trustedUserHeader != "",
 		UserHeader: c.trustedUserHeader,
 		RoleHeader: c.trustedRoleHeader,
+		ProxyCIDRs: trustedProxyCIDRs,
 	}, c.cookieSecure), log)
 
 	httpSrv := &http.Server{
@@ -388,6 +397,29 @@ func decodeKey(hexKey string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("-dsn-key decodes to %d bytes; it must be 16, 24 or 32", len(key))
 	}
+}
+
+func parseTrustedProxyCIDRs(userHeader, raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(userHeader) == "" {
+		if strings.TrimSpace(raw) != "" {
+			return nil, errors.New("-trusted-proxy-cidrs requires -trusted-user-header")
+		}
+		return nil, nil
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("-trusted-proxy-cidrs is required when -trusted-user-header is set")
+	}
+
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, part := range parts {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("-trusted-proxy-cidrs contains %q: %w", part, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 func defaultInstanceID() string {
