@@ -833,6 +833,7 @@ CREATE TABLE job_executor (
 CREATE TABLE job_executor_handler (
     executor_id VARCHAR(128) NOT NULL,
     handler_key VARCHAR(128) NOT NULL,
+    description VARCHAR(512) NOT NULL DEFAULT '', -- operator metadata; never routing authority
     PRIMARY KEY (executor_id, handler_key),
     KEY idx_job_executor_handler_key (handler_key)
 );

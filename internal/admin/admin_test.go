@@ -62,6 +62,9 @@ func TestEmbeddedTenantMigrationsIncludeCurrentSchema(t *testing.T) {
 	if !strings.Contains(ddl, "idx_job_execution_retention (status, finished_at, id)") {
 		t.Fatal("new-tenant migration stream lacks the execution-retention index required by v2")
 	}
+	if !strings.Contains(ddl, "ADD COLUMN description VARCHAR(512) NOT NULL DEFAULT ''") {
+		t.Fatal("new-tenant migration stream lacks handler descriptions required by v3")
+	}
 	if !strings.Contains(ddl, "SET schema_version = '"+control.SchemaVersion+"'") {
 		t.Fatalf("new-tenant migration stream does not advance schema_identity to required version %s",
 			control.SchemaVersion)
@@ -259,6 +262,23 @@ func TestDeepLinkServesTheUI(t *testing.T) {
 	}
 	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "frame-ancestors 'none'") {
 		t.Errorf("missing frame-ancestors in CSP: %q", got)
+	}
+}
+
+func TestUIOffersCopyAllAndHandlerDescriptionAutofill(t *testing.T) {
+	a := &API{}
+	rec := httptest.NewRecorder()
+	a.ui().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	for _, marker := range []string{
+		`id="copyAllJobs"`,
+		`/jobs/copy-all`,
+		`/handler-catalog`,
+		`function applyHandlerDescription()`,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Errorf("admin UI is missing %q", marker)
+		}
 	}
 }
 

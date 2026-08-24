@@ -2,7 +2,9 @@ package admin
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
@@ -294,6 +296,90 @@ func (a *API) createJob(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	writeJSON(w, http.StatusCreated, jobJSON(j))
+	return nil
+}
+
+type copyAllJobsBody struct {
+	Targets []string `json:"targets"`
+	Reason  string   `json:"reason"`
+}
+
+// copyAllJobs copies every non-retired definition to one or more admitted tenants. Each target
+// is atomic and returns its own result; an existing name is skipped, never overwritten.
+func (a *API) copyAllJobs(w http.ResponseWriter, r *http.Request) error {
+	sourceStore, source, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	var body copyAllJobsBody
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	if len(body.Targets) == 0 || len(body.Targets) > 100 {
+		return badRequest("targets must contain between 1 and 100 tenants")
+	}
+
+	targetStores := make(map[string]*store.Store, len(body.Targets))
+	seen := map[string]bool{}
+	for _, raw := range body.Targets {
+		target := strings.TrimSpace(raw)
+		if target == "" || target != raw {
+			return badRequest("target tenant names must be non-empty and contain no surrounding whitespace")
+		}
+		if target == source {
+			return badRequest("source tenant %q cannot also be a target", source)
+		}
+		if seen[target] {
+			return badRequest("target tenant %q is repeated", target)
+		}
+		seen[target] = true
+		st, ok := a.tenants.Store(target)
+		if !ok {
+			return badRequest("target tenant %q is not admitted", target)
+		}
+		targetStores[target] = st
+	}
+
+	jobs, err := sourceStore.Jobs(r.Context())
+	if err != nil {
+		return err
+	}
+	now := a.cfg.Clock.Now()
+	seeds := make([]store.JobSeed, 0, len(jobs))
+	for _, job := range jobs {
+		if job.Retired {
+			continue
+		}
+		def := job.Definition
+		def.Retired = false
+		def.Version = 0
+		def.UpdatedBy = ""
+		next, err := parseCron(def.ScheduleKind, def.ScheduleExpr, now)
+		if err != nil {
+			return fmt.Errorf("source job %q has an invalid schedule: %w", def.JobName, err)
+		}
+		seeds = append(seeds, store.JobSeed{Definition: def, NextFire: next})
+	}
+
+	actor := ActorFrom(r.Context())
+	results := make([]map[string]any, 0, len(body.Targets))
+	for _, target := range body.Targets {
+		created, skipped, copyErr := targetStores[target].CopyJobs(
+			r.Context(), seeds, source, actor, body.Reason)
+		result := map[string]any{"tenant": target, "created": created, "skipped": skipped}
+		if copyErr != nil {
+			result["error"] = copyErr.Error()
+			a.log.Warn("copy all jobs to tenant failed", "source", source, "target", target,
+				"actor", actor, "error", copyErr)
+		}
+		results = append(results, result)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"source": source, "available": len(seeds), "results": results,
+	})
 	return nil
 }
 

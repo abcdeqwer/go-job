@@ -161,6 +161,87 @@ func (s *Store) CreateJob(ctx context.Context, d gojob.Definition, nextFire time
 	})
 }
 
+// JobSeed is one validated definition plus the first cron fire computed by the API.
+type JobSeed struct {
+	Definition gojob.Definition
+	NextFire   time.Time
+}
+
+// CopyJobs creates every missing seed in one target-tenant transaction. Existing names are
+// skipped and never overwritten: tenant-local edits are authority for that tenant, and a
+// bulk copy must not silently erase them.
+func (s *Store) CopyJobs(ctx context.Context, seeds []JobSeed, source, actor, reason string) (created, skipped []string, err error) {
+	if source == "" || actor == "" || reason == "" {
+		return nil, nil, fmt.Errorf("%w: copying jobs needs a source, actor and reason", gojob.ErrProtocol)
+	}
+	now := s.clock.Now()
+	err = s.tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT job_name FROM job_definition FOR UPDATE`)
+		if err != nil {
+			return fmt.Errorf("lock target job definitions: %w", err)
+		}
+		existing := map[string]bool{}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan target job name: %w", err)
+			}
+			existing[name] = true
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+
+		for _, seed := range seeds {
+			d := seed.Definition
+			if existing[d.JobName] {
+				skipped = append(skipped, d.JobName)
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO job_definition
+				    (job_name, handler_key, executor_group, schedule_kind, schedule_expr,
+				     enabled, retired, concurrency_policy, misfire_policy,
+				     max_attempts, max_recoveries, lease_seconds, timeout_seconds,
+				     params_json, description, version, updated_by, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+				d.JobName, d.HandlerKey, nullString(d.ExecutorGroup), string(d.ScheduleKind), d.ScheduleExpr,
+				d.Enabled, string(d.Concurrency), string(d.Misfire),
+				d.MaxAttempts, d.MaxRecoveries, int(d.Lease/time.Second), int(d.Timeout/time.Second),
+				nullBytes(d.Params), nullString(d.Description), actor, now, now); err != nil {
+				return fmt.Errorf("copy job %q from %s: %w", d.JobName, source, err)
+			}
+
+			var fireArg, pollArg any
+			if d.Enabled {
+				if d.ScheduleKind == gojob.ScheduleCron {
+					fireArg = seed.NextFire
+				} else {
+					pollArg = now
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO job_state (job_name, next_fire_at, next_poll_at, config_version, updated_at)
+				VALUES (?, ?, ?, 1, ?)`, d.JobName, fireArg, pollArg, now); err != nil {
+				return fmt.Errorf("create copied state row for %q: %w", d.JobName, err)
+			}
+			if err := audit(ctx, tx, now, actor, "job_created", d.JobName, "",
+				fmt.Sprintf("copied from tenant %s: %s (handler=%s schedule=%s %s)",
+					source, reason, d.HandlerKey, d.ScheduleKind, d.ScheduleExpr)); err != nil {
+				return err
+			}
+			created = append(created, d.JobName)
+			existing[d.JobName] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return created, skipped, nil
+}
+
 // UpdateJob edits a definition under an optimistic version check.
 //
 // A stale version is refused rather than silently overwritten: two operators editing the same
@@ -771,7 +852,15 @@ func (s *Store) AuditLog(ctx context.Context, jobName, actor string, limit int) 
 	return out, rows.Err()
 }
 
-// DeclaredHandlers lists what live executors currently declare, for the job-creation picker.
+// HandlerMetadata is operator-facing code metadata from a live executor. Key is dispatch
+// authority; Description is explanatory only.
+type HandlerMetadata struct {
+	Key         string
+	Description string
+}
+
+// DeclaredHandlers lists what live executors currently declare, for compatibility with API
+// clients that predate handler descriptions.
 //
 // It is a convenience, not a constraint: a handler whose executor is down or not yet deployed
 // must still be nameable, or a job could never be created before its executor ships.
@@ -793,6 +882,37 @@ func (s *Store) DeclaredHandlers(ctx context.Context, liveness time.Duration) ([
 		if err := rows.Scan(&h); err != nil {
 			return nil, fmt.Errorf("scan handler: %w", err)
 		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// DeclaredHandlerMetadata lists each live handler once. During a rolling deployment two live
+// executor revisions may describe the same key differently; the freshest heartbeat wins so
+// the creation form describes the code most recently admitted by the scheduler.
+func (s *Store) DeclaredHandlerMetadata(ctx context.Context, liveness time.Duration) ([]HandlerMetadata, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT h.handler_key, COALESCE(h.description, '')
+		FROM job_executor_handler h
+		JOIN job_executor e ON e.executor_id = h.executor_id
+		WHERE e.heartbeat_at >= TIMESTAMPADD(SECOND, ?, UTC_TIMESTAMP())
+		ORDER BY h.handler_key, e.heartbeat_at DESC, e.executor_id`, -seconds(liveness))
+	if err != nil {
+		return nil, fmt.Errorf("list declared handler metadata: %w", err)
+	}
+	defer rows.Close()
+
+	var out []HandlerMetadata
+	seen := map[string]bool{}
+	for rows.Next() {
+		var h HandlerMetadata
+		if err := rows.Scan(&h.Key, &h.Description); err != nil {
+			return nil, fmt.Errorf("scan handler metadata: %w", err)
+		}
+		if seen[h.Key] {
+			continue
+		}
+		seen[h.Key] = true
 		out = append(out, h)
 	}
 	return out, rows.Err()

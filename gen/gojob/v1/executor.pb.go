@@ -318,7 +318,12 @@ type DescribeResponse struct {
 	Revision string `protobuf:"bytes,4,opt,name=revision,proto3" json:"revision,omitempty"`
 	// Optional capabilities. Absence is not an error: it downgrades what the scheduler
 	// offers for jobs routed here, visibly, rather than failing at runtime.
-	Capabilities  []Capability `protobuf:"varint,5,rep,packed,name=capabilities,proto3,enum=gojob.v1.Capability" json:"capabilities,omitempty"`
+	Capabilities []Capability `protobuf:"varint,5,rep,packed,name=capabilities,proto3,enum=gojob.v1.Capability" json:"capabilities,omitempty"`
+	// Optional operator-facing metadata for handler_keys. The key remains authoritative for
+	// routing; this description only explains what the compiled handler does when an operator
+	// creates a job. Executors SHOULD also keep populating handler_keys so schedulers built
+	// before this field was added remain compatible during a rolling upgrade.
+	Handlers      []*HandlerDescriptor `protobuf:"bytes,6,rep,name=handlers,proto3" json:"handlers,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -388,6 +393,65 @@ func (x *DescribeResponse) GetCapabilities() []Capability {
 	return nil
 }
 
+func (x *DescribeResponse) GetHandlers() []*HandlerDescriptor {
+	if x != nil {
+		return x.Handlers
+	}
+	return nil
+}
+
+type HandlerDescriptor struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Description   string                 `protobuf:"bytes,2,opt,name=description,proto3" json:"description,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HandlerDescriptor) Reset() {
+	*x = HandlerDescriptor{}
+	mi := &file_gojob_v1_executor_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HandlerDescriptor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HandlerDescriptor) ProtoMessage() {}
+
+func (x *HandlerDescriptor) ProtoReflect() protoreflect.Message {
+	mi := &file_gojob_v1_executor_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HandlerDescriptor.ProtoReflect.Descriptor instead.
+func (*HandlerDescriptor) Descriptor() ([]byte, []int) {
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *HandlerDescriptor) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *HandlerDescriptor) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
 type RunRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Durable identity of one logical run, unique WITHIN A TENANT. The executor's
@@ -438,7 +502,7 @@ type RunRequest struct {
 
 func (x *RunRequest) Reset() {
 	*x = RunRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[3]
+	mi := &file_gojob_v1_executor_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -450,7 +514,7 @@ func (x *RunRequest) String() string {
 func (*RunRequest) ProtoMessage() {}
 
 func (x *RunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[3]
+	mi := &file_gojob_v1_executor_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -463,7 +527,7 @@ func (x *RunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRequest.ProtoReflect.Descriptor instead.
 func (*RunRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{3}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *RunRequest) GetExecutionKey() string {
@@ -570,7 +634,7 @@ type RunResponse struct {
 
 func (x *RunResponse) Reset() {
 	*x = RunResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[4]
+	mi := &file_gojob_v1_executor_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -582,7 +646,7 @@ func (x *RunResponse) String() string {
 func (*RunResponse) ProtoMessage() {}
 
 func (x *RunResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[4]
+	mi := &file_gojob_v1_executor_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -595,7 +659,7 @@ func (x *RunResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunResponse.ProtoReflect.Descriptor instead.
 func (*RunResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{4}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *RunResponse) GetExecutionKey() string {
@@ -637,7 +701,7 @@ type ExecutionHeld struct {
 
 func (x *ExecutionHeld) Reset() {
 	*x = ExecutionHeld{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[5]
+	mi := &file_gojob_v1_executor_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -649,7 +713,7 @@ func (x *ExecutionHeld) String() string {
 func (*ExecutionHeld) ProtoMessage() {}
 
 func (x *ExecutionHeld) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[5]
+	mi := &file_gojob_v1_executor_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -662,7 +726,7 @@ func (x *ExecutionHeld) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionHeld.ProtoReflect.Descriptor instead.
 func (*ExecutionHeld) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{5}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ExecutionHeld) GetHeldRunToken() string {
@@ -684,7 +748,7 @@ type CancelRequest struct {
 
 func (x *CancelRequest) Reset() {
 	*x = CancelRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[6]
+	mi := &file_gojob_v1_executor_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -696,7 +760,7 @@ func (x *CancelRequest) String() string {
 func (*CancelRequest) ProtoMessage() {}
 
 func (x *CancelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[6]
+	mi := &file_gojob_v1_executor_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -709,7 +773,7 @@ func (x *CancelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelRequest.ProtoReflect.Descriptor instead.
 func (*CancelRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{6}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *CancelRequest) GetTenant() string {
@@ -755,7 +819,7 @@ type CancelResponse struct {
 
 func (x *CancelResponse) Reset() {
 	*x = CancelResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[7]
+	mi := &file_gojob_v1_executor_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -767,7 +831,7 @@ func (x *CancelResponse) String() string {
 func (*CancelResponse) ProtoMessage() {}
 
 func (x *CancelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[7]
+	mi := &file_gojob_v1_executor_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -780,7 +844,7 @@ func (x *CancelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelResponse.ProtoReflect.Descriptor instead.
 func (*CancelResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{7}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *CancelResponse) GetAcknowledged() bool {
@@ -800,7 +864,7 @@ type GetExecutionRequest struct {
 
 func (x *GetExecutionRequest) Reset() {
 	*x = GetExecutionRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[8]
+	mi := &file_gojob_v1_executor_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -812,7 +876,7 @@ func (x *GetExecutionRequest) String() string {
 func (*GetExecutionRequest) ProtoMessage() {}
 
 func (x *GetExecutionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[8]
+	mi := &file_gojob_v1_executor_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -825,7 +889,7 @@ func (x *GetExecutionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetExecutionRequest.ProtoReflect.Descriptor instead.
 func (*GetExecutionRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{8}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GetExecutionRequest) GetTenant() string {
@@ -871,7 +935,7 @@ type GetExecutionResponse struct {
 
 func (x *GetExecutionResponse) Reset() {
 	*x = GetExecutionResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[9]
+	mi := &file_gojob_v1_executor_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -883,7 +947,7 @@ func (x *GetExecutionResponse) String() string {
 func (*GetExecutionResponse) ProtoMessage() {}
 
 func (x *GetExecutionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[9]
+	mi := &file_gojob_v1_executor_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -896,7 +960,7 @@ func (x *GetExecutionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetExecutionResponse.ProtoReflect.Descriptor instead.
 func (*GetExecutionResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{9}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetExecutionResponse) GetState() ExecutionState {
@@ -968,7 +1032,7 @@ type RegisterRequest struct {
 
 func (x *RegisterRequest) Reset() {
 	*x = RegisterRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[10]
+	mi := &file_gojob_v1_executor_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -980,7 +1044,7 @@ func (x *RegisterRequest) String() string {
 func (*RegisterRequest) ProtoMessage() {}
 
 func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[10]
+	mi := &file_gojob_v1_executor_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -993,7 +1057,7 @@ func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterRequest.ProtoReflect.Descriptor instead.
 func (*RegisterRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{10}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RegisterRequest) GetExecutorId() string {
@@ -1041,7 +1105,7 @@ type InFlight struct {
 
 func (x *InFlight) Reset() {
 	*x = InFlight{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[11]
+	mi := &file_gojob_v1_executor_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1053,7 +1117,7 @@ func (x *InFlight) String() string {
 func (*InFlight) ProtoMessage() {}
 
 func (x *InFlight) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[11]
+	mi := &file_gojob_v1_executor_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1066,7 +1130,7 @@ func (x *InFlight) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InFlight.ProtoReflect.Descriptor instead.
 func (*InFlight) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{11}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *InFlight) GetExecutionKey() string {
@@ -1098,7 +1162,7 @@ type RegisterResponse struct {
 
 func (x *RegisterResponse) Reset() {
 	*x = RegisterResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[12]
+	mi := &file_gojob_v1_executor_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1110,7 +1174,7 @@ func (x *RegisterResponse) String() string {
 func (*RegisterResponse) ProtoMessage() {}
 
 func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[12]
+	mi := &file_gojob_v1_executor_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1123,7 +1187,7 @@ func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterResponse.ProtoReflect.Descriptor instead.
 func (*RegisterResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{12}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *RegisterResponse) GetHeartbeatIntervalSeconds() int32 {
@@ -1167,7 +1231,7 @@ type HeartbeatRequest struct {
 
 func (x *HeartbeatRequest) Reset() {
 	*x = HeartbeatRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[13]
+	mi := &file_gojob_v1_executor_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1179,7 +1243,7 @@ func (x *HeartbeatRequest) String() string {
 func (*HeartbeatRequest) ProtoMessage() {}
 
 func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[13]
+	mi := &file_gojob_v1_executor_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1192,7 +1256,7 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{13}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *HeartbeatRequest) GetExecutorId() string {
@@ -1226,7 +1290,7 @@ type HeartbeatResponse struct {
 
 func (x *HeartbeatResponse) Reset() {
 	*x = HeartbeatResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[14]
+	mi := &file_gojob_v1_executor_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1238,7 +1302,7 @@ func (x *HeartbeatResponse) String() string {
 func (*HeartbeatResponse) ProtoMessage() {}
 
 func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[14]
+	mi := &file_gojob_v1_executor_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1251,7 +1315,7 @@ func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{14}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *HeartbeatResponse) GetKnown() bool {
@@ -1278,7 +1342,7 @@ type ReportProgressRequest struct {
 
 func (x *ReportProgressRequest) Reset() {
 	*x = ReportProgressRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[15]
+	mi := &file_gojob_v1_executor_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1290,7 +1354,7 @@ func (x *ReportProgressRequest) String() string {
 func (*ReportProgressRequest) ProtoMessage() {}
 
 func (x *ReportProgressRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[15]
+	mi := &file_gojob_v1_executor_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1303,7 +1367,7 @@ func (x *ReportProgressRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportProgressRequest.ProtoReflect.Descriptor instead.
 func (*ReportProgressRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{15}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ReportProgressRequest) GetTenant() string {
@@ -1347,7 +1411,7 @@ type ReportProgressResponse struct {
 
 func (x *ReportProgressResponse) Reset() {
 	*x = ReportProgressResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[16]
+	mi := &file_gojob_v1_executor_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1359,7 +1423,7 @@ func (x *ReportProgressResponse) String() string {
 func (*ReportProgressResponse) ProtoMessage() {}
 
 func (x *ReportProgressResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[16]
+	mi := &file_gojob_v1_executor_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1372,7 +1436,7 @@ func (x *ReportProgressResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportProgressResponse.ProtoReflect.Descriptor instead.
 func (*ReportProgressResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{16}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ReportProgressResponse) GetProceed() bool {
@@ -1402,7 +1466,7 @@ type ReportResultRequest struct {
 
 func (x *ReportResultRequest) Reset() {
 	*x = ReportResultRequest{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[17]
+	mi := &file_gojob_v1_executor_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1414,7 +1478,7 @@ func (x *ReportResultRequest) String() string {
 func (*ReportResultRequest) ProtoMessage() {}
 
 func (x *ReportResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[17]
+	mi := &file_gojob_v1_executor_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1427,7 +1491,7 @@ func (x *ReportResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportResultRequest.ProtoReflect.Descriptor instead.
 func (*ReportResultRequest) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{17}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ReportResultRequest) GetTenant() string {
@@ -1493,7 +1557,7 @@ type ExecutionOutcome struct {
 
 func (x *ExecutionOutcome) Reset() {
 	*x = ExecutionOutcome{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[18]
+	mi := &file_gojob_v1_executor_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1505,7 +1569,7 @@ func (x *ExecutionOutcome) String() string {
 func (*ExecutionOutcome) ProtoMessage() {}
 
 func (x *ExecutionOutcome) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[18]
+	mi := &file_gojob_v1_executor_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1518,7 +1582,7 @@ func (x *ExecutionOutcome) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionOutcome.ProtoReflect.Descriptor instead.
 func (*ExecutionOutcome) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{18}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ExecutionOutcome) GetDisposition() Disposition {
@@ -1567,7 +1631,7 @@ type ReportResultResponse struct {
 
 func (x *ReportResultResponse) Reset() {
 	*x = ReportResultResponse{}
-	mi := &file_gojob_v1_executor_proto_msgTypes[19]
+	mi := &file_gojob_v1_executor_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1579,7 +1643,7 @@ func (x *ReportResultResponse) String() string {
 func (*ReportResultResponse) ProtoMessage() {}
 
 func (x *ReportResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_gojob_v1_executor_proto_msgTypes[19]
+	mi := &file_gojob_v1_executor_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1592,7 +1656,7 @@ func (x *ReportResultResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportResultResponse.ProtoReflect.Descriptor instead.
 func (*ReportResultResponse) Descriptor() ([]byte, []int) {
-	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{19}
+	return file_gojob_v1_executor_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ReportResultResponse) GetAlreadyRecorded() bool {
@@ -1609,13 +1673,17 @@ const file_gojob_v1_executor_proto_rawDesc = "" +
 	"\x17gojob/v1/executor.proto\x12\bgojob.v1\x1a\x1cgoogle/protobuf/struct.proto\"<\n" +
 	"\tJobParams\x12/\n" +
 	"\x06values\x18\x01 \x01(\v2\x17.google.protobuf.StructR\x06values\"\x11\n" +
-	"\x0fDescribeRequest\"\xd2\x01\n" +
+	"\x0fDescribeRequest\"\x8b\x02\n" +
 	"\x10DescribeResponse\x12)\n" +
 	"\x10contract_version\x18\x01 \x01(\tR\x0fcontractVersion\x12!\n" +
 	"\fhandler_keys\x18\x02 \x03(\tR\vhandlerKeys\x12\x1a\n" +
 	"\bcapacity\x18\x03 \x01(\x05R\bcapacity\x12\x1a\n" +
 	"\brevision\x18\x04 \x01(\tR\brevision\x128\n" +
-	"\fcapabilities\x18\x05 \x03(\x0e2\x14.gojob.v1.CapabilityR\fcapabilities\"\x82\x03\n" +
+	"\fcapabilities\x18\x05 \x03(\x0e2\x14.gojob.v1.CapabilityR\fcapabilities\x127\n" +
+	"\bhandlers\x18\x06 \x03(\v2\x1b.gojob.v1.HandlerDescriptorR\bhandlers\"G\n" +
+	"\x11HandlerDescriptor\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12 \n" +
+	"\vdescription\x18\x02 \x01(\tR\vdescription\"\x82\x03\n" +
 	"\n" +
 	"RunRequest\x12#\n" +
 	"\rexecution_key\x18\x01 \x01(\tR\fexecutionKey\x12\x1b\n" +
@@ -1737,7 +1805,7 @@ func file_gojob_v1_executor_proto_rawDescGZIP() []byte {
 }
 
 var file_gojob_v1_executor_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_gojob_v1_executor_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_gojob_v1_executor_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_gojob_v1_executor_proto_goTypes = []any{
 	(Capability)(0),                // 0: gojob.v1.Capability
 	(Disposition)(0),               // 1: gojob.v1.Disposition
@@ -1745,55 +1813,57 @@ var file_gojob_v1_executor_proto_goTypes = []any{
 	(*JobParams)(nil),              // 3: gojob.v1.JobParams
 	(*DescribeRequest)(nil),        // 4: gojob.v1.DescribeRequest
 	(*DescribeResponse)(nil),       // 5: gojob.v1.DescribeResponse
-	(*RunRequest)(nil),             // 6: gojob.v1.RunRequest
-	(*RunResponse)(nil),            // 7: gojob.v1.RunResponse
-	(*ExecutionHeld)(nil),          // 8: gojob.v1.ExecutionHeld
-	(*CancelRequest)(nil),          // 9: gojob.v1.CancelRequest
-	(*CancelResponse)(nil),         // 10: gojob.v1.CancelResponse
-	(*GetExecutionRequest)(nil),    // 11: gojob.v1.GetExecutionRequest
-	(*GetExecutionResponse)(nil),   // 12: gojob.v1.GetExecutionResponse
-	(*RegisterRequest)(nil),        // 13: gojob.v1.RegisterRequest
-	(*InFlight)(nil),               // 14: gojob.v1.InFlight
-	(*RegisterResponse)(nil),       // 15: gojob.v1.RegisterResponse
-	(*HeartbeatRequest)(nil),       // 16: gojob.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),      // 17: gojob.v1.HeartbeatResponse
-	(*ReportProgressRequest)(nil),  // 18: gojob.v1.ReportProgressRequest
-	(*ReportProgressResponse)(nil), // 19: gojob.v1.ReportProgressResponse
-	(*ReportResultRequest)(nil),    // 20: gojob.v1.ReportResultRequest
-	(*ExecutionOutcome)(nil),       // 21: gojob.v1.ExecutionOutcome
-	(*ReportResultResponse)(nil),   // 22: gojob.v1.ReportResultResponse
-	(*structpb.Struct)(nil),        // 23: google.protobuf.Struct
+	(*HandlerDescriptor)(nil),      // 6: gojob.v1.HandlerDescriptor
+	(*RunRequest)(nil),             // 7: gojob.v1.RunRequest
+	(*RunResponse)(nil),            // 8: gojob.v1.RunResponse
+	(*ExecutionHeld)(nil),          // 9: gojob.v1.ExecutionHeld
+	(*CancelRequest)(nil),          // 10: gojob.v1.CancelRequest
+	(*CancelResponse)(nil),         // 11: gojob.v1.CancelResponse
+	(*GetExecutionRequest)(nil),    // 12: gojob.v1.GetExecutionRequest
+	(*GetExecutionResponse)(nil),   // 13: gojob.v1.GetExecutionResponse
+	(*RegisterRequest)(nil),        // 14: gojob.v1.RegisterRequest
+	(*InFlight)(nil),               // 15: gojob.v1.InFlight
+	(*RegisterResponse)(nil),       // 16: gojob.v1.RegisterResponse
+	(*HeartbeatRequest)(nil),       // 17: gojob.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),      // 18: gojob.v1.HeartbeatResponse
+	(*ReportProgressRequest)(nil),  // 19: gojob.v1.ReportProgressRequest
+	(*ReportProgressResponse)(nil), // 20: gojob.v1.ReportProgressResponse
+	(*ReportResultRequest)(nil),    // 21: gojob.v1.ReportResultRequest
+	(*ExecutionOutcome)(nil),       // 22: gojob.v1.ExecutionOutcome
+	(*ReportResultResponse)(nil),   // 23: gojob.v1.ReportResultResponse
+	(*structpb.Struct)(nil),        // 24: google.protobuf.Struct
 }
 var file_gojob_v1_executor_proto_depIdxs = []int32{
-	23, // 0: gojob.v1.JobParams.values:type_name -> google.protobuf.Struct
+	24, // 0: gojob.v1.JobParams.values:type_name -> google.protobuf.Struct
 	0,  // 1: gojob.v1.DescribeResponse.capabilities:type_name -> gojob.v1.Capability
-	3,  // 2: gojob.v1.RunRequest.params:type_name -> gojob.v1.JobParams
-	2,  // 3: gojob.v1.GetExecutionResponse.state:type_name -> gojob.v1.ExecutionState
-	21, // 4: gojob.v1.GetExecutionResponse.outcome:type_name -> gojob.v1.ExecutionOutcome
-	14, // 5: gojob.v1.RegisterRequest.in_flight:type_name -> gojob.v1.InFlight
-	21, // 6: gojob.v1.ReportResultRequest.outcome:type_name -> gojob.v1.ExecutionOutcome
-	1,  // 7: gojob.v1.ExecutionOutcome.disposition:type_name -> gojob.v1.Disposition
-	4,  // 8: gojob.v1.JobExecutor.Describe:input_type -> gojob.v1.DescribeRequest
-	6,  // 9: gojob.v1.JobExecutor.Run:input_type -> gojob.v1.RunRequest
-	9,  // 10: gojob.v1.JobExecutor.Cancel:input_type -> gojob.v1.CancelRequest
-	11, // 11: gojob.v1.JobExecutor.GetExecution:input_type -> gojob.v1.GetExecutionRequest
-	13, // 12: gojob.v1.JobScheduler.Register:input_type -> gojob.v1.RegisterRequest
-	16, // 13: gojob.v1.JobScheduler.Heartbeat:input_type -> gojob.v1.HeartbeatRequest
-	18, // 14: gojob.v1.JobScheduler.ReportProgress:input_type -> gojob.v1.ReportProgressRequest
-	20, // 15: gojob.v1.JobScheduler.ReportResult:input_type -> gojob.v1.ReportResultRequest
-	5,  // 16: gojob.v1.JobExecutor.Describe:output_type -> gojob.v1.DescribeResponse
-	7,  // 17: gojob.v1.JobExecutor.Run:output_type -> gojob.v1.RunResponse
-	10, // 18: gojob.v1.JobExecutor.Cancel:output_type -> gojob.v1.CancelResponse
-	12, // 19: gojob.v1.JobExecutor.GetExecution:output_type -> gojob.v1.GetExecutionResponse
-	15, // 20: gojob.v1.JobScheduler.Register:output_type -> gojob.v1.RegisterResponse
-	17, // 21: gojob.v1.JobScheduler.Heartbeat:output_type -> gojob.v1.HeartbeatResponse
-	19, // 22: gojob.v1.JobScheduler.ReportProgress:output_type -> gojob.v1.ReportProgressResponse
-	22, // 23: gojob.v1.JobScheduler.ReportResult:output_type -> gojob.v1.ReportResultResponse
-	16, // [16:24] is the sub-list for method output_type
-	8,  // [8:16] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	6,  // 2: gojob.v1.DescribeResponse.handlers:type_name -> gojob.v1.HandlerDescriptor
+	3,  // 3: gojob.v1.RunRequest.params:type_name -> gojob.v1.JobParams
+	2,  // 4: gojob.v1.GetExecutionResponse.state:type_name -> gojob.v1.ExecutionState
+	22, // 5: gojob.v1.GetExecutionResponse.outcome:type_name -> gojob.v1.ExecutionOutcome
+	15, // 6: gojob.v1.RegisterRequest.in_flight:type_name -> gojob.v1.InFlight
+	22, // 7: gojob.v1.ReportResultRequest.outcome:type_name -> gojob.v1.ExecutionOutcome
+	1,  // 8: gojob.v1.ExecutionOutcome.disposition:type_name -> gojob.v1.Disposition
+	4,  // 9: gojob.v1.JobExecutor.Describe:input_type -> gojob.v1.DescribeRequest
+	7,  // 10: gojob.v1.JobExecutor.Run:input_type -> gojob.v1.RunRequest
+	10, // 11: gojob.v1.JobExecutor.Cancel:input_type -> gojob.v1.CancelRequest
+	12, // 12: gojob.v1.JobExecutor.GetExecution:input_type -> gojob.v1.GetExecutionRequest
+	14, // 13: gojob.v1.JobScheduler.Register:input_type -> gojob.v1.RegisterRequest
+	17, // 14: gojob.v1.JobScheduler.Heartbeat:input_type -> gojob.v1.HeartbeatRequest
+	19, // 15: gojob.v1.JobScheduler.ReportProgress:input_type -> gojob.v1.ReportProgressRequest
+	21, // 16: gojob.v1.JobScheduler.ReportResult:input_type -> gojob.v1.ReportResultRequest
+	5,  // 17: gojob.v1.JobExecutor.Describe:output_type -> gojob.v1.DescribeResponse
+	8,  // 18: gojob.v1.JobExecutor.Run:output_type -> gojob.v1.RunResponse
+	11, // 19: gojob.v1.JobExecutor.Cancel:output_type -> gojob.v1.CancelResponse
+	13, // 20: gojob.v1.JobExecutor.GetExecution:output_type -> gojob.v1.GetExecutionResponse
+	16, // 21: gojob.v1.JobScheduler.Register:output_type -> gojob.v1.RegisterResponse
+	18, // 22: gojob.v1.JobScheduler.Heartbeat:output_type -> gojob.v1.HeartbeatResponse
+	20, // 23: gojob.v1.JobScheduler.ReportProgress:output_type -> gojob.v1.ReportProgressResponse
+	23, // 24: gojob.v1.JobScheduler.ReportResult:output_type -> gojob.v1.ReportResultResponse
+	17, // [17:25] is the sub-list for method output_type
+	9,  // [9:17] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_gojob_v1_executor_proto_init() }
@@ -1807,7 +1877,7 @@ func file_gojob_v1_executor_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_gojob_v1_executor_proto_rawDesc), len(file_gojob_v1_executor_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   20,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	gojob "github.com/abcdeqwer/go-job"
 )
@@ -38,6 +39,9 @@ type Executor struct {
 	Running         int
 	Capabilities    string
 	Handlers        []string
+	// HandlerDescriptions is operator-facing metadata keyed by Handlers. It is never used for
+	// routing, so an older executor that supplies no descriptions remains fully compatible.
+	HandlerDescriptions map[string]string
 	// StartedAt and HeartbeatAt are OWNERSHIP columns: written with UTC_TIMESTAMP(), so the
 	// values in them are UTC wall clock. The driver tags whatever it reads with the DSN's
 	// `loc`, which is the BUSINESS location — so a value read straight out of the scan is
@@ -70,6 +74,12 @@ func (s *Store) Register(ctx context.Context, e Executor, livenessSeconds int) e
 	}
 	if len(e.Handlers) == 0 {
 		return fmt.Errorf("%w: executor %q declares no handlers", gojob.ErrProtocol, e.ExecutorID)
+	}
+	for key, description := range e.HandlerDescriptions {
+		if utf8.RuneCountInString(description) > 512 {
+			return fmt.Errorf("%w: handler %q description exceeds 512 characters",
+				gojob.ErrProtocol, key)
+		}
 	}
 
 	return s.tx(ctx, func(tx *sql.Tx) error {
@@ -137,8 +147,8 @@ func (s *Store) Register(ctx context.Context, e Executor, livenessSeconds int) e
 				return fmt.Errorf("%w: executor %q declares an empty handler key", gojob.ErrProtocol, e.ExecutorID)
 			}
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO job_executor_handler (executor_id, handler_key) VALUES (?, ?)`,
-				e.ExecutorID, h); err != nil {
+				`INSERT INTO job_executor_handler (executor_id, handler_key, description) VALUES (?, ?, ?)`,
+				e.ExecutorID, h, e.HandlerDescriptions[h]); err != nil {
 				return fmt.Errorf("declare handler %q of %q: %w", h, e.ExecutorID, err)
 			}
 		}

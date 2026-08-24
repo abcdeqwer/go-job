@@ -788,6 +788,10 @@ documentation says so rather than implying a guarantee that does not hold.
 Executors call `Register` and `Heartbeat` (`dispatch.md` §6); the scheduler stores the
 result in `job_executor` and `job_executor_handler`.
 
+The registration probe may also carry a description for each declared handler. The scheduler
+stores it on `job_executor_handler` for the admin creation form, but all routing and orphan
+decisions continue to use only `handler_key`.
+
 ```text
 Register   -> probe (Describe, plus a GetExecution for a key it cannot hold)
            -> INSERT job_executor, job_executor_handler x N

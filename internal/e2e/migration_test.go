@@ -22,7 +22,7 @@ func TestExistingTenantSchemaMigratesFromVersionOne(t *testing.T) {
 	}
 	assertTenantSchemaVersionAndRetentionIndex(t, db)
 
-	// A later replica in the rolling restart reads version 2 and performs no DDL.
+	// A later replica in the rolling restart reads the current version and performs no DDL.
 	if err := tenantmigration.Upgrade(ctx, db, migrations,
 		control.SchemaVersion, control.SchemaVersion); err != nil {
 		t.Fatalf("repeat upgrade: %v", err)
@@ -39,6 +39,23 @@ func TestExistingTenantSchemaMigrationResumesAfterIndexDDLCommitted(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := tenantmigration.Upgrade(ctx, db, migrations, "1", control.SchemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	assertTenantSchemaVersionAndRetentionIndex(t, db)
+}
+
+func TestExistingTenantSchemaMigrationResumesAfterDescriptionDDLCommitted(t *testing.T) {
+	db, migrations := setupVersionOneSchema(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := tenantmigration.Upgrade(ctx, db, migrations, "1", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE job_executor_handler
+		ADD COLUMN description VARCHAR(512) NOT NULL DEFAULT '' AFTER handler_key`); err != nil {
+		t.Fatalf("simulate committed description DDL: %v", err)
+	}
+	if err := tenantmigration.Upgrade(ctx, db, migrations, "2", control.SchemaVersion); err != nil {
 		t.Fatal(err)
 	}
 	assertTenantSchemaVersionAndRetentionIndex(t, db)
@@ -116,5 +133,18 @@ func assertTenantSchemaVersionAndRetentionIndex(t *testing.T, db *sql.DB) {
 	if !columns.Valid || columns.String != "status,finished_at,id" {
 		t.Fatalf("retention index columns = %q, want %q",
 			columns.String, "status,finished_at,id")
+	}
+	var columnType, nullable, defaultValue string
+	if err := db.QueryRow(`
+		SELECT column_type, is_nullable, column_default
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE()
+		  AND table_name = 'job_executor_handler'
+		  AND column_name = 'description'`).Scan(&columnType, &nullable, &defaultValue); err != nil {
+		t.Fatalf("read handler description column: %v", err)
+	}
+	if columnType != "varchar(512)" || nullable != "NO" || defaultValue != "" {
+		t.Fatalf("handler description column = %s nullable=%s default=%q",
+			columnType, nullable, defaultValue)
 	}
 }

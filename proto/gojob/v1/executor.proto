@@ -168,6 +168,17 @@ message DescribeResponse {
   // Optional capabilities. Absence is not an error: it downgrades what the scheduler
   // offers for jobs routed here, visibly, rather than failing at runtime.
   repeated Capability capabilities = 5;
+
+  // Optional operator-facing metadata for handler_keys. The key remains authoritative for
+  // routing; this description only explains what the compiled handler does when an operator
+  // creates a job. Executors SHOULD also keep populating handler_keys so schedulers built
+  // before this field was added remain compatible during a rolling upgrade.
+  repeated HandlerDescriptor handlers = 6;
+}
+
+message HandlerDescriptor {
+  string key = 1;
+  string description = 2;
 }
 
 enum Capability {

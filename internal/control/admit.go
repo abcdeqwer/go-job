@@ -15,7 +15,7 @@ import (
 //
 // Admission fails CLOSED on a mismatch after the runtime has had an opportunity to apply the
 // embedded additive migrations. A schema newer than this binary is never downgraded.
-const SchemaVersion = "2"
+const SchemaVersion = "3"
 
 // Admit verifies that a coordination schema is the one this tenant is supposed to be using,
 // is the version this build understands, and speaks the same wall clock.

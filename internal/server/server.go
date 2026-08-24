@@ -174,6 +174,10 @@ func (s *Server) Register(ctx context.Context, req *gojobv1.RegisterRequest) (*g
 		return nil, status.Errorf(codes.FailedPrecondition, "contract probe failed: %v", err)
 	}
 	e.Handlers = desc.HandlerKeys
+	e.HandlerDescriptions = make(map[string]string, len(desc.GetHandlers()))
+	for _, h := range desc.GetHandlers() {
+		e.HandlerDescriptions[h.GetKey()] = h.GetDescription()
+	}
 	e.Capacity = int(desc.Capacity)
 	e.Revision = desc.Revision
 	e.ContractVersion = desc.ContractVersion

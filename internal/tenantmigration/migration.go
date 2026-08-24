@@ -4,6 +4,7 @@ package tenantmigration
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -126,6 +127,26 @@ func Upgrade(ctx context.Context, db *sql.DB, migrations []Migration, current, r
 // alreadyApplied makes the version-2 index addition restartable if MySQL committed the ALTER
 // TABLE but the process stopped before schema_identity advanced.
 func alreadyApplied(ctx context.Context, conn *sql.Conn, version int, statement string) (bool, error) {
+	if version == 3 && strings.Contains(statement, "ADD COLUMN description") {
+		var columnType, nullable, defaultValue sql.NullString
+		err := conn.QueryRowContext(ctx, `
+			SELECT column_type, is_nullable, column_default
+			FROM information_schema.columns
+			WHERE table_schema = DATABASE()
+			  AND table_name = 'job_executor_handler'
+			  AND column_name = 'description'`).Scan(&columnType, &nullable, &defaultValue)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if columnType.String != "varchar(512)" || nullable.String != "NO" || defaultValue.String != "" {
+			return false, fmt.Errorf("existing job_executor_handler.description is %s nullable=%s default=%q, want varchar(512) NOT NULL default empty",
+				columnType.String, nullable.String, defaultValue.String)
+		}
+		return true, nil
+	}
 	if version != 2 || !strings.Contains(statement, "idx_job_execution_retention") {
 		return false, nil
 	}

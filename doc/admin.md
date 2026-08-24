@@ -96,6 +96,7 @@ Each is audited with actor, target and reason. Each requires the `OPERATOR` role
 | Action | Effect | Guard |
 | --- | --- | --- |
 | **Create** | a new job: handler, group, schedule, parameters, policy | the UI *offers* the handlers live executors declare; an unknown one is a **warning**, not a rejection |
+| **Copy all** | copies every non-retired definition to selected tenants | target tenants are atomic; existing names are skipped and never overwritten; pause state is not copied |
 | **Trigger** | a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one — and is selected ahead of it, so it cannot starve |
 | **Pause / resume** | sets `ops_paused` | takes the state-row lock, so it cannot race a claim into one extra run |
 | **Edit** | schedule, concurrency, retry budget, timeouts | optimistic `version` CAS; rejected if the row changed underneath |
@@ -143,9 +144,11 @@ PUT    /api/tenants/{tenant}/dsn                       re-point; 409 until quies
                                                        sets abandon_queued for `ready` work
 GET    /api/tenants/{tenant}/quiescence                per-instance observed generation
 GET    /api/tenants/{tenant}/handlers                  handler_keys live executors declare
+GET    /api/tenants/{tenant}/handler-catalog           keys plus code-supplied descriptions
 
 GET    /api/tenants/{tenant}/jobs                      list with effective state
 POST   /api/tenants/{tenant}/jobs                      create: handler_key, schedule, params
+POST   /api/tenants/{tenant}/jobs/copy-all             copy non-retired definitions to targets
 GET    /api/tenants/{tenant}/jobs/{name}               detail, configuration, conditions
 PATCH  /api/tenants/{tenant}/jobs/{name}               edit; requires If-Match: <version>
 POST   /api/tenants/{tenant}/jobs/{name}/pause         body: {reason}
@@ -176,6 +179,10 @@ picker. **It is a convenience, not a constraint**: a handler whose executor happ
 down or not yet deployed must still be nameable, or a job could never be created before its
 executor ships. An unrecognised handler is accepted with a warning and the job shows as an
 orphan until an executor declares it.
+
+`GET /handler-catalog` adds the optional operator description supplied by the compiled
+executor. Selecting a known handler on the create form copies that description into the job;
+the operator can still edit it before saving. Routing never reads the description.
 
 A job may also name a required executor **group**, which is what distinguishes two groups
 declaring the same handler — a partial rollout, or two configurations of one service. A job

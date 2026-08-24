@@ -110,6 +110,7 @@ func (a *API) Handler() http.Handler {
 	a.read(mux, "GET /api/tenants", a.listTenants)
 	a.read(mux, "GET /api/tenants/{tenant}/quiescence", a.quiescence)
 	a.read(mux, "GET /api/tenants/{tenant}/handlers", a.handlers)
+	a.read(mux, "GET /api/tenants/{tenant}/handler-catalog", a.handlerCatalog)
 	a.read(mux, "GET /api/tenants/{tenant}/jobs", a.listJobs)
 	a.read(mux, "GET /api/tenants/{tenant}/jobs/{name}", a.getJob)
 	a.read(mux, "GET /api/tenants/{tenant}/executions", a.listExecutions)
@@ -123,6 +124,7 @@ func (a *API) Handler() http.Handler {
 	a.write(mux, "PATCH /api/tenants/{tenant}", a.patchTenant)
 	a.write(mux, "PUT /api/tenants/{tenant}/dsn", a.repointTenant)
 	a.write(mux, "POST /api/tenants/{tenant}/jobs", a.createJob)
+	a.write(mux, "POST /api/tenants/{tenant}/jobs/copy-all", a.copyAllJobs)
 	a.write(mux, "PATCH /api/tenants/{tenant}/jobs/{name}", a.patchJob)
 	a.write(mux, "POST /api/tenants/{tenant}/jobs/{name}/pause", a.pauseJob)
 	a.write(mux, "POST /api/tenants/{tenant}/jobs/{name}/resume", a.resumeJob)
@@ -778,6 +780,26 @@ func (a *API) handlers(w http.ResponseWriter, r *http.Request) error {
 		hs = []string{}
 	}
 	writeJSON(w, http.StatusOK, hs)
+	return nil
+}
+
+func (a *API) handlerCatalog(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	hs, err := st.DeclaredHandlerMetadata(r.Context(), a.cfg.ExecutorLiveness)
+	if err != nil {
+		return err
+	}
+	out := make([]map[string]string, 0, len(hs))
+	for _, h := range hs {
+		out = append(out, map[string]string{
+			"handler_key": h.Key,
+			"description": h.Description,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 	return nil
 }
 

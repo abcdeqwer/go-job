@@ -287,6 +287,29 @@
   </form>
 </dialog>
 
+<dialog id="copyAllJobsDlg" class="wide">
+  <form method="dialog" id="copyAllJobsForm">
+    <div class="dlg-head">
+      <h3>复制全部任务到其他租户</h3>
+      <p>复制当前租户全部<b>未退役</b>任务的定义。目标租户已有的同名任务会跳过，绝不覆盖；
+         暂停状态属于租户运行态，不会跟着复制。</p>
+    </div>
+    <div class="dlg-body">
+      <div id="copyAllTargets" class="preview">读取租户…</div>
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么把这些任务复制到其他租户">
+      </div>
+      <div class="err" id="copyAllJobsErr" hidden></div>
+      <div id="copyAllJobsResult" class="preview" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok">复制</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="tenantEditDlg">
   <form method="dialog" id="tenantEditForm">
     <div class="dlg-head">
@@ -786,12 +809,15 @@ async function renderOnce() {
 }
 
 async function renderJobs(t) {
-  const [jobs, orphans, handlers] = await Promise.all([
+  const [jobs, orphans, handlerCatalog] = await Promise.all([
     api("GET", `/api/tenants/${t}/jobs`),
     api("GET", `/api/tenants/${t}/orphans`),
-    api("GET", `/api/tenants/${t}/handlers`),
+    api("GET", `/api/tenants/${t}/handler-catalog`),
   ]);
-  $("#handlers").innerHTML = handlers.map(h => `<option value="${esc(h)}">`).join("");
+  state.jobs = jobs;
+  state.handlerCatalog = handlerCatalog;
+  $("#handlers").innerHTML = handlerCatalog.map(h =>
+    `<option value="${esc(h.handler_key)}">${esc(h.description || "")}</option>`).join("");
   const orphaned = new Set(orphans.map(o => o.job_name));
 
   // Handlers that live executors declare for this tenant but no job uses.
@@ -811,14 +837,17 @@ async function renderJobs(t) {
   // A DISABLED job does count: it exists, an operator turned it off, and surfacing it as
   // "missing" would invite creating a second job for the same handler.
   const used = new Set(jobs.filter(j => !j.retired).map(j => j.handler_key));
-  const unused = handlers.filter(h => !used.has(h));
+  const unused = handlerCatalog.filter(h => !used.has(h.handler_key));
 
   $("#controls").innerHTML = (operator()
-    ? `<button class="primary" id="newJob">new job</button>` : "")
+    ? `<button class="primary" id="newJob">new job</button> `
+      + `<button id="copyAllJobs">复制全部任务到…</button> ` : "")
     + `<span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`
     + (unused.length ? ` <span class="dim">·</span> <button id="showUnused">${unused.length} 个 handler 还没有任务</button>` : "");
   const nj = $("#newJob");
   if (nj) nj.onclick = () => openJob(null);
+  const copyAll = $("#copyAllJobs");
+  if (copyAll) copyAll.onclick = openCopyAllJobs;
   const su = $("#showUnused");
   if (su) su.onclick = () => {
     const box = $("#unusedBox");
@@ -827,9 +856,11 @@ async function renderJobs(t) {
       box.innerHTML = `<div class="dim" style="margin-bottom:8px">`
         + `有执行器在为 <b>${esc(t)}</b> 声明这些 handler，但这个租户还没有对应的任务。`
         + `没有任务就不会跑——这是正常的，除非你本来就想让它跑。</div>`
-        + unused.map(h => `<div class="row" style="margin:4px 0">`
-            + `<code>${esc(h)}</code>`
-            + (operator() ? ` <button data-newfor="${esc(h)}">创建任务</button>` : "")
+        + unused.map(h => `<div class="row" style="margin:4px 0;align-items:flex-start">`
+            + `<div><code>${esc(h.handler_key)}</code>`
+            + (h.description ? `<div class="dim" style="margin-top:2px">${esc(h.description)}</div>` : "")
+            + `</div>`
+            + (operator() ? ` <button data-newfor="${esc(h.handler_key)}">创建任务</button>` : "")
             + `</div>`).join("");
       box.onclick = ev => {
         const b = ev.target.closest("[data-newfor]");
@@ -1580,6 +1611,20 @@ $("#cronPreset").onchange = ev => {
 $("#jobForm").schedule_expr.addEventListener("input", schedulePreview);
 $("#jobForm").schedule_kind.addEventListener("change", () => { fillPresets(); previewNow(); });
 
+function applyHandlerDescription() {
+  const f = $("#jobForm");
+  if (f.dataset.editing) return;
+  const metadata = (state.handlerCatalog || []).find(h => h.handler_key === f.handler_key.value);
+  const next = metadata ? metadata.description || "" : "";
+  const previous = f.dataset.autoDescription || "";
+  if (!f.description.value || f.description.value === previous) {
+    f.description.value = next;
+  }
+  f.dataset.autoDescription = next;
+}
+$("#jobForm").handler_key.addEventListener("input", applyHandlerDescription);
+$("#jobForm").handler_key.addEventListener("change", applyHandlerDescription);
+
 function openJob(name, handlerKey) {
   const f = $("#jobForm");
   f.reset();
@@ -1587,6 +1632,7 @@ function openJob(name, handlerKey) {
   $("#jobTitle").textContent = name ? `编辑 ${name}` : "新建任务";
   f.dataset.editing = name || "";
   f.dataset.version = "";
+  f.dataset.autoDescription = "";
 
   const show = () => { fillPresets(); previewNow(); $("#jobDlg").showModal(); };
   if (!name) {
@@ -1596,6 +1642,7 @@ function openJob(name, handlerKey) {
       // the job name is a guess the operator will usually keep, and always sees before saving.
       f.handler_key.value = handlerKey;
       f.job_name.value = handlerKey.replace(/[^a-zA-Z0-9]+/g, "-");
+      applyHandlerDescription();
     }
     return show();
   }
@@ -1657,13 +1704,56 @@ $("#jobForm").addEventListener("submit", async ev => {
   }
 });
 
+function openCopyAllJobs() {
+  const f = $("#copyAllJobsForm");
+  f.reset();
+  $("#copyAllJobsErr").hidden = true;
+  $("#copyAllJobsResult").hidden = true;
+  const others = (state.tenants || []).filter(t => t.tenant !== state.tenant && t.admitted);
+  const count = (state.jobs || []).filter(j => !j.retired).length;
+  $("#copyAllTargets").innerHTML = others.length
+    ? `<div class="dim" style="margin-bottom:8px">当前有 ${count} 个未退役任务可复制。</div>`
+      + others.map(t => `<label class="row" style="margin:6px 0;gap:8px">`
+          + `<input type="checkbox" data-tenant="${esc(t.tenant)}">`
+          + `<b>${esc(t.tenant)}</b></label>`).join("")
+    : '<span class="dim">没有其他已接纳的租户。</span>';
+  $("#copyAllJobsDlg").showModal();
+}
+
+$("#copyAllJobsForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#copyAllJobsErr").hidden = true;
+  const targets = [...document.querySelectorAll("#copyAllTargets input[type=checkbox]:checked")]
+    .map(c => c.dataset.tenant);
+  if (!targets.length) {
+    $("#copyAllJobsErr").textContent = "先选至少一个租户";
+    $("#copyAllJobsErr").hidden = false;
+    return;
+  }
+  try {
+    const source = encodeURIComponent(state.tenant);
+    const result = await api("POST", `/api/tenants/${source}/jobs/copy-all`, {
+      targets, reason: f.reason.value,
+    });
+    $("#copyAllJobsResult").innerHTML = result.results.map(r => r.error
+      ? `<div><span class="bad">✗ ${esc(r.tenant)}</span> — ${esc(r.error)}</div>`
+      : `<div><span class="t">✓</span> ${esc(r.tenant)}：新建 ${(r.created || []).length}，跳过已有 ${(r.skipped || []).length}</div>`
+    ).join("");
+    $("#copyAllJobsResult").hidden = false;
+    render();
+  } catch (e) {
+    $("#copyAllJobsErr").textContent = String(e.message || e);
+    $("#copyAllJobsErr").hidden = false;
+  }
+});
+
 // Copying a job across tenants.
 //
-// At ten tenants, a job that eight of them run is eight identical creations, and a timeout
-// change is eight more. There is no server-side bulk endpoint on purpose: each tenant's job is
-// its own row with its own audit entry and its own reason, and one request per tenant keeps
-// that true — a partial failure leaves the tenants that succeeded correct rather than leaving
-// a half-applied batch nobody can name.
+// This is the narrow, one-job copy flow. The separate copy-all endpoint is transactional per
+// target tenant; this older flow keeps per-target results visible while copying one selected
+// definition to several tenants.
 async function openCopyJob(name) {
   const f = $("#copyJobForm");
   f.reset();
@@ -1689,14 +1779,14 @@ async function openCopyJob(name) {
     // Creating a job into a tenant with no executor is legal and produces an orphan — visible
     // in that tenant's own orphan count, and not something to discover next week.
     const rows = await Promise.all(others.map(async t => {
-      const [jobs, handlers] = await Promise.all([
+      const [jobs, handlerCatalog] = await Promise.all([
         api("GET", `/api/tenants/${encodeURIComponent(t.tenant)}/jobs`).catch(() => []),
-        api("GET", `/api/tenants/${encodeURIComponent(t.tenant)}/handlers`).catch(() => []),
+        api("GET", `/api/tenants/${encodeURIComponent(t.tenant)}/handler-catalog`).catch(() => []),
       ]);
       return {
         tenant: t.tenant,
         has: jobs.some(j => j.job_name === name),
-        served: handlers.includes(source.handler_key),
+        served: handlerCatalog.some(h => h.handler_key === source.handler_key),
       };
     }));
     $("#copyTargets").innerHTML = rows.map(r => `

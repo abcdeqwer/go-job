@@ -51,8 +51,8 @@ the full connection as before.
 
 For an already-provisioned tenant, admission verifies the tenant name and schema UUID before
 applying missing embedded additive migrations. Version 1 is the starting schema; this build
-upgrades it to version 2 and re-verifies admission before starting the engine. A tenant already
-at version 2 performs no DDL, while a schema newer than the binary is refused.
+upgrades it through version 3 and re-verifies admission before starting the engine. A tenant
+already at version 3 performs no DDL, while a schema newer than the binary is refused.
 
 The SQL below is the same thing if you would rather run it yourself.
 
@@ -63,9 +63,10 @@ mysql gojob_control < schema/mysql/control/001_control.sql
 # once per tenant
 mysql np_scheduler < schema/mysql/tenant/001_tenant.sql
 mysql np_scheduler < schema/mysql/tenant/002_execution_retention.sql
+mysql np_scheduler < schema/mysql/tenant/003_handler_descriptions.sql
 mysql -e "INSERT INTO np_scheduler.schema_identity
           (tenant, schema_uuid, schema_version, created_at)
-          VALUES ('np', UUID(), '2', NOW())"
+          VALUES ('np', UUID(), '3', NOW())"
 mysql -N -e "SELECT schema_uuid FROM np_scheduler.schema_identity"   # keep this
 ```
 

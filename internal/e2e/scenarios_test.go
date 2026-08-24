@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,49 @@ func cronJob(name, expr string) gojob.Definition {
 		Enabled: true, Concurrency: gojob.PolicyQueue, Misfire: gojob.MisfireFireOnce,
 		MaxAttempts: 3, MaxRecoveries: 3,
 		Lease: 30 * time.Second, Timeout: 60 * time.Second,
+	}
+}
+
+func TestCopyJobsCreatesMissingAndPreservesExisting(t *testing.T) {
+	h := setup(t)
+	existing := cronJob("existing", "0 0 1 * * *")
+	existing.Description = "target authority"
+	h.createJob(existing, h.clock.Now().Add(time.Hour))
+
+	copiedExisting := cronJob("existing", "0 0 2 * * *")
+	copiedExisting.Description = "must not overwrite"
+	newJob := cronJob("new-job", "0 0 3 * * *")
+	newJob.Description = "copied code description"
+	created, skipped, err := h.store.CopyJobs(context.Background(), []store.JobSeed{
+		{Definition: copiedExisting, NextFire: h.clock.Now().Add(2 * time.Hour)},
+		{Definition: newJob, NextFire: h.clock.Now().Add(3 * time.Hour)},
+	}, "source", "operator", "tenant bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || created[0] != "new-job" || len(skipped) != 1 || skipped[0] != "existing" {
+		t.Fatalf("created=%v skipped=%v, want [new-job] and [existing]", created, skipped)
+	}
+	gotExisting, err := h.store.Job(context.Background(), "existing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotExisting.Description != "target authority" || gotExisting.ScheduleExpr != "0 0 1 * * *" {
+		t.Fatalf("existing target job was overwritten: %+v", gotExisting.Definition)
+	}
+	gotNew, err := h.store.Job(context.Background(), "new-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNew.Description != newJob.Description || gotNew.OpsPaused {
+		t.Fatalf("copied job = %+v paused=%v", gotNew.Definition, gotNew.OpsPaused)
+	}
+	audit, err := h.store.AuditLog(context.Background(), "new-job", "operator", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit) != 1 || !strings.Contains(audit[0].Detail, "copied from tenant source") {
+		t.Fatalf("copy audit = %+v", audit)
 	}
 }
 

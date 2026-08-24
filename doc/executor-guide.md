@@ -163,6 +163,9 @@ Register(executor_id, group, tenant, address, contract_version, revision, capaci
   scheduler's network, not from yours. This is the single most common deployment mistake.
 - `handlers` are the `handler_key` strings you serve. A job's `handler_key` must match one of
   them exactly, or the job is never dispatched to you.
+- `DescribeResponse.handlers` may repeat those keys with an operator-facing description of the
+  compiled code. Keep populating `handler_keys` for rolling compatibility; descriptions are
+  optional metadata and never routing authority.
 - `contract_version` is `"1"`.
 - `capacity` is advisory. Your refusal is what is authoritative.
 - Register **once per tenant** you serve. The scheduler probes back to your address during

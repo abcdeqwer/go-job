@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -444,6 +445,30 @@ func (c *Client) Describe(ctx context.Context, address, tenant string) (*gojobv1
 	}
 	if len(resp.GetHandlerKeys()) == 0 {
 		return nil, fmt.Errorf("%w: %s declares no handlers", ErrContractProbe, address)
+	}
+	keys := make(map[string]bool, len(resp.GetHandlerKeys()))
+	for _, key := range resp.GetHandlerKeys() {
+		if key == "" || keys[key] {
+			return nil, fmt.Errorf("%w: %s declares an empty or duplicate handler key %q",
+				ErrContractProbe, address, key)
+		}
+		keys[key] = true
+	}
+	descriptions := map[string]bool{}
+	for _, h := range resp.GetHandlers() {
+		if h.GetKey() == "" || !keys[h.GetKey()] {
+			return nil, fmt.Errorf("%w: %s describes undeclared handler %q",
+				ErrContractProbe, address, h.GetKey())
+		}
+		if descriptions[h.GetKey()] {
+			return nil, fmt.Errorf("%w: %s describes handler %q more than once",
+				ErrContractProbe, address, h.GetKey())
+		}
+		if utf8.RuneCountInString(h.GetDescription()) > 512 {
+			return nil, fmt.Errorf("%w: %s describes handler %q with more than 512 characters",
+				ErrContractProbe, address, h.GetKey())
+		}
+		descriptions[h.GetKey()] = true
 	}
 
 	// Describe alone is not enough. It is the method an executor is most likely to have

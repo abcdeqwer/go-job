@@ -234,6 +234,8 @@ mysql -h <mysql-host> -u gojob -p gojob_cp \
   < schema/mysql/tenant/001_tenant.sql
 mysql -h <mysql-host> -u gojob -p gojob_cp \
   < schema/mysql/tenant/002_execution_retention.sql
+mysql -h <mysql-host> -u gojob -p gojob_cp \
+  < schema/mysql/tenant/003_handler_descriptions.sql
 ```
 
 Then claim the schema for exactly one tenant. Save the returned `schema_uuid`; tenant admission
@@ -243,7 +245,7 @@ checks it so that a mistyped DSN cannot silently attach another tenant's databas
 INSERT INTO `gojob_cp`.schema_identity
   (lock_row, tenant, schema_uuid, schema_version, created_at)
 VALUES
-  (1, 'cp', UUID(), '2', NOW());
+  (1, 'cp', UUID(), '3', NOW());
 
 SELECT tenant, schema_uuid, schema_version, created_at
 FROM `gojob_cp`.schema_identity

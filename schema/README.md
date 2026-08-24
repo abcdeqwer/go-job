@@ -22,18 +22,20 @@ mysql gojob_control < control/001_control.sql
 ```sh
 mysql np_scheduler < tenant/001_tenant.sql
 mysql np_scheduler < tenant/002_execution_retention.sql
+mysql np_scheduler < tenant/003_handler_descriptions.sql
 
 # then give the schema its identity — the registry will refuse a DSN whose schema
 # does not present exactly this
 INSERT INTO np_scheduler.schema_identity
     (lock_row, tenant, schema_uuid, schema_version, created_at)
-VALUES (1, 'np', UUID(), '2', NOW());
+VALUES (1, 'np', UUID(), '3', NOW());
 ```
 
-For an existing version 1 tenant, starting this binary applies
-`002_execution_retention.sql`, verifies version 2, and then admits the tenant. If the index DDL
-committed but the process stopped before the version row advanced, the next admission verifies
-the exact index definition and resumes. Applying the file manually remains supported.
+For an existing version 1 or 2 tenant, starting this binary applies every missing ordered
+migration through `003_handler_descriptions.sql`, verifies version 3, and then admits the tenant.
+If additive DDL committed but the process stopped before the version row advanced, the next
+admission verifies the exact index/column definition and resumes. Applying the files manually
+remains supported.
 
 Record that `schema_uuid` in the tenant's `tenant_registry` row. Admission checks identity
 before version, which is what stops a mistyped DSN from adopting another tenant's schema, an
