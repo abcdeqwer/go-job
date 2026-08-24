@@ -326,6 +326,43 @@ func (s *Store) SetIdentityDisabled(ctx context.Context, identity, tenant string
 	})
 }
 
+// DeleteIdentity permanently removes a revoked executor credential.
+//
+// Requiring revocation as a separate first step makes an active credential impossible to
+// erase with one mistaken click. As with revocation, deletion prevents future registration;
+// it does not attempt to interrupt a handler that is already running.
+func (s *Store) DeleteIdentity(ctx context.Context, identity, tenant, actor, reason string) error {
+	if identity == "" || tenant == "" {
+		return fmt.Errorf("%w: deleting an identity needs a name and a tenant", gojob.ErrProtocol)
+	}
+	if reason == "" {
+		return fmt.Errorf("%w: deleting an executor identity needs a reason", gojob.ErrProtocol)
+	}
+	now := s.clock.Now()
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		var disabled bool
+		err := tx.QueryRowContext(ctx, `
+			SELECT disabled FROM executor_identity
+			WHERE identity = ? AND tenant = ? FOR UPDATE`, identity, tenant).Scan(&disabled)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: identity %q does not exist for %q",
+				gojob.ErrProtocol, identity, tenant)
+		}
+		if err != nil {
+			return fmt.Errorf("read identity %q for deletion: %w", identity, err)
+		}
+		if !disabled {
+			return fmt.Errorf("%w: revoke identity %q for %q before deleting it",
+				gojob.ErrProtocol, identity, tenant)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM executor_identity WHERE identity = ? AND tenant = ?`, identity, tenant); err != nil {
+			return fmt.Errorf("delete identity %q for %q: %w", identity, tenant, err)
+		}
+		return audit(ctx, tx, now, actor, "executor_deleted", tenant, reason+" ("+identity+")")
+	})
+}
+
 // AddTenant registers a new site.
 func (s *Store) AddTenant(ctx context.Context, name, dsn, schemaUUID, actor, reason string) error {
 	if reason == "" {

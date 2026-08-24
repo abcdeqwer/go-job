@@ -288,7 +288,8 @@ CREATE TABLE executor_identity (
     KEY idx_executor_identity_token (token_sha256)
 );
 
--- Actions on the registry itself: adding, disabling or re-pointing a tenant.
+-- Actions on the registry itself: adding, disabling or re-pointing a tenant, and managing
+-- executor identities. Identity deletion is audited in the same transaction as the delete.
 -- Per-job actions are audited in that tenant's own schema.
 CREATE TABLE control_audit (
     id         BIGINT       NOT NULL AUTO_INCREMENT,

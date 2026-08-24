@@ -142,6 +142,7 @@ func (a *API) Handler() http.Handler {
 	a.read(mux, "GET /api/executor-identities", a.listIdentities)
 	a.write(mux, "POST /api/executor-identities", a.addIdentity)
 	a.write(mux, "PATCH /api/executor-identities", a.setIdentityDisabled)
+	a.write(mux, "DELETE /api/executor-identities", a.deleteIdentity)
 
 	mux.Handle("/", a.ui())
 	return mux
@@ -287,6 +288,22 @@ func (a *API) setIdentityDisabled(w http.ResponseWriter, r *http.Request) error 
 		return badRequest("disabled is required")
 	}
 	return a.control.SetIdentityDisabled(r.Context(), body.Identity, body.Tenant, *body.Disabled,
+		ActorFrom(r.Context()), body.Reason)
+}
+
+func (a *API) deleteIdentity(w http.ResponseWriter, r *http.Request) error {
+	var body struct {
+		Identity string `json:"identity"`
+		Tenant   string `json:"tenant"`
+		Reason   string `json:"reason"`
+	}
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	return a.control.DeleteIdentity(r.Context(), body.Identity, body.Tenant,
 		ActorFrom(r.Context()), body.Reason)
 }
 

@@ -146,6 +146,11 @@ GET    /api/tenants/{tenant}/quiescence                per-instance observed gen
 GET    /api/tenants/{tenant}/handlers                  handler_keys live executors declare
 GET    /api/tenants/{tenant}/handler-catalog           keys plus code-supplied descriptions
 
+GET    /api/executor-identities                        installation-wide credentials
+POST   /api/executor-identities                        authorise; token is returned once
+PATCH  /api/executor-identities                        revoke or restore; body includes reason
+DELETE /api/executor-identities                        delete a revoked credential; body includes reason
+
 GET    /api/tenants/{tenant}/jobs                      list with effective state
 POST   /api/tenants/{tenant}/jobs                      create: handler_key, schedule, params
 POST   /api/tenants/{tenant}/jobs/copy-all             copy non-retired definitions to targets

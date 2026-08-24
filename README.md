@@ -357,7 +357,7 @@ Open `http://host:8080`. There is nothing more to configure on the command line.
 | --- | --- |
 | **First administrator** | The page offers it when no account exists yet. Twelve characters minimum. It refuses once an account exists, so this is not an open door. |
 | **Add a tenant** | 租户 → 添加租户. Enter host, database, user, password; **test the connection**; if the database is empty it offers to create the tables. Then save. |
-| **Authorise an executor** | 凭证 → 授权执行器. mTLS by certificate subject, or a generated token shown **once**. Nothing registers without a row here. |
+| **Authorise an executor** | 凭证 → 授权执行器. mTLS by certificate subject, or a generated token shown **once**. Nothing registers without a row here; revoke before permanently deleting one. |
 | **Create jobs** | jobs → new job. Every field carries an explanation, and the schedule shows the next five fire instants as you type. |
 
 The tenant appears in the picker within one registry poll (10s by default) — no restart.

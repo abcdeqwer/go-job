@@ -265,7 +265,7 @@ func TestDeepLinkServesTheUI(t *testing.T) {
 	}
 }
 
-func TestUIOffersCopyAllAndHandlerDescriptionAutofill(t *testing.T) {
+func TestUIOffersCopyAllHandlerDescriptionsAndIdentityDeletion(t *testing.T) {
 	a := &API{}
 	rec := httptest.NewRecorder()
 	a.ui().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -275,6 +275,8 @@ func TestUIOffersCopyAllAndHandlerDescriptionAutofill(t *testing.T) {
 		`/jobs/copy-all`,
 		`/handler-catalog`,
 		`function applyHandlerDescription()`,
+		`data-act="delete"`,
+		`api("DELETE", "/api/executor-identities"`,
 	} {
 		if !strings.Contains(body, marker) {
 			t.Errorf("admin UI is missing %q", marker)

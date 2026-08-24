@@ -129,7 +129,7 @@ disabled = 1` is an immediate revocation.
 Skip this only if executors reach the gRPC port over a network you fully control **and** you
 accept that anything reaching that port can register for any tenant.
 
-**Do this in the UI** — the 凭证 tab issues and revokes credentials, and for a token it
+**Do this in the UI** — the 凭证 tab issues, revokes and deletes credentials, and for a token it
 generates the value, shows it once, and stores only its SHA-256. The SQL below is the same
 thing if you would rather script it.
 
@@ -169,6 +169,11 @@ The token itself is never stored. Lost it? Issue a new one and update the hash.
 - `executor_group` — empty means any group. Naming one is what stops a canary in a partial
   rollout registering as `main` and silently taking production traffic.
 - `disabled` — flip to 1 to revoke.
+
+Permanent deletion is deliberately a two-step action: revoke the identity first, then use
+**删除** and provide an audit reason. Deletion removes the authorization row and stored token
+hash, so restoring it requires issuing a new credential. Neither revocation nor deletion
+interrupts a handler that is already running.
 
 An identity with no row is refused. There is deliberately no "empty table means allow
 everything" mode: in an mTLS installation that would let any certificate the CA ever signed

@@ -1468,14 +1468,28 @@ async function renderIdentities() {
       when(i.created_at),
       state.role === "OPERATOR"
         ? `<button data-act="${i.disabled ? "restore" : "revoke"}" data-id="${esc(i.identity)}" data-tenant="${esc(i.tenant)}">${i.disabled ? "恢复" : "吊销"}</button>`
+          + (i.disabled
+            ? ` <button class="danger" data-act="delete" data-id="${esc(i.identity)}" data-tenant="${esc(i.tenant)}">删除</button>`
+            : "")
         : "",
     ]));
 
   $("#body").onclick = async ev => {
     const b = ev.target.closest("button[data-act]");
     if (!b) return;
-    const revoke = b.dataset.act === "revoke";
+    const act = b.dataset.act;
     try {
+      if (act === "delete") {
+        const reason = await ask(
+          `永久删除 ${b.dataset.id} @ ${b.dataset.tenant}？`,
+          "删除后这条授权与 token 哈希无法恢复；如需再次使用，必须重新授权并签发凭证。已经在跑的 handler 不会被中止。");
+        if (reason === null) return;
+        await api("DELETE", "/api/executor-identities",
+          { identity: b.dataset.id, tenant: b.dataset.tenant, reason });
+        render();
+        return;
+      }
+      const revoke = act === "revoke";
       const reason = await ask(
         `${revoke ? "吊销" : "恢复"} ${b.dataset.id} @ ${b.dataset.tenant}？`,
         revoke

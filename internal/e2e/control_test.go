@@ -577,6 +577,63 @@ func TestExecutorIdentityLifecycle(t *testing.T) {
 	if err := auth.Authorize(ctx, server.Identity{Subject: "report-worker"}, "np", "", false); err == nil {
 		t.Fatal("a revoked identity is still authorised")
 	}
+	apiAuth := admin.NewAuth(db, clock, time.Hour, admin.TrustedHeader{
+		Enabled: true, UserHeader: "X-Admin-User", RoleHeader: "X-Admin-Role",
+	}, false)
+	api := admin.New(admin.Config{Clock: clock}, nil, ctl, alwaysHealthy{}, apiAuth, discardLogger())
+	req := httptest.NewRequest(http.MethodDelete, "/api/executor-identities", stringReader(
+		`{"identity":"report-worker","tenant":"np","reason":"remove old credential"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-User", "admin")
+	req.Header.Set("X-Admin-Role", "OPERATOR")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete identity API returned %d: %s", rec.Code, rec.Body.String())
+	}
+	var remaining int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM executor_identity
+		WHERE identity = 'report-worker' AND tenant = 'np'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("deleted identity still has %d rows", remaining)
+	}
+	var detail string
+	if err := db.QueryRowContext(ctx, `
+		SELECT detail FROM control_audit
+		WHERE action = 'executor_deleted' AND tenant = 'np'
+		ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "remove old credential") || !strings.Contains(detail, "report-worker") {
+		t.Fatalf("delete audit detail = %q", detail)
+	}
+}
+
+func TestExecutorIdentityMustBeRevokedBeforeDeletion(t *testing.T) {
+	db, clock := controlDB(t)
+	ctx := context.Background()
+	ctl, err := control.New(db, clock, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.AddIdentity(ctx, "active-worker", "cp", "", "", "admin", "add it"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.DeleteIdentity(ctx, "active-worker", "cp", "admin", "mistaken cleanup"); err == nil || !errors.Is(err, gojob.ErrProtocol) {
+		t.Fatalf("deleting an active identity returned %v, want protocol refusal", err)
+	}
+	var remaining int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM executor_identity
+		WHERE identity = 'active-worker' AND tenant = 'cp'`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("active identity has %d rows after refused deletion, want 1", remaining)
+	}
 }
 
 // The DSN encryption key is optional, and every combination has to behave.
