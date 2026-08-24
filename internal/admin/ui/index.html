@@ -323,6 +323,30 @@
   </form>
 </dialog>
 
+<dialog id="descriptionSyncDlg" class="wide">
+  <form method="dialog" id="descriptionSyncForm">
+    <div class="dlg-head">
+      <h3>同步任务中文作用说明</h3>
+      <p>说明来自当前在线执行器声明的 handler catalog。提交时只修改未退役任务的
+         <code>description</code>；任务名、调度时间、启停状态、策略和参数都不会改。</p>
+    </div>
+    <div class="dlg-body">
+      <div id="descriptionSyncPreview" class="preview">读取说明差异…</div>
+      <div class="f" style="margin-top:14px">
+        <label>reason</label>
+        <input name="reason" required placeholder="为什么批量同步任务说明">
+        <span class="hint">每个发生变化的任务都会留下独立审计记录。</span>
+      </div>
+      <div class="err" id="descriptionSyncErr" hidden></div>
+      <div id="descriptionSyncResult" class="preview" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" formnovalidate>取消</button>
+      <button class="primary" value="ok" id="descriptionSyncGo" disabled>同步 description</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="tenantEditDlg">
   <form method="dialog" id="tenantEditForm">
     <div class="dlg-head">
@@ -643,8 +667,11 @@
         </div>
         <div class="f" style="margin-top:14px">
           <label>description</label>
-          <input name="description" placeholder="这个任务是干什么的">
-          <span class="hint">写给凌晨三点来看这个列表的人。</span>
+          <div class="row">
+            <input name="description" placeholder="这个任务是干什么的" style="flex:1">
+            <button type="button" id="useHandlerDescription">使用 handler 说明</button>
+          </div>
+          <span class="hint" id="handlerDescriptionHint">写给凌晨三点来看这个列表的人；自动说明来自当前在线执行器。</span>
         </div>
         <div class="f" style="margin-top:14px">
           <label>reason</label>
@@ -854,13 +881,16 @@ async function renderJobs(t) {
 
   $("#controls").innerHTML = (operator()
     ? `<button class="primary" id="newJob">new job</button> `
-      + `<button id="copyAllJobs">复制全部任务到…</button> ` : "")
+      + `<button id="copyAllJobs">复制全部任务到…</button> `
+      + `<button id="syncDescriptions">批量同步中文说明</button> ` : "")
     + `<span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`
     + (unused.length ? ` <span class="dim">·</span> <button id="showUnused">${unused.length} 个 handler 还没有任务</button>` : "");
   const nj = $("#newJob");
   if (nj) nj.onclick = () => openJob(null);
   const copyAll = $("#copyAllJobs");
   if (copyAll) copyAll.onclick = openCopyAllJobs;
+  const syncDescriptions = $("#syncDescriptions");
+  if (syncDescriptions) syncDescriptions.onclick = openDescriptionSync;
   const su = $("#showUnused");
   if (su) su.onclick = () => {
     const box = $("#unusedBox");
@@ -1638,19 +1668,33 @@ $("#cronPreset").onchange = ev => {
 $("#jobForm").schedule_expr.addEventListener("input", schedulePreview);
 $("#jobForm").schedule_kind.addEventListener("change", () => { fillPresets(); previewNow(); });
 
-function applyHandlerDescription() {
+function handlerDescriptionFor(key) {
+  const metadata = (state.handlerCatalog || []).find(h => h.handler_key === key);
+  return metadata ? metadata.description || "" : "";
+}
+
+function updateHandlerDescriptionAction() {
   const f = $("#jobForm");
-  if (f.dataset.editing) return;
-  const metadata = (state.handlerCatalog || []).find(h => h.handler_key === f.handler_key.value);
-  const next = metadata ? metadata.description || "" : "";
+  const available = !!handlerDescriptionFor(f.handler_key.value);
+  $("#useHandlerDescription").disabled = !available;
+  $("#handlerDescriptionHint").textContent = available
+    ? "已找到当前在线执行器声明的作用说明；可自动带出，也可手工修改。"
+    : "当前在线执行器没有为这个 handler 提供说明，不会根据名字猜测。";
+}
+
+function applyHandlerDescription(force = false) {
+  const f = $("#jobForm");
+  const next = handlerDescriptionFor(f.handler_key.value);
   const previous = f.dataset.autoDescription || "";
-  if (!f.description.value || f.description.value === previous) {
+  if (force || (!f.dataset.editing && (!f.description.value || f.description.value === previous))) {
     f.description.value = next;
   }
   f.dataset.autoDescription = next;
+  updateHandlerDescriptionAction();
 }
-$("#jobForm").handler_key.addEventListener("input", applyHandlerDescription);
-$("#jobForm").handler_key.addEventListener("change", applyHandlerDescription);
+$("#jobForm").handler_key.addEventListener("input", () => applyHandlerDescription());
+$("#jobForm").handler_key.addEventListener("change", () => applyHandlerDescription());
+$("#useHandlerDescription").onclick = () => applyHandlerDescription(true);
 
 function openJob(name, handlerKey) {
   const f = $("#jobForm");
@@ -1661,7 +1705,7 @@ function openJob(name, handlerKey) {
   f.dataset.version = "";
   f.dataset.autoDescription = "";
 
-  const show = () => { fillPresets(); previewNow(); $("#jobDlg").showModal(); };
+  const show = () => { fillPresets(); previewNow(); updateHandlerDescriptionAction(); $("#jobDlg").showModal(); };
   if (!name) {
     f.job_name.disabled = false;
     if (handlerKey) {
@@ -1747,6 +1791,66 @@ function openCopyAllJobs() {
     : '<span class="dim">没有其他已接纳的租户。</span>';
   $("#copyAllJobsDlg").showModal();
 }
+
+function descriptionSyncRows(result) {
+  const changes = result.changes || [];
+  const missing = result.missing || [];
+  let html = `<div><b>${changes.length}</b> 个任务需要更新，`
+    + `${result.unchanged || 0} 个已经一致，${missing.length} 个没有在线 handler 说明。</div>`;
+  if (changes.length) {
+    html += `<div style="max-height:360px;overflow:auto;margin-top:12px">`
+      + changes.map(c => `<div style="padding:9px 0;border-top:1px solid var(--line)">`
+          + `<b>${esc(c.job_name)}</b> <code>${esc(c.handler_key)}</code>`
+          + `<div class="dim">原：${esc(c.before || "（空）")}</div>`
+          + `<div>新：${esc(c.after)}</div></div>`).join("") + `</div>`;
+  }
+  if (missing.length) {
+    html += `<div class="dim" style="margin-top:10px">不会修改：${missing.map(esc).join("、")}</div>`;
+  }
+  return html;
+}
+
+async function openDescriptionSync() {
+  const f = $("#descriptionSyncForm");
+  f.reset();
+  $("#descriptionSyncErr").hidden = true;
+  $("#descriptionSyncResult").hidden = true;
+  $("#descriptionSyncGo").disabled = true;
+  $("#descriptionSyncPreview").textContent = "读取说明差异…";
+  $("#descriptionSyncDlg").showModal();
+  try {
+    const tenant = encodeURIComponent(state.tenant);
+    const result = await api("GET", `/api/tenants/${tenant}/jobs/description-sync`);
+    $("#descriptionSyncPreview").innerHTML = descriptionSyncRows(result);
+    $("#descriptionSyncGo").disabled = !(result.changes || []).length;
+  } catch (e) {
+    $("#descriptionSyncErr").textContent = String(e.message || e);
+    $("#descriptionSyncErr").hidden = false;
+  }
+}
+
+$("#descriptionSyncForm").addEventListener("submit", async ev => {
+  const f = ev.target;
+  if (ev.submitter && ev.submitter.value === "cancel") return;
+  ev.preventDefault();
+  $("#descriptionSyncErr").hidden = true;
+  $("#descriptionSyncGo").disabled = true;
+  try {
+    const tenant = encodeURIComponent(state.tenant);
+    const result = await api("POST", `/api/tenants/${tenant}/jobs/description-sync`, {
+      reason: f.reason.value,
+    });
+    $("#descriptionSyncResult").innerHTML = `<span class="t">✓</span> 已更新 `
+      + `${(result.changes || []).length} 个任务；其他字段未改。`;
+    $("#descriptionSyncResult").hidden = false;
+    $("#descriptionSyncPreview").innerHTML = descriptionSyncRows(result);
+    render();
+  } catch (e) {
+    $("#descriptionSyncErr").textContent = String(e.message || e);
+    $("#descriptionSyncErr").hidden = false;
+    $("#descriptionSyncGo").disabled = false;
+  }
+});
 
 function copyTargetChanged(container, button, error) {
   $(button).disabled = !document.querySelector(`${container} input[type=checkbox]:checked`);

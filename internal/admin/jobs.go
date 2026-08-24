@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -380,6 +381,70 @@ func (a *API) copyAllJobs(w http.ResponseWriter, r *http.Request) error {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"source": source, "available": len(seeds), "results": results,
 	})
+	return nil
+}
+
+func (a *API) liveHandlerDescriptions(ctx context.Context, st *store.Store) (map[string]string, error) {
+	metadata, err := st.DeclaredHandlerMetadata(ctx, a.cfg.ExecutorLiveness)
+	if err != nil {
+		return nil, err
+	}
+	descriptions := make(map[string]string, len(metadata))
+	for _, handler := range metadata {
+		if handler.Description != "" {
+			descriptions[handler.Key] = handler.Description
+		}
+	}
+	return descriptions, nil
+}
+
+// previewJobDescriptionSync is deliberately read-only. The operator sees every replacement and
+// every job without live metadata before the write-shaped endpoint becomes relevant.
+func (a *API) previewJobDescriptionSync(w http.ResponseWriter, r *http.Request) error {
+	st, _, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	descriptions, err := a.liveHandlerDescriptions(r.Context(), st)
+	if err != nil {
+		return err
+	}
+	result, err := st.PlanJobDescriptionSync(r.Context(), descriptions)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, result)
+	return nil
+}
+
+type syncJobDescriptionsBody struct {
+	Reason string `json:"reason"`
+}
+
+func (a *API) syncJobDescriptions(w http.ResponseWriter, r *http.Request) error {
+	st, tenant, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	var body syncJobDescriptionsBody
+	if err := decode(r, &body); err != nil {
+		return err
+	}
+	if err := requireReason(body.Reason); err != nil {
+		return err
+	}
+	descriptions, err := a.liveHandlerDescriptions(r.Context(), st)
+	if err != nil {
+		return err
+	}
+	actor := ActorFrom(r.Context())
+	result, err := st.SyncJobDescriptions(r.Context(), descriptions, actor, body.Reason)
+	if err != nil {
+		return err
+	}
+	a.log.Info("job descriptions synced", "tenant", tenant, "actor", actor,
+		"changed", len(result.Changes), "missing", len(result.Missing), "unchanged", result.Unchanged)
+	writeJSON(w, http.StatusOK, result)
 	return nil
 }
 

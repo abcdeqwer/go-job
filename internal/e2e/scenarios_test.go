@@ -67,6 +67,65 @@ func TestCopyJobsCreatesMissingAndPreservesExisting(t *testing.T) {
 	}
 }
 
+func TestSyncJobDescriptionsChangesOnlyDescriptions(t *testing.T) {
+	h := setup(t)
+	first := cronJob("first", "0 0 1 * * *")
+	first.Description = "old"
+	second := cronJob("second", "0 0 2 * * *")
+	second.HandlerKey = "missing.handler"
+	second.Description = "keep"
+	h.createJob(first, h.clock.Now().Add(time.Hour))
+	h.createJob(second, h.clock.Now().Add(2*time.Hour))
+
+	before, err := h.store.Job(context.Background(), "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := h.store.SyncJobDescriptions(context.Background(), map[string]string{
+		"test.handler": "中文作用说明",
+	}, "operator", "publish handler descriptions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, missing := result.Changes, result.Missing
+	if len(changes) != 1 || changes[0].JobName != "first" || changes[0].Before != "old" ||
+		changes[0].After != "中文作用说明" {
+		t.Fatalf("changes = %+v", changes)
+	}
+	if len(missing) != 1 || missing[0] != "second" {
+		t.Fatalf("missing = %v, want [second]", missing)
+	}
+
+	after, err := h.store.Job(context.Background(), "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Description != "中文作用说明" || after.Version != before.Version+1 {
+		t.Fatalf("description/version = %q/%d, want 中文作用说明/%d",
+			after.Description, after.Version, before.Version+1)
+	}
+	if after.HandlerKey != before.HandlerKey || after.ScheduleExpr != before.ScheduleExpr ||
+		after.Enabled != before.Enabled || string(after.Params) != string(before.Params) ||
+		after.OpsPaused != before.OpsPaused {
+		t.Fatalf("sync changed non-description fields: before=%+v after=%+v", before, after)
+	}
+	unchanged, err := h.store.Job(context.Background(), "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Description != "keep" || unchanged.Version != 1 {
+		t.Fatalf("job without metadata changed: %+v", unchanged)
+	}
+	audit, err := h.store.AuditLog(context.Background(), "first", "operator", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit) != 1 || audit[0].Action != "job_description_synced" ||
+		!strings.Contains(audit[0].Detail, "publish handler descriptions") {
+		t.Fatalf("audit = %+v", audit)
+	}
+}
+
 // The whole path: a due state row becomes an execution, is claimed, dispatched over gRPC,
 // run by a real handler, reported back, and lands as success with one attempt recorded.
 func TestHappyPath(t *testing.T) {

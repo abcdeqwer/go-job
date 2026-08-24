@@ -278,7 +278,11 @@ func TestUIOffersCopyAllHandlerDescriptionsAndIdentityDeletion(t *testing.T) {
 		`id="copyAllJobsGo" disabled`,
 		`function copyTargetChanged(`,
 		`/handler-catalog`,
-		`function applyHandlerDescription()`,
+		`function applyHandlerDescription(`,
+		`id="useHandlerDescription"`,
+		`id="syncDescriptions"`,
+		`/jobs/description-sync`,
+		`function openDescriptionSync()`,
 		`data-act="delete"`,
 		`api("DELETE", "/api/executor-identities"`,
 	} {

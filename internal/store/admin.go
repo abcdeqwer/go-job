@@ -284,6 +284,149 @@ func (s *Store) UpdateJob(ctx context.Context, d gojob.Definition, expectVersion
 	})
 }
 
+// JobDescriptionChange is one operator-visible description replacement. The handler key is
+// included so the preview shows exactly which live code declaration supplies the new text.
+type JobDescriptionChange struct {
+	JobName    string `json:"job_name"`
+	HandlerKey string `json:"handler_key"`
+	Before     string `json:"before"`
+	After      string `json:"after"`
+}
+
+// JobDescriptionSync is both the preview and execution result for a description-only sync.
+// Retired jobs are outside the operation: the jobs screen and copy flow both define the active
+// catalogue as non-retired definitions.
+type JobDescriptionSync struct {
+	Changes   []JobDescriptionChange `json:"changes"`
+	Missing   []string               `json:"missing"`
+	Unchanged int                    `json:"unchanged"`
+}
+
+// PlanJobDescriptionSync compares current definitions with descriptions declared by live
+// executors. An empty/missing declaration is reported rather than used to erase operator text.
+func (s *Store) PlanJobDescriptionSync(ctx context.Context, descriptions map[string]string) (JobDescriptionSync, error) {
+	jobs, err := s.Jobs(ctx)
+	if err != nil {
+		return JobDescriptionSync{}, err
+	}
+	return descriptionSyncPlan(jobs, descriptions), nil
+}
+
+func descriptionSyncPlan(jobs []JobView, descriptions map[string]string) JobDescriptionSync {
+	result := JobDescriptionSync{
+		Changes: []JobDescriptionChange{},
+		Missing: []string{},
+	}
+	for _, job := range jobs {
+		if job.Retired {
+			continue
+		}
+		next := descriptions[job.HandlerKey]
+		if next == "" {
+			result.Missing = append(result.Missing, job.JobName)
+			continue
+		}
+		if job.Description == next {
+			result.Unchanged++
+			continue
+		}
+		result.Changes = append(result.Changes, JobDescriptionChange{
+			JobName: job.JobName, HandlerKey: job.HandlerKey,
+			Before: job.Description, After: next,
+		})
+	}
+	return result
+}
+
+// SyncJobDescriptions changes only job_definition.description plus the mandatory optimistic
+// version/audit metadata. Schedules, enabled state, policies, parameters and job_state are not
+// selected or assigned by this transaction, so they cannot be accidentally rewritten from a
+// stale browser snapshot.
+func (s *Store) SyncJobDescriptions(ctx context.Context, descriptions map[string]string,
+	actor, reason string) (JobDescriptionSync, error) {
+	if actor == "" || reason == "" {
+		return JobDescriptionSync{}, fmt.Errorf("%w: syncing job descriptions needs an actor and a reason", gojob.ErrProtocol)
+	}
+	for key, description := range descriptions {
+		if len(description) > 512 {
+			return JobDescriptionSync{}, fmt.Errorf("%w: handler %q description exceeds 512 characters", gojob.ErrProtocol, key)
+		}
+	}
+
+	now := s.clock.Now()
+	result := JobDescriptionSync{Changes: []JobDescriptionChange{}, Missing: []string{}}
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT job_name, handler_key, retired, COALESCE(description, ''), version
+			FROM job_definition
+			ORDER BY job_name
+			FOR UPDATE`)
+		if err != nil {
+			return fmt.Errorf("lock job descriptions: %w", err)
+		}
+		type row struct {
+			name, handler, description string
+			retired                    bool
+			version                    int64
+		}
+		var jobs []row
+		for rows.Next() {
+			var job row
+			if err := rows.Scan(&job.name, &job.handler, &job.retired, &job.description, &job.version); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan locked job description: %w", err)
+			}
+			jobs = append(jobs, job)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate locked job descriptions: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+
+		for _, job := range jobs {
+			if job.retired {
+				continue
+			}
+			next := descriptions[job.handler]
+			if next == "" {
+				result.Missing = append(result.Missing, job.name)
+				continue
+			}
+			if job.description == next {
+				result.Unchanged++
+				continue
+			}
+			res, err := tx.ExecContext(ctx, `
+				UPDATE job_definition
+				SET description = ?, version = version + 1, updated_by = ?, updated_at = ?
+				WHERE job_name = ? AND version = ?`,
+				next, actor, now, job.name, job.version)
+			if err != nil {
+				return fmt.Errorf("sync description for job %q: %w", job.name, err)
+			}
+			if err := assertOne(res, "sync job description"); err != nil {
+				return err
+			}
+			if err := audit(ctx, tx, now, actor, "job_description_synced", job.name, "",
+				fmt.Sprintf("%s (handler=%s)", reason, job.handler)); err != nil {
+				return err
+			}
+			result.Changes = append(result.Changes, JobDescriptionChange{
+				JobName: job.name, HandlerKey: job.handler,
+				Before: job.description, After: next,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return JobDescriptionSync{}, err
+	}
+	return result, nil
+}
+
 // ErrStaleVersion means an edit was made against a version the job no longer holds.
 var ErrStaleVersion = errors.New("gojob: job was modified by someone else")
 

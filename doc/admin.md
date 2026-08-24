@@ -154,6 +154,8 @@ DELETE /api/executor-identities                        delete a revoked credenti
 GET    /api/tenants/{tenant}/jobs                      list with effective state
 POST   /api/tenants/{tenant}/jobs                      create: handler_key, schedule, params
 POST   /api/tenants/{tenant}/jobs/copy-all             copy non-retired definitions to targets
+GET    /api/tenants/{tenant}/jobs/description-sync     preview catalog description changes
+POST   /api/tenants/{tenant}/jobs/description-sync     apply preview; body: {reason}
 GET    /api/tenants/{tenant}/jobs/{name}               detail, configuration, conditions
 PATCH  /api/tenants/{tenant}/jobs/{name}               edit; requires If-Match: <version>
 POST   /api/tenants/{tenant}/jobs/{name}/pause         body: {reason}
@@ -187,7 +189,14 @@ orphan until an executor declares it.
 
 `GET /handler-catalog` adds the optional operator description supplied by the compiled
 executor. Selecting a known handler on the create form copies that description into the job;
-the operator can still edit it before saving. Routing never reads the description.
+the operator can still edit it before saving, or explicitly restore the current handler
+description while editing. Routing never reads the description.
+
+The description-sync preview compares every non-retired job with the freshest live executor's
+catalog entry and lists the exact before/after text. Applying it updates only `description` plus
+the required definition version, actor/timestamp and per-job audit record. It never rewrites the
+job name, handler key, schedule, enabled/paused state, policies or parameters. A handler with no
+live non-empty description is reported and skipped rather than erasing existing operator text.
 
 A job may also name a required executor **group**, which is what distinguishes two groups
 declaring the same handler — a partial rollout, or two configurations of one service. A job
