@@ -273,6 +273,10 @@ func TestUIOffersCopyAllHandlerDescriptionsAndIdentityDeletion(t *testing.T) {
 	for _, marker := range []string{
 		`id="copyAllJobs"`,
 		`/jobs/copy-all`,
+		`.copy-target input[type="checkbox"] { width:auto`,
+		`id="copyJobGo" disabled`,
+		`id="copyAllJobsGo" disabled`,
+		`function copyTargetChanged(`,
 		`/handler-catalog`,
 		`function applyHandlerDescription()`,
 		`data-act="delete"`,
@@ -281,6 +285,9 @@ func TestUIOffersCopyAllHandlerDescriptionsAndIdentityDeletion(t *testing.T) {
 		if !strings.Contains(body, marker) {
 			t.Errorf("admin UI is missing %q", marker)
 		}
+	}
+	if got := strings.Count(body, `<label class="copy-target">`); got != 2 {
+		t.Fatalf("copy target row is used %d times, want both single-job and copy-all dialogs", got)
 	}
 }
 

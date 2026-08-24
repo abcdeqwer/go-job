@@ -76,6 +76,9 @@
   button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink);
                    font-weight:550; }
   button.primary:hover { filter:brightness(1.08); background:var(--accent); }
+  button:disabled { cursor:not-allowed; opacity:.5; filter:none; }
+  button:disabled:hover { background:var(--bg); }
+  button.primary:disabled:hover { background:var(--accent); filter:none; }
   button.danger { color:var(--bad); border-color:var(--line); }
   button.danger:hover { border-color:var(--bad); }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
@@ -162,6 +165,16 @@
              color:var(--dim); min-height:1.7em; }
   .preview .t { color:var(--text); }
   .preview .bad { color:var(--bad); }
+  /* Tenant choices are one control, not a full-width form input followed by a detached name.
+     The generic `form input { width:100% }` rule is right for text fields but made a checkbox
+     consume the whole row, forcing its label onto the next line. Keep the whole option clickable
+     while the checkbox itself stays at its native size. */
+  .copy-target { display:flex; align-items:center; gap:9px; width:100%; margin:6px 0;
+                 padding:8px 10px; border:1px solid var(--line-soft);
+                 border-radius:var(--radius); cursor:pointer; }
+  .copy-target:hover { background:var(--raised); border-color:var(--line); }
+  form .copy-target input[type="checkbox"] { width:auto; flex:0 0 auto; margin:0; }
+  .copy-target b { min-width:8ch; }
   .f input, .f select, .f textarea { width:100%; }
   label { display:block; }
   /* Scoped to forms. A blanket width:100% also hit the tenant picker in the header, which
@@ -282,7 +295,7 @@
     </div>
     <div class="dlg-foot">
       <button value="cancel" formnovalidate>取消</button>
-      <button class="primary" value="ok" id="copyJobGo">创建</button>
+      <button class="primary" value="ok" id="copyJobGo" disabled>创建</button>
     </div>
   </form>
 </dialog>
@@ -305,7 +318,7 @@
     </div>
     <div class="dlg-foot">
       <button value="cancel" formnovalidate>取消</button>
-      <button class="primary" value="ok">复制</button>
+      <button class="primary" value="ok" id="copyAllJobsGo" disabled>复制</button>
     </div>
   </form>
 </dialog>
@@ -1723,16 +1736,26 @@ function openCopyAllJobs() {
   f.reset();
   $("#copyAllJobsErr").hidden = true;
   $("#copyAllJobsResult").hidden = true;
+  $("#copyAllJobsGo").disabled = true;
   const others = (state.tenants || []).filter(t => t.tenant !== state.tenant && t.admitted);
   const count = (state.jobs || []).filter(j => !j.retired).length;
   $("#copyAllTargets").innerHTML = others.length
     ? `<div class="dim" style="margin-bottom:8px">当前有 ${count} 个未退役任务可复制。</div>`
-      + others.map(t => `<label class="row" style="margin:6px 0;gap:8px">`
+      + others.map(t => `<label class="copy-target">`
           + `<input type="checkbox" data-tenant="${esc(t.tenant)}">`
           + `<b>${esc(t.tenant)}</b></label>`).join("")
     : '<span class="dim">没有其他已接纳的租户。</span>';
   $("#copyAllJobsDlg").showModal();
 }
+
+function copyTargetChanged(container, button, error) {
+  $(button).disabled = !document.querySelector(`${container} input[type=checkbox]:checked`);
+  if (!$(button).disabled) $(error).hidden = true;
+}
+$("#copyAllTargets").addEventListener("change", () =>
+  copyTargetChanged("#copyAllTargets", "#copyAllJobsGo", "#copyAllJobsErr"));
+$("#copyTargets").addEventListener("change", () =>
+  copyTargetChanged("#copyTargets", "#copyJobGo", "#copyJobErr"));
 
 $("#copyAllJobsForm").addEventListener("submit", async ev => {
   const f = ev.target;
@@ -1776,6 +1799,7 @@ async function openCopyJob(name) {
   $("#copyJobName").textContent = name;
   $("#copyJobErr").hidden = true;
   $("#copyJobResult").hidden = true;
+  $("#copyJobGo").disabled = true;
   $("#copyTargets").textContent = "读取租户…";
   $("#copyJobDlg").showModal();
 
@@ -1804,7 +1828,7 @@ async function openCopyJob(name) {
       };
     }));
     $("#copyTargets").innerHTML = rows.map(r => `
-      <label class="row" style="margin:6px 0; gap:8px">
+      <label class="copy-target">
         <input type="checkbox" data-tenant="${esc(r.tenant)}" ${r.has ? "disabled" : ""}>
         <b>${esc(r.tenant)}</b>
         ${r.has ? '<span class="tag dim">已有这个任务</span>' : ""}
