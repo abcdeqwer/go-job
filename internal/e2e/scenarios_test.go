@@ -67,6 +67,89 @@ func TestCopyJobsCreatesMissingAndPreservesExisting(t *testing.T) {
 	}
 }
 
+func TestSyncJobsUpdatesDefinitionsCreatesMissingAndPreservesRuntimeState(t *testing.T) {
+	h := setup(t)
+	existing := cronJob("existing", "0 0 1 * * *")
+	existing.Description = "target-local"
+	h.createJob(existing, h.clock.Now().Add(time.Hour))
+	if err := h.store.SetPaused(context.Background(), existing.JobName, true, "operator", "hold target"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.store.Job(context.Background(), existing.JobName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceExisting := cronJob("existing", "0 30 2 * * *")
+	sourceExisting.Description = "source authority"
+	sourceExisting.MaxAttempts = 7
+	newJob := cronJob("new-job", "0 0 3 * * *")
+	seeds := []store.JobSeed{
+		{Definition: sourceExisting, NextFire: h.clock.Now().Add(2 * time.Hour)},
+		{Definition: newJob, NextFire: h.clock.Now().Add(3 * time.Hour)},
+	}
+
+	preview, err := h.store.PlanJobSync(context.Background(), seeds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Created) != 1 || preview.Created[0] != "new-job" ||
+		len(preview.Updated) != 1 || preview.Updated[0].JobName != "existing" {
+		t.Fatalf("preview = %+v", preview)
+	}
+
+	result, err := h.store.SyncJobs(context.Background(), seeds, "source", "operator", "publish catalogue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Created) != 1 || len(result.Updated) != 1 || len(result.BlockedRetired) != 0 {
+		t.Fatalf("sync result = %+v", result)
+	}
+	after, err := h.store.Job(context.Background(), existing.JobName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ScheduleExpr != sourceExisting.ScheduleExpr || after.Description != sourceExisting.Description ||
+		after.MaxAttempts != sourceExisting.MaxAttempts || after.Version != before.Version+1 {
+		t.Fatalf("definition was not synced: before=%+v after=%+v", before.Definition, after.Definition)
+	}
+	if !after.OpsPaused || after.ConfigVersion != before.ConfigVersion ||
+		after.NextFireAt != before.NextFireAt || after.ActiveExec != before.ActiveExec {
+		t.Fatalf("runtime state changed: before=%+v after=%+v", before, after)
+	}
+	if _, err := h.store.Job(context.Background(), newJob.JobName); err != nil {
+		t.Fatalf("missing job was not created: %v", err)
+	}
+	audit, err := h.store.AuditLog(context.Background(), existing.JobName, "operator", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit) < 1 || audit[0].Action != "job_synced" ||
+		!strings.Contains(audit[0].Detail, "publish catalogue") {
+		t.Fatalf("sync audit = %+v", audit)
+	}
+}
+
+func TestSyncJobsRetiredConflictRollsBackTarget(t *testing.T) {
+	h := setup(t)
+	retired := cronJob("retired", "0 0 1 * * *")
+	h.createJob(retired, h.clock.Now().Add(time.Hour))
+	if err := h.store.Retire(context.Background(), retired.JobName, "operator", "terminal fixture"); err != nil {
+		t.Fatal(err)
+	}
+	missing := cronJob("must-not-be-created", "0 0 2 * * *")
+	result, err := h.store.SyncJobs(context.Background(), []store.JobSeed{
+		{Definition: retired, NextFire: h.clock.Now().Add(time.Hour)},
+		{Definition: missing, NextFire: h.clock.Now().Add(2 * time.Hour)},
+	}, "source", "operator", "should be atomic")
+	if err == nil || len(result.BlockedRetired) != 1 || result.BlockedRetired[0] != retired.JobName {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if _, err := h.store.Job(context.Background(), missing.JobName); !errors.Is(err, store.ErrNoSuchJob) {
+		t.Fatalf("target was partially updated despite retired conflict: %v", err)
+	}
+}
+
 func TestSyncJobDescriptionsChangesOnlyDescriptions(t *testing.T) {
 	h := setup(t)
 	first := cronJob("first", "0 0 1 * * *")

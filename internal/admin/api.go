@@ -112,6 +112,7 @@ func (a *API) Handler() http.Handler {
 	a.read(mux, "GET /api/tenants/{tenant}/handlers", a.handlers)
 	a.read(mux, "GET /api/tenants/{tenant}/handler-catalog", a.handlerCatalog)
 	a.read(mux, "GET /api/tenants/{tenant}/jobs", a.listJobs)
+	a.read(mux, "GET /api/tenants/{tenant}/jobs/copy-all-preview", a.previewAllJobSync)
 	a.read(mux, "GET /api/tenants/{tenant}/jobs/description-sync", a.previewJobDescriptionSync)
 	a.read(mux, "GET /api/tenants/{tenant}/jobs/{name}", a.getJob)
 	a.read(mux, "GET /api/tenants/{tenant}/executions", a.listExecutions)

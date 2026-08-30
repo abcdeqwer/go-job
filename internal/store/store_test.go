@@ -10,10 +10,45 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	gojob "github.com/abcdeqwer/go-job"
 )
+
+func TestPlanJobSyncReportsCreateUpdateUnchangedAndRetired(t *testing.T) {
+	job := func(name, schedule string) gojob.Definition {
+		return gojob.Definition{
+			JobName: name, HandlerKey: "handler", ScheduleKind: gojob.ScheduleCron,
+			ScheduleExpr: schedule, Enabled: true, Concurrency: gojob.PolicyQueue,
+			Misfire: gojob.MisfireFireOnce, MaxAttempts: 3, MaxRecoveries: 3,
+			Lease: 30 * time.Second, Timeout: time.Minute, Params: []byte(`{"scope":"all"}`),
+		}
+	}
+	same := job("same", "0 0 1 * * *")
+	changed := job("changed", "0 0 2 * * *")
+	retired := job("retired", "0 0 3 * * *")
+	retired.Retired = true
+	result := planJobSync([]JobSeed{
+		{Definition: same},
+		{Definition: job("changed", "0 30 2 * * *")},
+		{Definition: job("new", "0 0 4 * * *")},
+		{Definition: job("retired", "0 0 3 * * *")},
+	}, map[string]gojob.Definition{
+		"same": same, "changed": changed, "retired": retired,
+	})
+	if len(result.Unchanged) != 1 || result.Unchanged[0] != "same" ||
+		len(result.Created) != 1 || result.Created[0] != "new" ||
+		len(result.BlockedRetired) != 1 || result.BlockedRetired[0] != "retired" ||
+		len(result.Updated) != 1 || result.Updated[0].JobName != "changed" {
+		t.Fatalf("plan = %+v", result)
+	}
+	fields := result.Updated[0].Fields
+	if len(fields) != 1 || fields[0].Field != "schedule_expr" ||
+		fields[0].Before != "0 0 2 * * *" || fields[0].After != "0 30 2 * * *" {
+		t.Fatalf("schedule changes = %+v", fields)
+	}
+}
 
 func TestResolvedStatus(t *testing.T) {
 	base := Stale{Status: gojob.StatusRunning, AttemptNo: 1, MaxAttempts: 3, RecoveryCount: 0, MaxRecoveries: 3}

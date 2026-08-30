@@ -273,6 +273,8 @@ func TestUIOffersCopyAllHandlerDescriptionsAndIdentityDeletion(t *testing.T) {
 	for _, marker := range []string{
 		`id="copyAllJobs"`,
 		`/jobs/copy-all`,
+		`/jobs/copy-all-preview`,
+		`function previewAllJobSync()`,
 		`.copy-target input[type="checkbox"] { width:auto`,
 		`id="copyJobGo" disabled`,
 		`id="copyAllJobsGo" disabled`,

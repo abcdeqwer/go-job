@@ -1,11 +1,13 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	gojob "github.com/abcdeqwer/go-job"
@@ -167,6 +169,45 @@ type JobSeed struct {
 	NextFire   time.Time
 }
 
+// JobDefinitionFieldChange is one operator-visible difference between a source definition and
+// the tenant-local definition it would replace. Runtime state is deliberately absent: syncing
+// definitions must never copy pause, ownership, execution history, or materialized clocks.
+type JobDefinitionFieldChange struct {
+	Field  string `json:"field"`
+	Before string `json:"before"`
+	After  string `json:"after"`
+}
+
+type JobDefinitionChange struct {
+	JobName string                     `json:"job_name"`
+	Fields  []JobDefinitionFieldChange `json:"fields"`
+}
+
+// JobSyncResult is used by both the read-only preview and the transactional write. A retired
+// target definition blocks the whole target tenant: retirement is terminal and must not be
+// undone by a catalogue sync.
+type JobSyncResult struct {
+	Created        []string              `json:"created"`
+	Updated        []JobDefinitionChange `json:"updated"`
+	Unchanged      []string              `json:"unchanged"`
+	BlockedRetired []string              `json:"blocked_retired"`
+}
+
+// PlanJobSync compares one source catalogue with the target tenant without taking write locks.
+// The write path repeats this comparison under FOR UPDATE, so the preview is informative rather
+// than an authority that can become stale between confirmation and submit.
+func (s *Store) PlanJobSync(ctx context.Context, seeds []JobSeed) (JobSyncResult, error) {
+	jobs, err := s.Jobs(ctx)
+	if err != nil {
+		return JobSyncResult{}, err
+	}
+	existing := make(map[string]gojob.Definition, len(jobs))
+	for _, job := range jobs {
+		existing[job.JobName] = job.Definition
+	}
+	return planJobSync(seeds, existing), nil
+}
+
 // CopyJobs creates every missing seed in one target-tenant transaction. Existing names are
 // skipped and never overwritten: tenant-local edits are authority for that tenant, and a
 // bulk copy must not silently erase them.
@@ -199,36 +240,7 @@ func (s *Store) CopyJobs(ctx context.Context, seeds []JobSeed, source, actor, re
 				skipped = append(skipped, d.JobName)
 				continue
 			}
-			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO job_definition
-				    (job_name, handler_key, executor_group, schedule_kind, schedule_expr,
-				     enabled, retired, concurrency_policy, misfire_policy,
-				     max_attempts, max_recoveries, lease_seconds, timeout_seconds,
-				     params_json, description, version, updated_by, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
-				d.JobName, d.HandlerKey, nullString(d.ExecutorGroup), string(d.ScheduleKind), d.ScheduleExpr,
-				d.Enabled, string(d.Concurrency), string(d.Misfire),
-				d.MaxAttempts, d.MaxRecoveries, int(d.Lease/time.Second), int(d.Timeout/time.Second),
-				nullBytes(d.Params), nullString(d.Description), actor, now, now); err != nil {
-				return fmt.Errorf("copy job %q from %s: %w", d.JobName, source, err)
-			}
-
-			var fireArg, pollArg any
-			if d.Enabled {
-				if d.ScheduleKind == gojob.ScheduleCron {
-					fireArg = seed.NextFire
-				} else {
-					pollArg = now
-				}
-			}
-			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO job_state (job_name, next_fire_at, next_poll_at, config_version, updated_at)
-				VALUES (?, ?, ?, 1, ?)`, d.JobName, fireArg, pollArg, now); err != nil {
-				return fmt.Errorf("create copied state row for %q: %w", d.JobName, err)
-			}
-			if err := audit(ctx, tx, now, actor, "job_created", d.JobName, "",
-				fmt.Sprintf("copied from tenant %s: %s (handler=%s schedule=%s %s)",
-					source, reason, d.HandlerKey, d.ScheduleKind, d.ScheduleExpr)); err != nil {
+			if err := insertCopiedJob(ctx, tx, d, seed.NextFire, source, actor, reason, now); err != nil {
 				return err
 			}
 			created = append(created, d.JobName)
@@ -240,6 +252,197 @@ func (s *Store) CopyJobs(ctx context.Context, seeds []JobSeed, source, actor, re
 		return nil, nil, err
 	}
 	return created, skipped, nil
+}
+
+// SyncJobs makes the source tenant's active catalogue authoritative for a target tenant. It
+// creates missing definitions and updates changed definitions in one target-local transaction.
+// Only job_definition is updated; job_state remains tenant-local. The version bump lets the
+// engine's normal drift pass recompute schedule clocks under the same locking rules as edits.
+func (s *Store) SyncJobs(ctx context.Context, seeds []JobSeed, source, actor, reason string) (JobSyncResult, error) {
+	if source == "" || actor == "" || reason == "" {
+		return JobSyncResult{}, fmt.Errorf("%w: syncing jobs needs a source, actor and reason", gojob.ErrProtocol)
+	}
+	now := s.clock.Now()
+	result := emptyJobSyncResult()
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		existing, err := lockedDefinitions(ctx, tx)
+		if err != nil {
+			return err
+		}
+		result = planJobSync(seeds, existing)
+		if len(result.BlockedRetired) > 0 {
+			return fmt.Errorf("%w: target has retired definitions: %v", gojob.ErrProtocol, result.BlockedRetired)
+		}
+
+		created := make(map[string]bool, len(result.Created))
+		for _, name := range result.Created {
+			created[name] = true
+		}
+		updated := make(map[string]JobDefinitionChange, len(result.Updated))
+		for _, change := range result.Updated {
+			updated[change.JobName] = change
+		}
+
+		for _, seed := range seeds {
+			d := seed.Definition
+			if created[d.JobName] {
+				if err := insertCopiedJob(ctx, tx, d, seed.NextFire, source, actor, reason, now); err != nil {
+					return err
+				}
+				continue
+			}
+			change, ok := updated[d.JobName]
+			if !ok {
+				continue
+			}
+			res, err := tx.ExecContext(ctx, `
+				UPDATE job_definition
+				SET handler_key = ?, executor_group = ?, schedule_kind = ?, schedule_expr = ?,
+				    enabled = ?, concurrency_policy = ?, misfire_policy = ?,
+				    max_attempts = ?, max_recoveries = ?, lease_seconds = ?, timeout_seconds = ?,
+				    params_json = ?, description = ?, version = version + 1,
+				    updated_by = ?, updated_at = ?
+				WHERE job_name = ? AND retired = 0`,
+				d.HandlerKey, nullString(d.ExecutorGroup), string(d.ScheduleKind), d.ScheduleExpr,
+				d.Enabled, string(d.Concurrency), string(d.Misfire), d.MaxAttempts, d.MaxRecoveries,
+				int(d.Lease/time.Second), int(d.Timeout/time.Second), nullBytes(d.Params),
+				nullString(d.Description), actor, now, d.JobName)
+			if err != nil {
+				return fmt.Errorf("sync job %q from %s: %w", d.JobName, source, err)
+			}
+			if err := assertOne(res, "sync job definition"); err != nil {
+				return err
+			}
+			fields := make([]string, 0, len(change.Fields))
+			for _, field := range change.Fields {
+				fields = append(fields, field.Field)
+			}
+			if err := audit(ctx, tx, now, actor, "job_synced", d.JobName, "",
+				fmt.Sprintf("synced from tenant %s: %s (fields=%v)", source, reason, fields)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return result, err
+}
+
+func emptyJobSyncResult() JobSyncResult {
+	return JobSyncResult{
+		Created: []string{}, Updated: []JobDefinitionChange{},
+		Unchanged: []string{}, BlockedRetired: []string{},
+	}
+}
+
+func planJobSync(seeds []JobSeed, existing map[string]gojob.Definition) JobSyncResult {
+	result := emptyJobSyncResult()
+	for _, seed := range seeds {
+		target, ok := existing[seed.Definition.JobName]
+		if !ok {
+			result.Created = append(result.Created, seed.Definition.JobName)
+			continue
+		}
+		if target.Retired {
+			result.BlockedRetired = append(result.BlockedRetired, seed.Definition.JobName)
+			continue
+		}
+		fields := definitionChanges(target, seed.Definition)
+		if len(fields) == 0 {
+			result.Unchanged = append(result.Unchanged, seed.Definition.JobName)
+			continue
+		}
+		result.Updated = append(result.Updated, JobDefinitionChange{
+			JobName: seed.Definition.JobName, Fields: fields,
+		})
+	}
+	return result
+}
+
+func definitionChanges(before, after gojob.Definition) []JobDefinitionFieldChange {
+	changes := []JobDefinitionFieldChange{}
+	add := func(field, old, next string) {
+		if old != next {
+			changes = append(changes, JobDefinitionFieldChange{Field: field, Before: old, After: next})
+		}
+	}
+	add("handler_key", before.HandlerKey, after.HandlerKey)
+	add("executor_group", before.ExecutorGroup, after.ExecutorGroup)
+	add("schedule_kind", string(before.ScheduleKind), string(after.ScheduleKind))
+	add("schedule_expr", before.ScheduleExpr, after.ScheduleExpr)
+	add("enabled", strconv.FormatBool(before.Enabled), strconv.FormatBool(after.Enabled))
+	add("concurrency_policy", string(before.Concurrency), string(after.Concurrency))
+	add("misfire_policy", string(before.Misfire), string(after.Misfire))
+	add("max_attempts", strconv.Itoa(before.MaxAttempts), strconv.Itoa(after.MaxAttempts))
+	add("max_recoveries", strconv.Itoa(before.MaxRecoveries), strconv.Itoa(after.MaxRecoveries))
+	add("lease_seconds", strconv.FormatInt(int64(before.Lease/time.Second), 10), strconv.FormatInt(int64(after.Lease/time.Second), 10))
+	add("timeout_seconds", strconv.FormatInt(int64(before.Timeout/time.Second), 10), strconv.FormatInt(int64(after.Timeout/time.Second), 10))
+	if !bytes.Equal(before.Params, after.Params) {
+		changes = append(changes, JobDefinitionFieldChange{Field: "params", Before: string(before.Params), After: string(after.Params)})
+	}
+	add("description", before.Description, after.Description)
+	return changes
+}
+
+func lockedDefinitions(ctx context.Context, tx *sql.Tx) (map[string]gojob.Definition, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT job_name, handler_key, COALESCE(executor_group, ''), schedule_kind, schedule_expr,
+		       enabled, retired, concurrency_policy, misfire_policy, max_attempts, max_recoveries,
+		       lease_seconds, timeout_seconds, params_json, COALESCE(description, ''), version,
+		       COALESCE(updated_by, '')
+		FROM job_definition FOR UPDATE`)
+	if err != nil {
+		return nil, fmt.Errorf("lock target job definitions: %w", err)
+	}
+	defer rows.Close()
+	existing := map[string]gojob.Definition{}
+	for rows.Next() {
+		var d gojob.Definition
+		var leaseSeconds, timeoutSeconds int
+		if err := rows.Scan(&d.JobName, &d.HandlerKey, &d.ExecutorGroup, &d.ScheduleKind, &d.ScheduleExpr,
+			&d.Enabled, &d.Retired, &d.Concurrency, &d.Misfire, &d.MaxAttempts, &d.MaxRecoveries,
+			&leaseSeconds, &timeoutSeconds, &d.Params, &d.Description, &d.Version, &d.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("scan target job definition: %w", err)
+		}
+		d.Lease = time.Duration(leaseSeconds) * time.Second
+		d.Timeout = time.Duration(timeoutSeconds) * time.Second
+		existing[d.JobName] = d
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
+func insertCopiedJob(ctx context.Context, tx *sql.Tx, d gojob.Definition, nextFire time.Time,
+	source, actor, reason string, now time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO job_definition
+		    (job_name, handler_key, executor_group, schedule_kind, schedule_expr,
+		     enabled, retired, concurrency_policy, misfire_policy, max_attempts, max_recoveries,
+		     lease_seconds, timeout_seconds, params_json, description, version, updated_by, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+		d.JobName, d.HandlerKey, nullString(d.ExecutorGroup), string(d.ScheduleKind), d.ScheduleExpr,
+		d.Enabled, string(d.Concurrency), string(d.Misfire), d.MaxAttempts, d.MaxRecoveries,
+		int(d.Lease/time.Second), int(d.Timeout/time.Second), nullBytes(d.Params), nullString(d.Description),
+		actor, now, now); err != nil {
+		return fmt.Errorf("copy job %q from %s: %w", d.JobName, source, err)
+	}
+	var fireArg, pollArg any
+	if d.Enabled {
+		if d.ScheduleKind == gojob.ScheduleCron {
+			fireArg = nextFire
+		} else {
+			pollArg = now
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO job_state (job_name, next_fire_at, next_poll_at, config_version, updated_at)
+		VALUES (?, ?, ?, 1, ?)`, d.JobName, fireArg, pollArg, now); err != nil {
+		return fmt.Errorf("create copied state row for %q: %w", d.JobName, err)
+	}
+	return audit(ctx, tx, now, actor, "job_created", d.JobName, "",
+		fmt.Sprintf("copied from tenant %s: %s (handler=%s schedule=%s %s)",
+			source, reason, d.HandlerKey, d.ScheduleKind, d.ScheduleExpr))
 }
 
 // UpdateJob edits a definition under an optimistic version check.

@@ -305,8 +305,40 @@ type copyAllJobsBody struct {
 	Reason  string   `json:"reason"`
 }
 
-// copyAllJobs copies every non-retired definition to one or more admitted tenants. Each target
-// is atomic and returns its own result; an existing name is skipped, never overwritten.
+// previewAllJobSync compares every non-retired source definition with selected target tenants.
+// It is read-only; SyncJobs repeats the comparison under locks before applying it.
+func (a *API) previewAllJobSync(w http.ResponseWriter, r *http.Request) error {
+	sourceStore, source, err := a.tenantStore(r)
+	if err != nil {
+		return err
+	}
+	targets := r.URL.Query()["target"]
+	targetStores, err := a.copyTargetStores(source, targets)
+	if err != nil {
+		return err
+	}
+	seeds, err := a.activeJobSeeds(r.Context(), sourceStore)
+	if err != nil {
+		return err
+	}
+	results := make([]map[string]any, 0, len(targets))
+	for _, target := range targets {
+		plan, planErr := targetStores[target].PlanJobSync(r.Context(), seeds)
+		result := map[string]any{"tenant": target, "plan": plan}
+		if planErr != nil {
+			result["error"] = planErr.Error()
+		}
+		results = append(results, result)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"source": source, "available": len(seeds), "results": results,
+	})
+	return nil
+}
+
+// copyAllJobs synchronises every non-retired definition to one or more admitted tenants. Each
+// target is atomic: missing names are created and changed names are updated. Tenant runtime
+// state remains local, and a retired target name blocks that target rather than being revived.
 func (a *API) copyAllJobs(w http.ResponseWriter, r *http.Request) error {
 	sourceStore, source, err := a.tenantStore(r)
 	if err != nil {
@@ -319,34 +351,65 @@ func (a *API) copyAllJobs(w http.ResponseWriter, r *http.Request) error {
 	if err := requireReason(body.Reason); err != nil {
 		return err
 	}
-	if len(body.Targets) == 0 || len(body.Targets) > 100 {
-		return badRequest("targets must contain between 1 and 100 tenants")
+	targetStores, err := a.copyTargetStores(source, body.Targets)
+	if err != nil {
+		return err
+	}
+	seeds, err := a.activeJobSeeds(r.Context(), sourceStore)
+	if err != nil {
+		return err
 	}
 
-	targetStores := make(map[string]*store.Store, len(body.Targets))
+	actor := ActorFrom(r.Context())
+	results := make([]map[string]any, 0, len(body.Targets))
+	for _, target := range body.Targets {
+		plan, copyErr := targetStores[target].SyncJobs(
+			r.Context(), seeds, source, actor, body.Reason)
+		result := map[string]any{"tenant": target, "plan": plan}
+		if copyErr != nil {
+			result["error"] = copyErr.Error()
+			a.log.Warn("sync all jobs to tenant failed", "source", source, "target", target,
+				"actor", actor, "error", copyErr)
+		}
+		results = append(results, result)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"source": source, "available": len(seeds), "results": results,
+	})
+	return nil
+}
+
+func (a *API) copyTargetStores(source string, targets []string) (map[string]*store.Store, error) {
+	if len(targets) == 0 || len(targets) > 100 {
+		return nil, badRequest("targets must contain between 1 and 100 tenants")
+	}
+	targetStores := make(map[string]*store.Store, len(targets))
 	seen := map[string]bool{}
-	for _, raw := range body.Targets {
+	for _, raw := range targets {
 		target := strings.TrimSpace(raw)
 		if target == "" || target != raw {
-			return badRequest("target tenant names must be non-empty and contain no surrounding whitespace")
+			return nil, badRequest("target tenant names must be non-empty and contain no surrounding whitespace")
 		}
 		if target == source {
-			return badRequest("source tenant %q cannot also be a target", source)
+			return nil, badRequest("source tenant %q cannot also be a target", source)
 		}
 		if seen[target] {
-			return badRequest("target tenant %q is repeated", target)
+			return nil, badRequest("target tenant %q is repeated", target)
 		}
 		seen[target] = true
 		st, ok := a.tenants.Store(target)
 		if !ok {
-			return badRequest("target tenant %q is not admitted", target)
+			return nil, badRequest("target tenant %q is not admitted", target)
 		}
 		targetStores[target] = st
 	}
+	return targetStores, nil
+}
 
-	jobs, err := sourceStore.Jobs(r.Context())
+func (a *API) activeJobSeeds(ctx context.Context, sourceStore *store.Store) ([]store.JobSeed, error) {
+	jobs, err := sourceStore.Jobs(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	now := a.cfg.Clock.Now()
 	seeds := make([]store.JobSeed, 0, len(jobs))
@@ -360,28 +423,11 @@ func (a *API) copyAllJobs(w http.ResponseWriter, r *http.Request) error {
 		def.UpdatedBy = ""
 		next, err := parseCron(def.ScheduleKind, def.ScheduleExpr, now)
 		if err != nil {
-			return fmt.Errorf("source job %q has an invalid schedule: %w", def.JobName, err)
+			return nil, fmt.Errorf("source job %q has an invalid schedule: %w", def.JobName, err)
 		}
 		seeds = append(seeds, store.JobSeed{Definition: def, NextFire: next})
 	}
-
-	actor := ActorFrom(r.Context())
-	results := make([]map[string]any, 0, len(body.Targets))
-	for _, target := range body.Targets {
-		created, skipped, copyErr := targetStores[target].CopyJobs(
-			r.Context(), seeds, source, actor, body.Reason)
-		result := map[string]any{"tenant": target, "created": created, "skipped": skipped}
-		if copyErr != nil {
-			result["error"] = copyErr.Error()
-			a.log.Warn("copy all jobs to tenant failed", "source", source, "target", target,
-				"actor", actor, "error", copyErr)
-		}
-		results = append(results, result)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"source": source, "available": len(seeds), "results": results,
-	})
-	return nil
+	return seeds, nil
 }
 
 func (a *API) liveHandlerDescriptions(ctx context.Context, st *store.Store) (map[string]string, error) {

@@ -303,12 +303,13 @@
 <dialog id="copyAllJobsDlg" class="wide">
   <form method="dialog" id="copyAllJobsForm">
     <div class="dlg-head">
-      <h3>复制全部任务到其他租户</h3>
-      <p>复制当前租户全部<b>未退役</b>任务的定义。目标租户已有的同名任务会跳过，绝不覆盖；
-         暂停状态属于租户运行态，不会跟着复制。</p>
+      <h3>同步全部任务到其他租户</h3>
+      <p>以当前租户全部<b>未退役</b>任务为准：缺失任务会创建，同名任务的时间和其他定义会更新。
+         暂停、执行中状态和历史属于目标租户运行态，不会被覆盖；退役同名任务会阻止该租户同步。</p>
     </div>
     <div class="dlg-body">
       <div id="copyAllTargets" class="preview">读取租户…</div>
+      <div id="copyAllJobsPreview" class="preview" hidden></div>
       <div class="f" style="margin-top:14px">
         <label>reason</label>
         <input name="reason" required placeholder="为什么把这些任务复制到其他租户">
@@ -318,7 +319,7 @@
     </div>
     <div class="dlg-foot">
       <button value="cancel" formnovalidate>取消</button>
-      <button class="primary" value="ok" id="copyAllJobsGo" disabled>复制</button>
+      <button class="primary" value="ok" id="copyAllJobsGo" disabled>确认同步</button>
     </div>
   </form>
 </dialog>
@@ -881,7 +882,7 @@ async function renderJobs(t) {
 
   $("#controls").innerHTML = (operator()
     ? `<button class="primary" id="newJob">new job</button> `
-      + `<button id="copyAllJobs">复制全部任务到…</button> `
+      + `<button id="copyAllJobs">同步全部任务到…</button> `
       + `<button id="syncDescriptions">批量同步中文说明</button> ` : "")
     + `<span class="dim">${orphans.length} orphan${orphans.length === 1 ? "" : "s"}</span>`
     + (unused.length ? ` <span class="dim">·</span> <button id="showUnused">${unused.length} 个 handler 还没有任务</button>` : "");
@@ -1780,6 +1781,7 @@ function openCopyAllJobs() {
   f.reset();
   $("#copyAllJobsErr").hidden = true;
   $("#copyAllJobsResult").hidden = true;
+  $("#copyAllJobsPreview").hidden = true;
   $("#copyAllJobsGo").disabled = true;
   const others = (state.tenants || []).filter(t => t.tenant !== state.tenant && t.admitted);
   const count = (state.jobs || []).filter(j => !j.retired).length;
@@ -1790,6 +1792,53 @@ function openCopyAllJobs() {
           + `<b>${esc(t.tenant)}</b></label>`).join("")
     : '<span class="dim">没有其他已接纳的租户。</span>';
   $("#copyAllJobsDlg").showModal();
+}
+
+let copyAllPreviewSeq = 0;
+
+function syncPlanHTML(result) {
+  if (result.error) return `<div><span class="bad">✗ ${esc(result.tenant)}</span> — ${esc(result.error)}</div>`;
+  const p = result.plan || {};
+  let html = `<div><b>${esc(result.tenant)}</b>：新建 ${(p.created || []).length}，`
+    + `更新 ${(p.updated || []).length}，已一致 ${(p.unchanged || []).length}</div>`;
+  if ((p.blocked_retired || []).length) {
+    html += `<div class="bad">退役任务冲突：${p.blocked_retired.map(esc).join("、")}</div>`;
+  }
+  if ((p.created || []).length) {
+    html += `<div class="dim">新建：${p.created.map(esc).join("、")}</div>`;
+  }
+  for (const change of (p.updated || [])) {
+    html += `<div style="padding:7px 0;border-top:1px solid var(--line)"><b>${esc(change.job_name)}</b>`
+      + change.fields.map(f => `<div class="dim"><code>${esc(f.field)}</code>：`
+          + `${esc(f.before || "（空）")} → ${esc(f.after || "（空）")}</div>`).join("") + `</div>`;
+  }
+  return html;
+}
+
+async function previewAllJobSync() {
+  const seq = ++copyAllPreviewSeq;
+  const targets = [...document.querySelectorAll("#copyAllTargets input[type=checkbox]:checked")]
+    .map(c => c.dataset.tenant);
+  const box = $("#copyAllJobsPreview");
+  $("#copyAllJobsGo").disabled = true;
+  if (!targets.length) {
+    box.hidden = true;
+    return;
+  }
+  box.textContent = "读取定义差异…";
+  box.hidden = false;
+  try {
+    const query = targets.map(t => `target=${encodeURIComponent(t)}`).join("&");
+    const source = encodeURIComponent(state.tenant);
+    const result = await api("GET", `/api/tenants/${source}/jobs/copy-all-preview?${query}`);
+    if (seq !== copyAllPreviewSeq) return;
+    box.innerHTML = (result.results || []).map(syncPlanHTML).join("");
+    const blocked = (result.results || []).some(r => r.error || (r.plan.blocked_retired || []).length);
+    $("#copyAllJobsGo").disabled = blocked;
+  } catch (e) {
+    if (seq !== copyAllPreviewSeq) return;
+    box.innerHTML = `<span class="bad">${esc(String(e.message || e))}</span>`;
+  }
 }
 
 function descriptionSyncRows(result) {
@@ -1856,8 +1905,10 @@ function copyTargetChanged(container, button, error) {
   $(button).disabled = !document.querySelector(`${container} input[type=checkbox]:checked`);
   if (!$(button).disabled) $(error).hidden = true;
 }
-$("#copyAllTargets").addEventListener("change", () =>
-  copyTargetChanged("#copyAllTargets", "#copyAllJobsGo", "#copyAllJobsErr"));
+$("#copyAllTargets").addEventListener("change", () => {
+  $("#copyAllJobsErr").hidden = true;
+  previewAllJobSync();
+});
 $("#copyTargets").addEventListener("change", () =>
   copyTargetChanged("#copyTargets", "#copyJobGo", "#copyJobErr"));
 
@@ -1880,8 +1931,7 @@ $("#copyAllJobsForm").addEventListener("submit", async ev => {
     });
     $("#copyAllJobsResult").innerHTML = result.results.map(r => r.error
       ? `<div><span class="bad">✗ ${esc(r.tenant)}</span> — ${esc(r.error)}</div>`
-      : `<div><span class="t">✓</span> ${esc(r.tenant)}：新建 ${(r.created || []).length}，跳过已有 ${(r.skipped || []).length}</div>`
-    ).join("");
+      : `<div class="t">✓ 已完成</div>${syncPlanHTML(r)}`).join("");
     $("#copyAllJobsResult").hidden = false;
     render();
   } catch (e) {
@@ -1892,9 +1942,9 @@ $("#copyAllJobsForm").addEventListener("submit", async ev => {
 
 // Copying a job across tenants.
 //
-// This is the narrow, one-job copy flow. The separate copy-all endpoint is transactional per
-// target tenant; this older flow keeps per-target results visible while copying one selected
-// definition to several tenants.
+// This is the narrow, one-job copy flow. The separate copy-all endpoint synchronises the active
+// catalogue transactionally per target; this flow still creates one missing definition and
+// refuses an existing name.
 async function openCopyJob(name) {
   const f = $("#copyJobForm");
   f.reset();

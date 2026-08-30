@@ -96,7 +96,7 @@ Each is audited with actor, target and reason. Each requires the `OPERATOR` role
 | Action | Effect | Guard |
 | --- | --- | --- |
 | **Create** | a new job: handler, group, schedule, parameters, policy | the UI *offers* the handlers live executors declare; an unknown one is a **warning**, not a rejection |
-| **Copy all** | copies every non-retired definition to selected tenants | target tenants are atomic; existing names are skipped and never overwritten; pause state is not copied |
+| **Sync all** | makes every non-retired source definition present and current in selected tenants | preview shows field differences; each target is atomic; pause/execution/history state is preserved; a retired same-name target blocks that tenant |
 | **Trigger** | a manual execution, with optional parameter overrides | competes for the same job lock as a scheduled run, so it cannot overlap one — and is selected ahead of it, so it cannot starve |
 | **Pause / resume** | sets `ops_paused` | takes the state-row lock, so it cannot race a claim into one extra run |
 | **Edit** | schedule, concurrency, retry budget, timeouts | optimistic `version` CAS; rejected if the row changed underneath |
@@ -153,7 +153,8 @@ DELETE /api/executor-identities                        delete a revoked credenti
 
 GET    /api/tenants/{tenant}/jobs                      list with effective state
 POST   /api/tenants/{tenant}/jobs                      create: handler_key, schedule, params
-POST   /api/tenants/{tenant}/jobs/copy-all             copy non-retired definitions to targets
+GET    /api/tenants/{tenant}/jobs/copy-all-preview     preview sync; repeated query: target=name
+POST   /api/tenants/{tenant}/jobs/copy-all             create missing and update changed definitions
 GET    /api/tenants/{tenant}/jobs/description-sync     preview catalog description changes
 POST   /api/tenants/{tenant}/jobs/description-sync     apply preview; body: {reason}
 GET    /api/tenants/{tenant}/jobs/{name}               detail, configuration, conditions
